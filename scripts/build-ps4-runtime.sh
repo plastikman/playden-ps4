@@ -196,7 +196,7 @@ PW_EXECUTABLE_NO_RELRO=1 PW_EXECUTABLE_NO_ORBIS_COMPAT=1 \
     "$CC" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
     "$ROOT/ps4/runtime_stub.c" "$BUILD/obj/orbis_bigheap.o" -o "$BUILD/stub/stub-linked.elf" \
     -lSceSystemService -lSceSysmodule -lSceVideoOut -lScePad -lSceUserService
-python3 "$ROOT/deps/orbis-win-reference/scripts/prepare-orbis-stub-no-relro.py" \
+python3 "$ORBIS_WIN_ROOT/scripts/prepare-orbis-stub-no-relro.py" \
     --layout 0x55c000 0x7fff0000 0x80000000 \
     "$BUILD/stub/stub-linked.elf" "$BUILD/stub/stub.elf"
 "$ORBIS_WIN_ROOT/scripts/create-fself-repro.sh" "$SDK/bin/linux/create-fself" \
