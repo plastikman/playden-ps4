@@ -1,6 +1,103 @@
 <p align="center"><img src="docs/images/icon.png" alt="Playden icon" width="128"></p>
 
-# Playden for PS5
+# Playden for PS4
+
+**Play your Steam library's Windows games on a jailbroken PS4.**
+
+This is a PS4 port of [Playden for PS5](https://github.com/leolobato/playden-ps5) by Leo Lobato. It runs as its own
+PS4 app (title `PLDN10001`): you sign in to Steam, browse your library, download games and play them. The Windows
+games run on [Orbis-Win](https://github.com/plastikman/orbis-win), a PS4 port of
+[prospero-win](https://github.com/mpereiraesaa/prospero-win) (Wine with Mesa/RADV and DXVK), which this package
+carries inside it. Each game gets its own Wine prefix.
+
+It is a separate project from Playden for PS5. **Please report PS4 problems here, not to the PS5 project or its
+Discord.**
+
+> [!WARNING]
+> **Alpha software, test builds only.** It signs in to **your real Steam account**, downloads games with your
+> licenses, and reads and writes your **Steam Cloud saves**. It has been run on one console, a PS4 Pro with
+> GoldHEN. Read Playden's [Before you use it](#before-you-use-it) below: the same risks apply.
+
+## On the PS4
+
+### What works
+
+Seen working on the test console:
+
+- **Steam sign-in** with a QR code, cached between runs.
+- **Your Steam library** with cover art, store details, favorites and hidden games.
+- **Downloads from Steam**, one game at a time, with resume after an interruption.
+- **Steam Cloud saves** from the Saves tab: check a game, and choose which saves to keep when the PS4 and the Cloud
+  disagree.
+- **Per-game settings** (Triangle on a game): the program that starts, Wine log detail, and for games without full
+  controller support the controller mode, preset and button mapping.
+
+### In testing
+
+Built and packaged, not yet confirmed on the console:
+
+- An **install sheet** before a download: the version (public, or a beta without a password), the content language
+  and the download size.
+- **Game updates**: an **UPDATE** mark on installed games Steam has a newer version of; Cross downloads only the
+  changed files.
+- **Steam Cloud sync** before a game starts and after it ends.
+- More **Game settings**: resolution (including 4:3) and scaling, mouse-look controls (pointer and movement
+  sticks), and library (DLL) overrides chosen from a list.
+- **Playden updates**: Settings checks this repository's releases and downloads a newer package to `/data/pkg`, to
+  install with GoldHEN's package installer.
+- Library **search, sort and collections**.
+- **Maintenance** per game: check and repair files, back up and restore saves, reset the Wine prefix.
+- **Uninstall that asks**: keep the Wine prefix and saves, or remove them too (saves backed up first), with a Steam
+  Cloud sync first.
+- **Account name and password sign-in** with Steam Guard codes, and **signing out** to switch accounts.
+- **Games shared by a Steam family member**, listed and installable.
+
+### Not on the PS4 (yet)
+
+- Games don't get their own Home screen tile: start them from Playden.
+- One download at a time; no queue.
+- No USB or external drives, and no importing games from elsewhere.
+- Not yet ported from the PS5: community recipes, player presets, and the newer Game settings rows (graphics,
+  Steam Input, network).
+- The PS4 is much slower than a PS5: heavier games may be CPU-bound (Grand Theft Auto IV runs at about 8–9 fps).
+
+### Install
+
+1. Install `IV0000-PLDN10001_00-PLDN100010000000.pkg` with GoldHEN's package installer.
+2. Start **Playden for PS4** and sign in to Steam.
+
+Playden keeps its data in `/data/PLDN10001` (games, Wine prefixes, settings, save backups). Each new package has a
+higher version and installs over the last one; your data stays.
+
+### Build
+
+The package is built from this repository and a published Orbis-Win package:
+
+```sh
+# An Orbis-Win checkout with its PS4 toolchain and SDK set up (see its README), at the commit the
+# Orbis-Win package below was built from, and that package's release tag:
+ORBIS_WIN_ROOT=/path/to/orbis-win \
+ORBIS_WIN_TAG=<release> \
+PKG_VERSION=NN.NN OUT=build/out scripts/ci/build-package.sh
+```
+
+The Orbis-Win release must have run-time title detection (after `v0.0.4`; `ORBIS_WIN_PKG_DIR` takes a folder with a
+package and its `BUILD-MANIFEST` until one is published). `scripts/ci/build-package.sh` checks the Orbis-Win package
+against its manifest, extracts it, downloads DXVK 2.6.2 and the PS4 network libraries (pinned hashes), then runs
+`scripts/build-ps4-runtime.sh`. The **Build PS4 package**
+workflow does the same on a self-hosted runner. Orbis-Win's own build needs its private toolchain cache, so building
+from scratch is not yet possible without it.
+
+### Credits
+
+Playden is [Leo Lobato](https://github.com/leolobato)'s work; this port adds the PS4 app (`ps4/`) and its build, and
+keeps the rest of Playden as upstream has it. The runtime is Orbis-Win, built on prospero-win and Wine.
+
+---
+
+# Playden for PS5 (upstream README)
+
+The rest of this file is upstream's README as it stands, for the PS5. The PS4 sections above say what differs.
 
 **Play your Steam library's Windows games on a jailbroken PS5.**
 
