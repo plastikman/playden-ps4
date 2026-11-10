@@ -27,6 +27,7 @@ extern "C" {
 //   2 restore the newest backup over the prefix's drive_c/users
 //   3 reset the Wine prefix: back up, then delete everything but drive_c/users; the next launch makes
 //     Windows and the registry again from the template, and the saves stay.
+//   4 before an uninstall that removes the prefix: back up, then delete the whole prefix
 // 0 when it started.
 int playden_ps4_maintenance_start(std::uint32_t app_id, int action);
 // 0 idle, 1 running, 2 done, 3 failed.

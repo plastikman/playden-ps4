@@ -301,6 +301,21 @@ void Run(std::uint32_t app_id, int action)
                          " files removed). The next launch sets it up again; saves were kept.");
         return;
     }
+    if (action == 4) {
+        // Before an uninstall that removes the prefix: back the saves up, then delete the whole prefix.
+        if (IsDirectory(prefix + "/drive_c/users") && !BackUp(app_id, prefix, &message)) {
+            Finish(false, "Nothing was deleted. " + message);
+            return;
+        }
+        TreeStats stats;
+        bool kept = false;
+        if (!RemoveTree(prefix, "", {}, &stats, &kept)) {
+            Finish(false, "The Wine prefix could not be removed: " + stats.error);
+            return;
+        }
+        Finish(true, "Saves backed up and the Wine prefix removed.");
+        return;
+    }
     Finish(false, "Unknown maintenance action.");
 }
 
@@ -355,14 +370,15 @@ bool ListDirectory(const std::string &path, std::vector<DirectoryEntry> *out, st
 extern "C" int playden_ps4_maintenance_start(std::uint32_t app_id, int action)
 {
     auto &job = playden::ps4::CurrentJob();
-    if (app_id == 0 || action < 1 || action > 3) return -1;
+    if (app_id == 0 || action < 1 || action > 4) return -1;
     int state = job.state.load();
     do {
         if (state == 1) return -1;
     } while (!job.state.compare_exchange_weak(state, 1));
     {
         const std::lock_guard<std::mutex> guard(job.mutex);
-        job.message = action == 1 ? "Backing up saves…" : action == 2 ? "Restoring saves…" : "Resetting the Wine prefix…";
+        job.message = action == 1 ? "Backing up saves…" : action == 2 ? "Restoring saves…" :
+                      action == 3 ? "Resetting the Wine prefix…" : "Backing up saves, then removing the Wine prefix…";
     }
     playden::ps4::Log("start app=" + std::to_string(app_id) + " action=" + std::to_string(action));
     std::thread([app_id, action] { playden::ps4::Run(app_id, action); }).detach();

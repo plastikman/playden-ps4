@@ -69,6 +69,7 @@ int playden_ps4_game_details_incomplete(void);
 void playden_ps4_game_verify_start(uint32_t app_id);
 int playden_ps4_maintenance_start(uint32_t app_id, int action);
 int playden_ps4_maintenance_state(void);
+const char *playden_ps4_maintenance_message(void);
 int playden_ps4_library_search_edit(int user_id);
 int playden_ps4_library_sort_cycle(void);
 size_t playden_ps4_library_collection_count(void);
@@ -77,6 +78,10 @@ int playden_ps4_library_collection_delete(size_t index);
 int playden_ps4_library_collection_toggle(uint32_t app_id, size_t index);
 const char *playden_ps4_auth_challenge(void);
 
+/* Delete (page 3): 0 choosing, 1 Steam Cloud sync first, 2 backing up and removing the prefix. ui.cpp shows it,
+ * with the reason a delete stopped. */
+int playden_ps4_delete_stage = 0;
+char playden_ps4_delete_note[160] = "";
 /* Maintenance (page 10): the prefix reset takes a second Cross; ui.cpp shows it. */
 int playden_ps4_maintenance_armed = 0;
 /* The game the collection picker (page 9) is for; ui.cpp draws from it. */
@@ -214,6 +219,8 @@ int playden_ps4_main(int argc, char **argv) {
                 playden_ps4_game_details_installed() && playden_ps4_game_uninstall_state() != 1) {
                 page = 3;
                 delete_choice = 0;
+                playden_ps4_delete_stage = 0;
+                playden_ps4_delete_note[0] = '\0';
                 changed = 1;
             }
             // Game settings, saved per game: Wine log detail, and controller mode and button mapping
@@ -258,22 +265,75 @@ int playden_ps4_main(int argc, char **argv) {
                 }
             }
         } else if (page == 3) {
-            if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
+            /* 0 delete the game and keep its prefix and saves, 1 delete the prefix too (saves backed up first),
+             * 2 keep the game. Signed in, Steam Cloud syncs first; a conflict stops the delete. */
+            static int remove_prefix = 0;
+            /* Not while the prefix is being removed: the delete finishes first. */
+            if ((pressed & ORBIS_PAD_BUTTON_CIRCLE) && playden_ps4_delete_stage != 3) {
                 page = 2;
+                playden_ps4_delete_stage = 0;
                 changed = 1;
             }
-            if ((pressed & ORBIS_PAD_BUTTON_UP) || (pressed & ORBIS_PAD_BUTTON_DOWN)) {
-                delete_choice = 1 - delete_choice;
+            if (playden_ps4_delete_stage == 0) {
+                if ((pressed & ORBIS_PAD_BUTTON_UP) && delete_choice > 0) { --delete_choice; changed = 1; }
+                if ((pressed & ORBIS_PAD_BUTTON_DOWN) && delete_choice < 2) { ++delete_choice; changed = 1; }
+                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && delete_choice == 2) {
+                    page = 2;
+                    changed = 1;
+                } else if (pressed & ORBIS_PAD_BUTTON_CROSS) {
+                    remove_prefix = delete_choice == 1;
+                    playden_ps4_delete_note[0] = '\0';
+                    const int auth_now = playden_ps4_auth_state();
+                    if ((auth_now == 6 || auth_now == 7) && playden_ps4_saves_state() != 1) {
+                        playden_ps4_saves_start(detail_app_id, 0);
+                        playden_ps4_delete_stage = 1;
+                    } else {
+                        playden_ps4_delete_stage = 2;
+                    }
+                    changed = 1;
+                }
+            }
+            if (playden_ps4_delete_stage == 1) {
+                const int saves = playden_ps4_saves_state();
+                if (saves == 3) {
+                    snprintf(playden_ps4_delete_note, sizeof(playden_ps4_delete_note),
+                             "Steam Cloud and the PS4 have different saves. Choose which to keep in Saves, then delete.");
+                    playden_ps4_delete_stage = 0;
+                    changed = 1;
+                } else if (saves != 1) {
+                    playden_ps4_delete_stage = 2;   /* synced, nothing to sync, or offline (logged) */
+                    changed = 1;
+                }
+            }
+            if (playden_ps4_delete_stage == 2) {
+                if (!remove_prefix) {
+                    playden_ps4_game_uninstall_start(detail_app_id);
+                    playden_ps4_delete_stage = 0;
+                    page = 2;
+                } else if (playden_ps4_maintenance_start(detail_app_id, 4) == 0) {
+                    playden_ps4_delete_stage = 3;
+                } else {
+                    snprintf(playden_ps4_delete_note, sizeof(playden_ps4_delete_note),
+                             "Another maintenance job is running. Try again when it finishes.");
+                    playden_ps4_delete_stage = 0;
+                }
                 changed = 1;
             }
-            if ((pressed & ORBIS_PAD_BUTTON_CROSS) && delete_choice == 0) {
-                playden_ps4_game_uninstall_start(detail_app_id);
-                page = 2;
-                changed = 1;
-            } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && delete_choice == 1) {
-                page = 2;
-                changed = 1;
+            if (playden_ps4_delete_stage == 3) {
+                const int job = playden_ps4_maintenance_state();
+                if (job == 2) {
+                    playden_ps4_game_uninstall_start(detail_app_id);
+                    playden_ps4_delete_stage = 0;
+                    page = 2;
+                    changed = 1;
+                } else if (job == 3) {
+                    snprintf(playden_ps4_delete_note, sizeof(playden_ps4_delete_note), "%s",
+                             playden_ps4_maintenance_message());
+                    playden_ps4_delete_stage = 0;
+                    changed = 1;
+                }
             }
+            if (playden_ps4_saves_poll()) changed = 1;
         } else if (page == 5) {
             const int rows = (int)playden_ps4_controls_count();
             if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {

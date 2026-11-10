@@ -53,6 +53,9 @@ extern "C" const char *playden_ps4_library_collection_name(std::size_t index);
 extern "C" std::size_t playden_ps4_library_collection_size(std::size_t index);
 extern "C" int playden_ps4_library_in_collection(std::uint32_t app_id, std::size_t index);
 extern "C" int playden_ps4_maintenance_state(void);
+// Delete (page 3): main.c's stage (0 choosing, 1 Cloud sync, 2-3 prefix backup and removal) and why it stopped.
+extern "C" int playden_ps4_delete_stage;
+extern "C" char playden_ps4_delete_note[160];
 extern "C" const char *playden_ps4_maintenance_message(void);
 extern "C" const char *playden_ps4_maintenance_backup_label(std::uint32_t app_id);
 // Maintenance (page 10): main.c arms the prefix reset with a first Cross.
@@ -902,23 +905,34 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
         if (font_ready)
         {
             const char *title = playden_ps4_library_title_by_app_id(playden_ps4_game_details_app_id());
-            list.text(font, 0, "DELETE GAME", 390, 306, 24, accent);
-            list.text(font, 0, title, 390, 378, 40, ink);
-            list.text(font, 0, "This removes only Playden-managed game files.", 390, 438, 23, secondary);
-            list.text(font, 0, "The Playden Wine prefix and saves are kept.",
-                      390, 478, 21, secondary);
-            const char *choices[] = {"DELETE GAME FILES", "KEEP GAME"};
-            for (int i = 0; i < 2; ++i)
+            list.text(font, 0, "DELETE GAME", 390, 296, 24, accent);
+            list.text(font, 0, font.fit(title, 40, 1140), 390, 360, 40, ink);
+            const bool signed_in = auth_state == 6 || auth_state == 7;
+            list.text(font, 0, signed_in ? "Steam Cloud saves are synced first."
+                                         : "Not signed in: Steam Cloud saves are not synced first.",
+                      390, 408, 19, secondary);
+            list.text(font, 0, "Saves a game keeps in its own folder are deleted with it.", 390, 440, 19,
+                      secondary);
+            const char *choices[] = {"DELETE GAME, KEEP ITS WINE PREFIX AND SAVES",
+                                     "DELETE GAME AND ITS WINE PREFIX (SAVES BACKED UP FIRST)", "KEEP GAME"};
+            for (int i = 0; i < 3; ++i)
             {
-                const Rect row{390, 540.0F + static_cast<float>(i) * 76.0F, 1140, 58};
+                const Rect row{390, 478.0F + static_cast<float>(i) * 72.0F, 1140, 58};
                 if (delete_choice == i)
                     list.bordered_rect(row, 8, Color::rgb(0xf0863a, 0.16F), 1.5F, accent);
                 else
                     list.rounded_rect(row, 8, bg);
-                list.text(font, 0, choices[i], 416, 578.0F + static_cast<float>(i) * 76.0F,
-                          21, delete_choice == i ? ink : secondary);
+                list.text(font, 0, choices[i], 416, 515.0F + static_cast<float>(i) * 72.0F,
+                          20, delete_choice == i ? ink : secondary);
             }
-            hint_text(list, font, "UP / DOWN  CHOOSE     CROSS  CONFIRM     CIRCLE  CANCEL",
+            const int stage = playden_ps4_delete_stage;
+            const char *status = stage == 1 ? "Syncing Steam Cloud saves before deleting…"
+                : stage >= 2 ? playden_ps4_maintenance_message() : playden_ps4_delete_note;
+            if (status[0])
+                list.text(font, 0, font.fit(status, 19, 1140), 390, 726, 19,
+                          stage == 0 ? Color::rgb(0xffc477) : accent);
+            hint_text(list, font, stage == 3 ? "REMOVING THE WINE PREFIX…" : stage == 1 ? "CIRCLE  CANCEL" :
+                                  "UP / DOWN  CHOOSE     CROSS  CONFIRM     CIRCLE  CANCEL",
                       96, 970, 17, secondary);
         }
     }
