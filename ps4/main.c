@@ -66,7 +66,18 @@ int playden_ps4_overrides_toggle(size_t item);
 int playden_ps4_install_sheet_open(uint32_t app_id);
 void playden_ps4_install_sheet_step(int row, int direction);
 int playden_ps4_game_details_incomplete(void);
+int playden_ps4_library_search_edit(int user_id);
+int playden_ps4_library_sort_cycle(void);
+size_t playden_ps4_library_collection_count(void);
+int playden_ps4_library_collection_create(int user_id);
+int playden_ps4_library_collection_delete(size_t index);
+int playden_ps4_library_collection_toggle(uint32_t app_id, size_t index);
 const char *playden_ps4_auth_challenge(void);
+
+/* The game the collection picker (page 9) is for; ui.cpp draws from it. */
+uint32_t playden_ps4_collection_app_id = 0;
+/* The Library tab's views (Home uses 0: the installed list, unsearched); ui.cpp has the same rule. */
+static int library_filter(int tab, int row) { return tab == 0 ? 0 : 1000 + row; }
 const char *playden_ps4_auth_failure(void);
 
 enum { WIDTH = 1920, HEIGHT = 1080, BUFFERS = 3 };
@@ -378,11 +389,18 @@ int playden_ps4_main(int argc, char **argv) {
                 changed = 1;
             }
             if (pressed & ORBIS_PAD_BUTTON_DOWN) {
-                if (delete_choice < 2) ++delete_choice;
+                if (delete_choice < 3) ++delete_choice;
                 changed = 1;
             }
-            if (pressed & ORBIS_PAD_BUTTON_CROSS) {
-                const int filter = tab == 0 ? 0 : selected;
+            if ((pressed & ORBIS_PAD_BUTTON_CROSS) && delete_choice == 2) {
+                /* Collections: the picker keeps this game even when the view below changes. */
+                playden_ps4_collection_app_id = playden_ps4_library_visible_app_id(library_filter(tab, selected),
+                                                                                   (size_t)game_selected);
+                page = 9;
+                delete_choice = 0;
+                changed = 1;
+            } else if (pressed & ORBIS_PAD_BUTTON_CROSS) {
+                const int filter = library_filter(tab, selected);
                 const uint32_t app_id = playden_ps4_library_visible_app_id(filter, (size_t)game_selected);
                 int saved = 1;
                 if (delete_choice == 0)
@@ -391,10 +409,43 @@ int playden_ps4_main(int argc, char **argv) {
                     saved = playden_ps4_library_toggle_hidden(app_id);
                 if (!saved) log_line("PLDN10001: could not save library organization change");
                 page = 0;
-                game_focus = delete_choice != 2;
+                game_focus = delete_choice != 3;
                 const int count = (int)playden_ps4_library_visible_count(filter);
                 if (count <= 0) { game_selected = 0; game_focus = 0; }
                 else if (game_selected >= count) game_selected = count - 1;
+                changed = 1;
+            }
+        } else if (page == 9) {
+            /* Collections for one game: Cross ticks a collection or makes a new one; Square deletes one. */
+            const int count = (int)playden_ps4_library_collection_count();
+            if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
+                page = 0;
+                const int visible = (int)playden_ps4_library_visible_count(library_filter(tab, selected));
+                game_focus = visible > 0;
+                if (game_selected >= visible) game_selected = visible > 0 ? visible - 1 : 0;
+                changed = 1;
+            }
+            if ((pressed & ORBIS_PAD_BUTTON_UP) && delete_choice > 0) { --delete_choice; changed = 1; }
+            if ((pressed & ORBIS_PAD_BUTTON_DOWN) && delete_choice < count) { ++delete_choice; changed = 1; }
+            if (pressed & ORBIS_PAD_BUTTON_CROSS) {
+                if (delete_choice < count) {
+                    if (!playden_ps4_library_collection_toggle(playden_ps4_collection_app_id, (size_t)delete_choice))
+                        log_line("PLDN10001: could not save collection change");
+                } else {
+                    const int made = playden_ps4_library_collection_create(user);
+                    if (made >= 0) {
+                        playden_ps4_library_collection_toggle(playden_ps4_collection_app_id, (size_t)made);
+                        delete_choice = made;
+                    }
+                }
+                changed = 1;
+            }
+            if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && delete_choice < count) {
+                if (playden_ps4_library_collection_delete((size_t)delete_choice)) {
+                    /* The Library tab's row for it, or one after it, moves up. */
+                    if (tab == 1 && selected >= 4 + delete_choice) selected = selected > 4 + delete_choice ? selected - 1 : 1;
+                    if (delete_choice > 0 && delete_choice >= count - 1) --delete_choice;
+                }
                 changed = 1;
             }
         } else {
@@ -403,7 +454,15 @@ int playden_ps4_main(int argc, char **argv) {
                     game_focus = 0;
                     changed = 1;
                 }
-                const int game_count = (int)playden_ps4_library_visible_count(tab == 0 ? 0 : selected);
+                const int game_count = (int)playden_ps4_library_visible_count(library_filter(tab, selected));
+                /* Library search and sort, from the grid. */
+                if (tab == 1 && (pressed & (ORBIS_PAD_BUTTON_TRIANGLE | ORBIS_PAD_BUTTON_R1))) {
+                    if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) playden_ps4_library_search_edit(user);
+                    else playden_ps4_library_sort_cycle();
+                    game_selected = 0;
+                    if (playden_ps4_library_visible_count(library_filter(tab, selected)) == 0) game_focus = 0;
+                    changed = 1;
+                }
                 if (tab == 0) {
                     if ((pressed & ORBIS_PAD_BUTTON_LEFT) && game_selected > 0) {
                         --game_selected; changed = 1;
@@ -431,13 +490,13 @@ int playden_ps4_main(int argc, char **argv) {
                     }
                 }
                 if ((pressed & ORBIS_PAD_BUTTON_CROSS) && game_count > 0) {
-                    const int filter = tab == 0 ? 0 : selected;
+                    const int filter = library_filter(tab, selected);
                     detail_app_id = playden_ps4_library_visible_app_id(filter, (size_t)game_selected);
                     playden_ps4_game_details_start(detail_app_id);
                     page = 2; changed = 1;
                 }
                 if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && game_count > 0) {
-                    const int filter = tab == 0 ? 0 : selected;
+                    const int filter = library_filter(tab, selected);
                     const uint32_t app_id = playden_ps4_library_visible_app_id(filter, (size_t)game_selected);
                     if (!playden_ps4_library_toggle_favorite(app_id))
                         log_line("PLDN10001: could not save favorite change");
@@ -465,18 +524,25 @@ int playden_ps4_main(int argc, char **argv) {
                 const int auth_state = playden_ps4_auth_state();
                 const int steam_connected = auth_state == 6 || auth_state == 7;
                 const int installed_games = (int)playden_ps4_library_visible_count(0);
-                const int max_selection = tab == 1 ? (steam_connected ? 3 : 4) : tab == 3 && saves_state == 3 ? 2 :
+                const int library_rows = 4 + (int)playden_ps4_library_collection_count();
+                const int max_selection = tab == 1 ? library_rows - (steam_connected ? 1 : 0) : tab == 3 && saves_state == 3 ? 2 :
                                           tab == 3 && saves_state == 1 ? 0 :
                                           tab == 3 ? (installed_games > 0 ? installed_games - 1 : 0) :
                                           tab == 4 ? 6 : 0;
                 if ((pressed & ORBIS_PAD_BUTTON_DOWN) && selected < max_selection) { ++selected; changed = 1; }
-                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 1 && selected < 4 &&
-                    playden_ps4_library_visible_count(selected) > 0) {
+                /* Library search and sort from the views menu too. */
+                if (tab == 1 && (pressed & (ORBIS_PAD_BUTTON_TRIANGLE | ORBIS_PAD_BUTTON_R1))) {
+                    if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) playden_ps4_library_search_edit(user);
+                    else playden_ps4_library_sort_cycle();
+                    changed = 1;
+                }
+                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 1 && selected < library_rows &&
+                    playden_ps4_library_visible_count(library_filter(tab, selected)) > 0) {
                     game_focus = 1;
                     game_selected = 0;
                     changed = 1;
                 } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 1 &&
-                           selected == 4 && !steam_connected) {
+                           selected == library_rows && !steam_connected) {
                     playden_ps4_auth_start();
                     page = 1;
                     changed = 1;

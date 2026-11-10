@@ -13,6 +13,7 @@
 #include "library/cache.h"
 #include "library/service.h"
 #include "library/organization.h"
+#include "library/query.h"
 #include "steam/backend/cm_client.h"
 #include "steam/backend/app_info.h"
 #include "steam/backend/cdn_client.h"
@@ -1160,10 +1161,28 @@ std::uint32_t SteamQrAuth::library_visible_app_id(int filter, std::size_t index)
     return index < indices.size() ? games_[indices[index]].id.steam_app().value_or(0) : 0;
 }
 
+namespace {
+// The Library tab's sorts, by the names the organization file keeps (OrganizationSnapshot::sort).
+struct LibrarySortName { const char *id; const char *label; };
+constexpr LibrarySortName kLibrarySorts[] = {
+    {"name", "Name"}, {"recent-played", "Recently played"}, {"recent-added", "Recently added"},
+    {"playtime", "Most played"}};
+constexpr int kLibrarySortCount = static_cast<int>(sizeof(kLibrarySorts) / sizeof(kLibrarySorts[0]));
+// Filter numbers: 0 is Home's installed list (no search, Steam's order). The Library tab passes
+// kLibraryView + its row: 0 Installed, 1 All games, 2 Favorites, 3 Hidden, then one row per collection.
+constexpr int kLibraryView = 1000;
+} // namespace
+
 std::vector<std::size_t> SteamQrAuth::visible_library_indices_locked(int filter) const
 {
     std::vector<std::size_t> indices;
-    if (filter < 0 || filter > 3) return indices;
+    const bool library_view = filter >= kLibraryView;
+    const int row = library_view ? filter - kLibraryView : filter;
+    const std::size_t collections = organization_.collections.size();
+    if (row < 0 || static_cast<std::size_t>(row) >= 4 + (library_view ? collections : 0)) return indices;
+    const playden::OrganizationCollection *collection =
+        row >= 4 ? &organization_.collections[static_cast<std::size_t>(row - 4)] : nullptr;
+    const std::string query = library_view ? playden::FoldLibraryText(organization_.query) : std::string();
     for (std::size_t i = 0; i < games_.size(); ++i)
     {
         const std::uint32_t app_id = games_[i].id.steam_app().value_or(0);
@@ -1171,12 +1190,152 @@ std::vector<std::size_t> SteamQrAuth::visible_library_indices_locked(int filter)
         const bool hidden = hidden_games_.contains(app_id);
         const bool favorite = favorite_games_.contains(app_id);
         const bool installed = std::find(installed_games_.begin(), installed_games_.end(), i) != installed_games_.end();
-        if (filter == 0 && installed && !hidden) indices.push_back(i);
-        else if (filter == 1 && !hidden) indices.push_back(i);
-        else if (filter == 2 && favorite && !hidden) indices.push_back(i);
-        else if (filter == 3 && hidden) indices.push_back(i);
+        bool shown = false;
+        if (collection) shown = !hidden && collection->members.contains(games_[i].id);
+        else if (row == 0) shown = installed && !hidden;
+        else if (row == 1) shown = !hidden;
+        else if (row == 2) shown = favorite && !hidden;
+        else if (row == 3) shown = hidden;
+        if (shown && !query.empty() &&
+            playden::FoldLibraryText(games_[i].title).find(query) == std::string::npos)
+            shown = false;
+        if (shown) indices.push_back(i);
     }
+    if (!library_view) return indices;
+    // Sorted by the chosen order, then by name; games without a date or playtime go last.
+    std::vector<std::string> names(games_.size());
+    for (const auto i : indices) names[i] = playden::FoldLibraryText(games_[i].title);
+    const std::string sort = organization_.sort;
+    const auto key = [&](std::size_t i) -> std::uint64_t {
+        const auto &game = games_[i];
+        if (sort == "recent-played") return game.last_played_unix_seconds.value_or(0);
+        if (sort == "recent-added") return game.added_at_unix_seconds.value_or(0);
+        if (sort == "playtime") return game.playtime_minutes.value_or(0);
+        return 0;
+    };
+    std::stable_sort(indices.begin(), indices.end(), [&](std::size_t a, std::size_t b) {
+        const auto ka = key(a), kb = key(b);
+        if (ka != kb) return ka > kb;
+        if (names[a] != names[b]) return names[a] < names[b];
+        return a < b;
+    });
     return indices;
+}
+
+std::string SteamQrAuth::library_query() const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    return organization_.query;
+}
+
+bool SteamQrAuth::library_set_query(const std::string &query)
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    const auto first = query.find_first_not_of(' ');
+    const std::string trimmed = first == std::string::npos ? std::string()
+        : query.substr(first, query.find_last_not_of(' ') - first + 1);
+    if (trimmed.size() > 256) return false;
+    organization_.query = trimmed;
+    return persist_library_organization_locked();
+}
+
+int SteamQrAuth::library_sort() const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    for (int i = 0; i < kLibrarySortCount; ++i)
+        if (organization_.sort == kLibrarySorts[i].id) return i;
+    return 0;
+}
+
+bool SteamQrAuth::library_cycle_sort()
+{
+    const int next = (library_sort() + 1) % kLibrarySortCount;
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    organization_.sort = kLibrarySorts[next].id;
+    return persist_library_organization_locked();
+}
+
+std::size_t SteamQrAuth::library_collection_count() const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    return organization_.collections.size();
+}
+
+std::string SteamQrAuth::library_collection_name(std::size_t index) const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    return index < organization_.collections.size() ? organization_.collections[index].name : std::string();
+}
+
+std::size_t SteamQrAuth::library_collection_size(std::size_t index) const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    return visible_library_indices_locked(kLibraryView + 4 + static_cast<int>(index)).size();
+}
+
+int SteamQrAuth::library_create_collection(const std::string &name)
+{
+    const auto first = name.find_first_not_of(" \t");
+    if (first == std::string::npos) return -1;
+    const std::string trimmed = name.substr(first, name.find_last_not_of(" \t") - first + 1);
+    if (trimmed.size() > 128) return -1;
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    if (!organization_ready_ || organization_.collections.size() >= 256) return -1;
+    for (std::size_t i = 0; i < organization_.collections.size(); ++i)
+        if (organization_.collections[i].name == trimmed) return static_cast<int>(i);
+    // Ids are letters, digits, '-' and '_' (OrganizationSnapshotIsValid); "c-<n>", the first one free.
+    std::string id;
+    for (unsigned n = 1; id.empty(); ++n) {
+        const std::string candidate = "c-" + std::to_string(n);
+        if (std::none_of(organization_.collections.begin(), organization_.collections.end(),
+                         [&](const auto &c) { return c.id == candidate; }))
+            id = candidate;
+    }
+    playden::OrganizationCollection collection;
+    collection.id = id;
+    collection.name = trimmed;
+    organization_.collections.push_back(collection);
+    if (!persist_library_organization_locked()) {
+        organization_.collections.pop_back();
+        return -1;
+    }
+    return static_cast<int>(organization_.collections.size() - 1);
+}
+
+bool SteamQrAuth::library_delete_collection(std::size_t index)
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    if (index >= organization_.collections.size()) return false;
+    const auto removed = organization_.collections[index];
+    organization_.collections.erase(organization_.collections.begin() + static_cast<std::ptrdiff_t>(index));
+    // A scope naming the collection would make the file invalid.
+    const std::string scope = organization_.scope;
+    if (scope == removed.id) organization_.scope = "all";
+    if (persist_library_organization_locked()) return true;
+    organization_.collections.insert(organization_.collections.begin() + static_cast<std::ptrdiff_t>(index), removed);
+    organization_.scope = scope;
+    return false;
+}
+
+bool SteamQrAuth::library_in_collection(std::uint32_t app_id, std::size_t index) const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    return index < organization_.collections.size() &&
+           organization_.collections[index].members.contains(playden::GameId::Steam(app_id));
+}
+
+bool SteamQrAuth::library_toggle_collection(std::uint32_t app_id, std::size_t index)
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    if (index >= organization_.collections.size() || app_id == 0) return false;
+    auto &members = organization_.collections[index].members;
+    const auto id = playden::GameId::Steam(app_id);
+    const bool added = members.insert(id).second;
+    if (!added) members.erase(id);
+    if (persist_library_organization_locked()) return true;
+    if (added) members.erase(id);
+    else members.insert(id);
+    return false;
 }
 
 bool SteamQrAuth::library_is_favorite(std::uint32_t app_id) const
@@ -2636,6 +2795,57 @@ extern "C" int playden_ps4_library_is_favorite(std::uint32_t app_id)
 extern "C" int playden_ps4_library_is_hidden(std::uint32_t app_id)
 {
     return auth().library_is_hidden(app_id) ? 1 : 0;
+}
+extern "C" int playden_ps4_library_search_edit(int user_id)
+{
+    std::string edited;
+    const int result = EditTextWithSystemKeyboard(user_id, "Search the library", "Part of a game's name",
+                                                  auth().library_query(), 64, &edited);
+    if (result != 1) return 0;
+    return auth().library_set_query(edited) ? 1 : -1;
+}
+extern "C" void playden_ps4_library_search_clear() { auth().library_set_query(""); }
+extern "C" const char *playden_ps4_library_search_text()
+{
+    static std::string text;
+    text = auth().library_query();
+    return text.c_str();
+}
+extern "C" int playden_ps4_library_sort_cycle() { return auth().library_cycle_sort() ? 1 : 0; }
+extern "C" const char *playden_ps4_library_sort_label()
+{
+    return playden::ps4::kLibrarySorts[auth().library_sort()].label;
+}
+extern "C" std::size_t playden_ps4_library_collection_count() { return auth().library_collection_count(); }
+extern "C" const char *playden_ps4_library_collection_name(std::size_t index)
+{
+    static std::string names[8];
+    static unsigned next = 0;
+    auto &name = names[next++ % 8];
+    name = auth().library_collection_name(index);
+    return name.c_str();
+}
+extern "C" std::size_t playden_ps4_library_collection_size(std::size_t index)
+{
+    return auth().library_collection_size(index);
+}
+extern "C" int playden_ps4_library_collection_create(int user_id)
+{
+    std::string name;
+    if (EditTextWithSystemKeyboard(user_id, "New collection", "Collection name", "", 48, &name) != 1) return -1;
+    return auth().library_create_collection(name);
+}
+extern "C" int playden_ps4_library_collection_delete(std::size_t index)
+{
+    return auth().library_delete_collection(index) ? 1 : 0;
+}
+extern "C" int playden_ps4_library_in_collection(std::uint32_t app_id, std::size_t index)
+{
+    return auth().library_in_collection(app_id, index) ? 1 : 0;
+}
+extern "C" int playden_ps4_library_collection_toggle(std::uint32_t app_id, std::size_t index)
+{
+    return auth().library_toggle_collection(app_id, index) ? 1 : 0;
 }
 extern "C" int playden_ps4_library_toggle_favorite(std::uint32_t app_id)
 {

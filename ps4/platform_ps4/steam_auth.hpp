@@ -49,6 +49,19 @@ class SteamQrAuth
     bool library_is_hidden(std::uint32_t app_id) const;
     bool library_toggle_favorite(std::uint32_t app_id);
     bool library_toggle_hidden(std::uint32_t app_id);
+    // Library search, sort and collections, kept in the organization file (Leo's format: query, sort
+    // name, collections), so they survive a restart. They apply to the Library tab's views, not Home.
+    std::string library_query() const;
+    bool library_set_query(const std::string &query);
+    int library_sort() const;                 // index into kLibrarySorts
+    bool library_cycle_sort();
+    std::size_t library_collection_count() const;
+    std::string library_collection_name(std::size_t index) const;
+    std::size_t library_collection_size(std::size_t index) const;
+    int library_create_collection(const std::string &name);   // its index, or -1
+    bool library_delete_collection(std::size_t index);
+    bool library_in_collection(std::uint32_t app_id, std::size_t index) const;
+    bool library_toggle_collection(std::uint32_t app_id, std::size_t index);
     std::string library_detail() const;
     void request_game_details(std::uint32_t app_id);
     int game_details_state() const;

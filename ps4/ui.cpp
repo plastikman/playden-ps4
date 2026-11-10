@@ -46,6 +46,16 @@ extern "C" {
 #include "native/pw_update_ps4.h"
 }
 extern "C" int playden_ps4_library_is_hidden(std::uint32_t app_id);
+extern "C" const char *playden_ps4_library_search_text();
+extern "C" const char *playden_ps4_library_sort_label();
+extern "C" std::size_t playden_ps4_library_collection_count();
+extern "C" const char *playden_ps4_library_collection_name(std::size_t index);
+extern "C" std::size_t playden_ps4_library_collection_size(std::size_t index);
+extern "C" int playden_ps4_library_in_collection(std::uint32_t app_id, std::size_t index);
+// The game the collection picker (page 9) is for; main.c sets it when the picker opens.
+extern "C" std::uint32_t playden_ps4_collection_app_id;
+// The Library tab's views (Home uses 0: the installed list, unsearched); main.c has the same rule.
+static int library_filter(int tab, int row) { return tab == 0 ? 0 : 1000 + row; }
 extern "C" const char *playden_ps4_library_detail();
 extern "C" int playden_ps4_game_details_state();
 extern "C" int playden_ps4_game_details_installed();
@@ -625,22 +635,22 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             list.text(font, 0, controller_ready ? "DUALSHOCK 4 CONNECTED" : "CONNECT A DUALSHOCK 4",
                       98, 232, 16, secondary);
         }
-        const char *filters[] = {"Installed", "All games", "Favorites", "Hidden"};
-        const std::size_t visible_count = selected >= 0 && selected <= 3
-            ? playden_ps4_library_visible_count(selected) : 0;
-        const std::string installed_count = std::to_string(playden_ps4_library_visible_count(0));
-        const std::string all_count = std::to_string(playden_ps4_library_visible_count(1));
-        const std::string favorites_count = std::to_string(playden_ps4_library_visible_count(2));
-        const std::string hidden_count = std::to_string(playden_ps4_library_visible_count(3));
+        // The four views, then one row per collection; counts follow the search.
+        const int collection_count = static_cast<int>(playden_ps4_library_collection_count());
+        const int filter_count = 4 + collection_count;
+        const int connect_index = filter_count;
+        const std::size_t visible_count = selected >= 0 && selected < filter_count
+            ? playden_ps4_library_visible_count(1000 + selected) : 0;
         const std::string installed_detail = std::to_string(visible_count) +
             (visible_count == 1 ? " game" : " games");
-        const char *counts[] = {installed_count.c_str(), all_count.c_str(),
-                                favorites_count.c_str(), hidden_count.c_str()};
-        const int filter_count = 4;
-        const int connect_index = 4;
-        for (int i = 0; i < filter_count; ++i)
+        constexpr int kMenuRows = 9;
+        const int first_row = std::max(0, std::min(selected, filter_count - 1) - (kMenuRows - 1));
+        for (int i = first_row; i < filter_count && i < first_row + kMenuRows; ++i)
         {
-            const float y = 282.0F + static_cast<float>(i) * 68.0F;
+            const char *names[] = {"Installed", "All games", "Favorites", "Hidden"};
+            const std::string name = i < 4 ? names[i] : playden_ps4_library_collection_name(static_cast<std::size_t>(i - 4));
+            const std::string count = std::to_string(playden_ps4_library_visible_count(1000 + i));
+            const float y = 282.0F + static_cast<float>(i - first_row) * 68.0F;
             const Rect row{96, y, 316, 58};
             if (i == selected)
                 list.bordered_rect(row, 8, Color::rgb(0xf3efe9, 0.08F), 1.0F,
@@ -649,12 +659,22 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 list.rounded_rect(row, 8, bg);
             if (font_ready)
             {
-                list.text(font, 0, filters[i], 116, y + 36, 22,
+                list.text(font, 0, font.fit(name, 22, 230), 116, y + 36, 22,
                           i == selected ? ink : secondary);
-                list.text(font, 0, counts[i], 390, y + 36, 18, secondary, Align::right);
+                list.text(font, 0, count, 390, y + 36, 18, secondary, Align::right);
+                if (i == 3 && collection_count > 0)
+                    list.rounded_rect({116, y + 63, 274, 1}, 0, Color::rgb(0xf3efe9, 0.12F));
             }
         }
         list.rounded_rect({510, 272, 1304, 690}, 16, panel);
+        const std::string search = playden_ps4_library_search_text();
+        if (font_ready && selected < filter_count)
+        {
+            std::string order = std::string("SORT  ") + playden_ps4_library_sort_label();
+            if (!search.empty()) order = "SEARCH  \"" + search + "\"     " + order;
+            list.text(font, 0, font.fit(order, 17, 760), 1780, 320, 17, search.empty() ? secondary : accent,
+                      Align::right);
+        }
         if (visible_count == 0)
         {
             list.rounded_rect({574, 344, 44, 4}, 2, accent);
@@ -662,13 +682,18 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             {
                 const bool steam_connected = auth_state == 6 || auth_state == 7;
                 const bool show_connect = !steam_connected && selected == connect_index;
+                const bool searched = !search.empty() && selected < filter_count;
                 const char *empty = auth_state == 5 ? "LOADING STEAM LIBRARY" :
+                    searched ? "NO MATCHES" :
+                    selected >= 4 && selected < filter_count ? "NO GAMES IN THIS COLLECTION" :
                     selected == 0 ? "NO INSTALLED GAMES" :
                     selected == 2 ? "NO FAVORITES YET" :
                     selected == 3 ? "NO HIDDEN GAMES" :
                     selected == connect_index ? "STEAM NOT CONNECTED" : "NO GAMES HERE";
                 list.text(font, 0, empty, 1162, 472, 42, ink, Align::center);
-                const char *detail = selected != 1 && auth_state == 6 ?
+                const char *detail = searched ? "Nothing here matches the search. Triangle changes it." :
+                    selected >= 4 && selected < filter_count ? "Open Actions on a game and add it to this collection." :
+                    selected != 1 && auth_state == 6 ?
                     (selected == 0 ? "Games you install on this console will appear here." :
                      selected == 2 ? "Press Square on a game to add it to Favorites." :
                      selected == 3 ? "Hidden games appear here. Open Actions on a game to hide it." :
@@ -683,7 +708,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                     list.text(font, 0, "CONNECT STEAM", 1162, 644, 24, ink, Align::center);
                 }
                 hint_text(list, font, selected == connect_index && show_connect ? "CROSS  CONNECT     CIRCLE  BACK" :
-                          "UP / DOWN  MOVE     CROSS  OPEN     CIRCLE  BACK",
+                          "UP / DOWN  MOVE     TRIANGLE  SEARCH     R1  SORT     CIRCLE  BACK",
                           96, 970, 17, secondary);
             }
         }
@@ -705,8 +730,8 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 const float y = 354.0F + static_cast<float>(i / 6) * 326.0F;
                 const bool focused = game_focus && game_index == static_cast<std::size_t>(game_selected);
                 const Rect cover{x, y, 180.0F, 270.0F};
-                const std::uint32_t app_id = playden_ps4_library_visible_app_id(selected, game_index);
-                const std::string title = playden_ps4_library_visible_title(selected, game_index);
+                const std::uint32_t app_id = playden_ps4_library_visible_app_id(1000 + selected, game_index);
+                const std::string title = playden_ps4_library_visible_title(1000 + selected, game_index);
                 const auto game_id = playden::GameId::Steam(app_id);
                 const std::string url = playden::homebrew::CoverUrl(game_id);
                 const std::uint32_t texture = art.cache.TextureFor(game_id, url);
@@ -740,8 +765,9 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                     list.bordered_rect({cover.x - 4.0F, cover.y - 4.0F, cover.w + 8.0F, cover.h + 8.0F},
                                        10.0F, Color::rgb(0x000000, 0.0F), 3.0F, accent);
             }
-            hint_text(list, font, game_focus ? "UP / DOWN / LEFT / RIGHT  SELECT     CROSS  DETAILS     SQUARE  FAVORITE     OPTIONS     CIRCLE  FILTERS" :
-                      "CROSS  BROWSE GAMES     UP / DOWN  FILTERS",
+            hint_text(list, font, game_focus ? "ARROWS  SELECT     CROSS  DETAILS     SQUARE  FAVORITE     TRIANGLE  SEARCH     "
+                                               "R1  SORT     OPTIONS     CIRCLE  BACK" :
+                      "CROSS  BROWSE GAMES     UP / DOWN  VIEWS     TRIANGLE  SEARCH     R1  SORT",
                       96, 970, 17, secondary);
         }
     }
@@ -754,7 +780,8 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             const std::uint32_t detail_app_id = playden_ps4_game_details_app_id();
             const char *detail_title = playden_ps4_library_title_by_app_id(detail_app_id);
             list.text(font, 0, detail_title[0] ? detail_title :
-                      playden_ps4_library_visible_title(selected, static_cast<std::size_t>(game_selected)),
+                      playden_ps4_library_visible_title(library_filter(tab, selected),
+                                                        static_cast<std::size_t>(game_selected)),
                       530, 356, 44, ink);
             const Rect poster{260, 322, 220, 330};
             const playden::GameId detail_game = playden::GameId::Steam(detail_app_id);
@@ -869,8 +896,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
         list.rounded_rect({300, 210, 1320, 650}, 18, panel);
         if (font_ready)
         {
-            const char *title = playden_ps4_library_visible_title(selected,
-                static_cast<std::size_t>(game_selected));
+            const char *title = playden_ps4_library_title_by_app_id(playden_ps4_game_details_app_id());
             list.text(font, 0, "DELETE GAME", 390, 306, 24, accent);
             list.text(font, 0, title, 390, 378, 40, ink);
             list.text(font, 0, "This removes only Playden-managed game files.", 390, 438, 23, secondary);
@@ -1061,7 +1087,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
     }
     else if (page == 4)
     {
-        const int filter = tab == 0 ? 0 : selected;
+        const int filter = library_filter(tab, selected);
         const std::uint32_t app_id = playden_ps4_library_visible_app_id(
             filter, static_cast<std::size_t>(std::max(game_selected, 0)));
         const char *title = playden_ps4_library_visible_title(
@@ -1074,9 +1100,10 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             const char *choices[] = {
                 playden_ps4_library_is_favorite(app_id) ? "REMOVE FROM FAVORITES" : "ADD TO FAVORITES",
                 playden_ps4_library_is_hidden(app_id) ? "UNHIDE GAME" : "HIDE GAME",
+                "ADD TO COLLECTION…",
                 "CANCEL"
             };
-            for (int i = 0; i < 3; ++i)
+            for (int i = 0; i < 4; ++i)
             {
                 const Rect row{560, 438.0F + static_cast<float>(i) * 76.0F, 800, 58};
                 if (delete_choice == i)
@@ -1087,6 +1114,51 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                           21, delete_choice == i ? ink : secondary);
             }
             hint_text(list, font, "UP / DOWN  CHOOSE     CROSS  SELECT     CIRCLE  BACK",
+                      96, 970, 17, secondary);
+        }
+    }
+    else if (page == 9)
+    {
+        // Collections for one game: tick to add or remove; the last row makes a new one.
+        const std::uint32_t app_id = playden_ps4_collection_app_id;
+        list.rounded_rect({480, 200, 960, 700}, 16, panel);
+        if (font_ready)
+        {
+            const char *title = playden_ps4_library_title_by_app_id(app_id);
+            list.text(font, 0, "COLLECTIONS", 560, 278, 24, accent);
+            list.text(font, 0, font.fit(title[0] ? title : "Selected game", 34, 800), 560, 332, 34, ink);
+            const int count = static_cast<int>(playden_ps4_library_collection_count());
+            const int rows = count + 1;
+            constexpr int kVisible = 6;
+            const int first = std::max(0, std::min(delete_choice - kVisible / 2, rows - kVisible));
+            for (int i = 0; i < kVisible && first + i < rows; ++i)
+            {
+                const int row = first + i;
+                const float y = 380.0F + static_cast<float>(i) * 70.0F;
+                const Rect box{560, y, 800, 56};
+                if (row == delete_choice)
+                    list.bordered_rect(box, 8, Color::rgb(0xf0863a, 0.16F), 1.5F, accent);
+                else
+                    list.rounded_rect(box, 8, bg);
+                std::string label;
+                bool on = false;
+                if (row == count) label = "NEW COLLECTION…";
+                else {
+                    on = playden_ps4_library_in_collection(app_id, static_cast<std::size_t>(row)) != 0;
+                    label = std::string(on ? "[x]  " : "[  ]  ") +
+                            playden_ps4_library_collection_name(static_cast<std::size_t>(row));
+                }
+                list.text(font, 0, font.fit(label, 21, 640), 586, y + 36, 21,
+                          on ? accent : row == delete_choice ? ink : secondary);
+                if (row < count)
+                    list.text(font, 0, std::to_string(playden_ps4_library_collection_size(static_cast<std::size_t>(row))),
+                              1336, y + 36, 18, secondary, Align::right);
+            }
+            if (count == 0)
+                list.text(font, 0, "No collections yet. Make one, then add games to it.", 560, 850, 18, secondary);
+            hint_text(list, font,
+                      delete_choice < count ? "UP / DOWN  CHOOSE     CROSS  ADD / REMOVE     SQUARE  DELETE COLLECTION     CIRCLE  BACK"
+                                            : "UP / DOWN  CHOOSE     CROSS  NEW COLLECTION     CIRCLE  BACK",
                       96, 970, 17, secondary);
         }
     }
