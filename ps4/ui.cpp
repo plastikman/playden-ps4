@@ -53,6 +53,11 @@ extern "C" const char *playden_ps4_library_collection_name(std::size_t index);
 extern "C" std::size_t playden_ps4_library_collection_size(std::size_t index);
 extern "C" int playden_ps4_library_in_collection(std::uint32_t app_id, std::size_t index);
 extern "C" int playden_ps4_maintenance_state(void);
+extern "C" const char *playden_ps4_auth_prompt();
+extern "C" const char *playden_ps4_auth_account_name();
+extern "C" int playden_ps4_auth_guard_code_wanted();
+// Settings' Steam account row: main.c arms the sign-out with a first Cross.
+extern "C" int playden_ps4_signout_armed;
 // Delete (page 3): main.c's stage (0 choosing, 1 Cloud sync, 2-3 prefix backup and removal) and why it stopped.
 extern "C" int playden_ps4_delete_stage;
 extern "C" char playden_ps4_delete_note[160];
@@ -1336,7 +1341,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             list.text(font, 0, "DOWNLOAD & RUNTIME SETTINGS", 590, 242, 24, accent);
             const char *labels[] = {"Content language", "Remote diagnostic logging",
                                     "Wine log level", "Wait watchdog traces", "Full GPU hang report",
-                                    "Log receiver IP", "Playden update"};
+                                    "Log receiver IP", "Playden update", "Steam account"};
             PwUpdateDownload update{};
             pw_update_ps4_download_status(&update);
             char update_value[64];
@@ -1363,8 +1368,12 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                     ? "PROFILE" : std::string_view(debug_level) == "quiet" ? "QUIET" : "DETAILED",
                 playden_ps4_wait_watchdog_enabled() ? "ON" : "OFF",
                 playden_ps4_gpu_hang_dump_enabled() ? "ON" : "OFF",
-                playden_ps4_log_receiver_ip(), update_value};
-            for (int i = 0; i < 7; ++i)
+                playden_ps4_log_receiver_ip(), update_value,
+                auth_state != 6 && auth_state != 7 ? std::string("Not signed in")
+                : playden_ps4_signout_armed ? std::string("CROSS AGAIN TO SIGN OUT")
+                : playden_ps4_auth_account_name()[0] ? std::string(playden_ps4_auth_account_name())
+                                                     : std::string("Signed in")};
+            for (int i = 0; i < 8; ++i)
             {
                 const Rect row{590, 258.0F + static_cast<float>(i) * 68.0F, 900, 56};
                 if (selected == i)
@@ -1383,6 +1392,9 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                                            ? "CROSS downloads it to /data/pkg, checked against GitHub." :
                                        "Checked once at start on github.com/plastikman/playden-ps4.") :
                       selected == 5 ? "CROSS opens the system keyboard. Saved IP applies when Wine starts." :
+                      selected == 7 ? (auth_state == 6 || auth_state == 7
+                                           ? "CROSS signs out. Installed games and saves stay; sign in again for any account."
+                                           : "CROSS opens Steam sign-in: QR code, or account name and password.") :
                       "CROSS changes the selected setting. Runtime settings apply when Wine starts.",
                       590, 840, 17, secondary);
             const char *receiver_status = playden_ps4_log_receiver_status();
@@ -1472,7 +1484,9 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
         if (font_ready)
         {
             list.text(font, 0, "STEAM SIGN-IN", 260, 334, 42, ink);
-            const char *message = auth_state == 1 ? "Contacting Steam securely…" :
+            const char *prompt = playden_ps4_auth_prompt();
+            const char *message = (auth_state == 1 || auth_state == 8) && prompt[0] ? prompt :
+                                  auth_state == 1 ? "Contacting Steam securely…" :
                                   auth_state == 2 ? "Scan this code with the Steam mobile app." :
                                   auth_state == 3 ? "Steam sign-in complete for this session." :
                                   auth_state == 5 ? "Loading your Steam library…" :
@@ -1506,7 +1520,13 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                                                   0, Color::rgb(0x111111));
                 }
             }
-            hint_text(list, font, "CIRCLE  BACK", 96, 970, 17, secondary);
+            if (auth_state == 2 || auth_state == 4 || auth_state == 0)
+                list.text(font, 0, "No phone handy? Press Square to sign in with your account name and password.",
+                          260, 470, 19, secondary);
+            hint_text(list, font,
+                      playden_ps4_auth_guard_code_wanted() ? "TRIANGLE  TYPE CODE     CIRCLE  CANCEL" :
+                      auth_state == 8 || auth_state == 1 ? "CIRCLE  CANCEL" : "SQUARE  ACCOUNT NAME AND PASSWORD     CIRCLE  BACK",
+                      96, 970, 17, secondary);
         }
     }
     art.cache.EndFrame();

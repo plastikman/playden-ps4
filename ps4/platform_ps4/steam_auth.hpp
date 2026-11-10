@@ -33,6 +33,14 @@ class SteamQrAuth
     bool start();
     bool restore_cached_session();
     void cancel();
+    // Account name and password sign-in (the system keyboard, masked for the password), its Steam Guard
+    // code, and signing out. Sign-in messages for the page come from sign_in_prompt().
+    bool start_password_sign_in(int user_id);
+    bool submit_guard_code(int user_id);
+    void sign_out();
+    std::string sign_in_prompt() const;
+    std::string account_name() const;
+    bool guard_code_wanted() const { return state_ == 8 && guard_code_allowed_; }
     // Pumps completed worker events. Returns true when the UI should redraw.
     bool poll();
     int state() const { return state_; }
@@ -121,6 +129,12 @@ class SteamQrAuth
     int state_ = 0; // idle, waiting, showing QR, authenticated, failed
     bool restoring_session_ = false;
     std::string challenge_url_;
+    // Password sign-in: 8 is "waiting on Steam Guard" (approve in the app, or type a code).
+    bool password_flow_ = false;
+    bool guard_code_allowed_ = false;
+    bool signing_out_ = false;
+    std::string sign_in_prompt_;
+    std::string account_name_;
     mutable std::mutex failure_mutex_;
     std::string pending_failure_detail_;
     std::string failure_detail_;

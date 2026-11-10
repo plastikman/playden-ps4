@@ -24,6 +24,7 @@
 #include "installs/install_record.h"
 #include "steam/backend/native_network.h"
 #include "steam/secret.h"
+#include <cctype>
 #include "steam/service.h"
 #include "steam/session_store.h"
 #include "platform/storage.h"
@@ -218,8 +219,13 @@ void WaitForKeyboard()
 
 // The system keyboard for one line of ASCII text (title and placeholder are ASCII). 1: accepted and
 // stored in *result; 0: cancelled or unavailable; -1: the text was not plain ASCII.
+// IME options (SceImeOption): no automatic capital letters, and a masked field.
+constexpr std::uint32_t kImeNoAutoCapitalization = 0x2;
+constexpr std::uint32_t kImePassword = 0x4;
+
 int EditTextWithSystemKeyboard(int user_id, const char *title_ascii, const char *placeholder_ascii,
-                               const std::string &initial, std::size_t max_length, std::string *result)
+                               const std::string &initial, std::size_t max_length, std::string *result,
+                               std::uint32_t option = 0)
 {
     if (!result || user_id < 0 || max_length == 0 || max_length > 250 ||
         sceSysmoduleLoadModule(ORBIS_SYSMODULE_IME_DIALOG) < 0)
@@ -238,6 +244,7 @@ int EditTextWithSystemKeyboard(int user_id, const char *title_ascii, const char 
     OrbisImeDialogSetting settings {};
     settings.userId = static_cast<std::uint32_t>(user_id);
     settings.type = ORBIS_TYPE_BASIC_LATIN;  // letters, digits and symbols, as Orbis-Win's keyboard
+    settings.option = option;
     settings.enterLabel = ORBIS_BUTTON_LABEL_DEFAULT;
     settings.maxTextLength = static_cast<std::uint32_t>(max_length);
     settings.inputTextBuffer = reinterpret_cast<wchar_t *>(input);
@@ -2637,6 +2644,71 @@ void SteamQrAuth::cancel()
     state_ = 0;
 }
 
+bool SteamQrAuth::start_password_sign_in(int user_id)
+{
+    std::string name, password;
+    if (EditTextWithSystemKeyboard(user_id, "Steam account name", "Account name (not your email)", account_name_, 64,
+                                   &name, kImeNoAutoCapitalization) != 1 || name.empty())
+        return false;
+    const int typed = EditTextWithSystemKeyboard(user_id, "Steam password", "Password", "", 128, &password,
+                                                 kImeNoAutoCapitalization | kImePassword);
+    if (typed != 1 || password.empty())
+    {
+        playden::steam::ZeroizeSecret(password);
+        return false;
+    }
+    // The service is made by the first sign-in; a QR sign-in it starts is replaced right away.
+    if (service_ == nullptr && !start_auth(false) && service_ == nullptr)
+    {
+        playden::steam::ZeroizeSecret(password);
+        return false;
+    }
+    if (request_ != 0) service_->Cancel(request_);
+    challenge_url_.clear();
+    restoring_session_ = false;
+    password_flow_ = true;
+    guard_code_allowed_ = false;
+    sign_in_prompt_ = "Signing in to Steam…";
+    {
+        const std::lock_guard<std::mutex> guard(failure_mutex_);
+        pending_failure_detail_.clear();
+        failure_detail_.clear();
+    }
+    LogNetworkLine("Steam password sign-in requested");
+    request_ = service_->BeginCredentialSignIn(name, std::move(password));
+    playden::steam::ZeroizeSecret(password);
+    state_ = request_ == 0 ? 4 : 1;
+    return request_ != 0;
+}
+
+bool SteamQrAuth::submit_guard_code(int user_id)
+{
+    if (service_ == nullptr || !guard_code_wanted()) return false;
+    std::string code;
+    if (EditTextWithSystemKeyboard(user_id, "Steam Guard code", "Code", "", 8, &code, kImeNoAutoCapitalization) != 1 ||
+        code.empty())
+        return false;
+    // Steam Guard codes are upper case letters and digits; the keyboard may have typed lower case.
+    for (auto &ch : code) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    sign_in_prompt_ = "Checking the code…";
+    service_->SubmitGuardCode(std::move(code));
+    return true;
+}
+
+void SteamQrAuth::sign_out()
+{
+    if (service_ == nullptr) return;
+    if (request_ != 0) service_->Cancel(request_);
+    signing_out_ = true;
+    password_flow_ = false;
+    sign_in_prompt_.clear();
+    LogNetworkLine("Steam sign-out requested");
+    service_->SignOut();
+}
+
+std::string SteamQrAuth::sign_in_prompt() const { return sign_in_prompt_; }
+std::string SteamQrAuth::account_name() const { return account_name_; }
+
 bool SteamQrAuth::poll()
 {
     bool changed = false;
@@ -2664,6 +2736,33 @@ bool SteamQrAuth::poll()
         return changed;
     for (const auto &event : service_->Pump(16))
     {
+        // A sign-out is its own request (SignOut returns no id): its result is taken whatever request_ is.
+        if (signing_out_ && (event.kind == playden::steam::SteamEventKind::kSignedOut ||
+                             (event.kind == playden::steam::SteamEventKind::kFailure && event.request_id != request_)))
+        {
+            signing_out_ = false;
+            if (event.kind == playden::steam::SteamEventKind::kSignedOut)
+            {
+                LogNetworkLine("Steam signed out");
+                {
+                    const std::lock_guard<std::mutex> guard(library_mutex_);
+                    games_.clear();
+                    installed_games_.clear();
+                    library_detail_ = "Signed out of Steam.";
+                }
+                account_name_.clear();
+                request_ = 0;
+                library_request_ = 0;
+                state_ = 0;
+            }
+            else
+            {
+                failure_detail_ = "Steam sign-out could not remove the saved sign-in.";
+                LogNetworkLine("Steam sign-out failed");
+            }
+            changed = true;
+            continue;
+        }
         if (event.request_id != request_)
             continue;
         switch (event.kind)
@@ -2674,10 +2773,45 @@ bool SteamQrAuth::poll()
             changed = true;
             break;
         case playden::steam::SteamEventKind::kAwaitingApproval:
-            state_ = 2;
+            if (password_flow_)
+            {
+                guard_code_allowed_ = event.code_allowed;
+                sign_in_prompt_ = event.code_allowed
+                    ? "Approve this sign-in in the Steam Mobile app, or press Triangle to type a code."
+                    : "Approve this sign-in in the Steam Mobile app" +
+                          (event.email_domain.empty() ? std::string(".") : " or from Steam's email to an address at " +
+                                                                               event.email_domain + ".");
+                state_ = 8;
+            }
+            else
+            {
+                state_ = 2;
+            }
+            changed = true;
+            break;
+        case playden::steam::SteamEventKind::kNeedsEmailCode:
+            guard_code_allowed_ = true;
+            sign_in_prompt_ = "Steam emailed a code to an address at " + event.email_domain +
+                              ". Press Triangle to type it.";
+            state_ = 8;
+            changed = true;
+            break;
+        case playden::steam::SteamEventKind::kNeedsAuthenticatorCode:
+            guard_code_allowed_ = true;
+            sign_in_prompt_ = "Press Triangle and type the code from the Steam Mobile app.";
+            state_ = 8;
+            changed = true;
+            break;
+        case playden::steam::SteamEventKind::kCodeRejected:
+            guard_code_allowed_ = true;
+            sign_in_prompt_ = "Steam did not accept that code. Press Triangle to type it again.";
+            state_ = 8;
             changed = true;
             break;
         case playden::steam::SteamEventKind::kAuthenticated:
+            if (!event.account_name.empty()) account_name_ = event.account_name;
+            password_flow_ = false;
+            sign_in_prompt_.clear();
             restoring_session_ = false;
             challenge_url_.clear();
             LogNetworkLine("library startup step=authenticated");
@@ -2700,6 +2834,19 @@ bool SteamQrAuth::poll()
                 const std::lock_guard<std::mutex> guard(failure_mutex_);
                 failure_detail_ = pending_failure_detail_;
                 pending_failure_detail_.clear();
+            }
+            if (password_flow_)
+            {
+                // The password sign-in's own reasons, in words the player can act on.
+                using E = playden::steam::AuthError;
+                if (event.error == E::kInvalidPassword)
+                    failure_detail_ = "Steam did not accept that account name and password.";
+                else if (event.error == E::kRateLimited)
+                    failure_detail_ = "Too many sign-in attempts. Wait a while, then try again.";
+                else if (event.error == E::kSignInTimedOut)
+                    failure_detail_ = "The sign-in timed out waiting for Steam Guard. Try again.";
+                password_flow_ = false;
+                sign_in_prompt_.clear();
             }
             if (failure_detail_.empty()) failure_detail_ = "Steam rejected the sign-in request";
             state_ = 4;
@@ -2834,6 +2981,22 @@ extern "C" int playden_ps4_library_is_favorite(std::uint32_t app_id)
 extern "C" int playden_ps4_library_is_hidden(std::uint32_t app_id)
 {
     return auth().library_is_hidden(app_id) ? 1 : 0;
+}
+extern "C" int playden_ps4_auth_password_start(int user_id) { return auth().start_password_sign_in(user_id) ? 1 : 0; }
+extern "C" int playden_ps4_auth_guard_code(int user_id) { return auth().submit_guard_code(user_id) ? 1 : 0; }
+extern "C" int playden_ps4_auth_guard_code_wanted() { return auth().guard_code_wanted() ? 1 : 0; }
+extern "C" void playden_ps4_auth_sign_out() { auth().sign_out(); }
+extern "C" const char *playden_ps4_auth_prompt()
+{
+    static std::string prompt;
+    prompt = auth().sign_in_prompt();
+    return prompt.c_str();
+}
+extern "C" const char *playden_ps4_auth_account_name()
+{
+    static std::string name;
+    name = auth().account_name();
+    return name.c_str();
 }
 extern "C" int playden_ps4_library_search_edit(int user_id)
 {

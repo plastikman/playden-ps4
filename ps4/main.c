@@ -70,6 +70,10 @@ void playden_ps4_game_verify_start(uint32_t app_id);
 int playden_ps4_maintenance_start(uint32_t app_id, int action);
 int playden_ps4_maintenance_state(void);
 const char *playden_ps4_maintenance_message(void);
+int playden_ps4_auth_password_start(int user_id);
+int playden_ps4_auth_guard_code(int user_id);
+int playden_ps4_auth_guard_code_wanted(void);
+void playden_ps4_auth_sign_out(void);
 int playden_ps4_library_search_edit(int user_id);
 int playden_ps4_library_sort_cycle(void);
 size_t playden_ps4_library_collection_count(void);
@@ -82,6 +86,8 @@ const char *playden_ps4_auth_challenge(void);
  * with the reason a delete stopped. */
 int playden_ps4_delete_stage = 0;
 char playden_ps4_delete_note[160] = "";
+/* Settings' Steam account row: signing out takes a second Cross; ui.cpp shows it. */
+int playden_ps4_signout_armed = 0;
 /* Maintenance (page 10): the prefix reset takes a second Cross; ui.cpp shows it. */
 int playden_ps4_maintenance_armed = 0;
 /* The game the collection picker (page 9) is for; ui.cpp draws from it. */
@@ -209,6 +215,19 @@ int playden_ps4_main(int argc, char **argv) {
                 page = 0;
                 changed = 1;
             }
+            /* Account name and password instead of the QR code; Steam Guard's code when it asks for one. */
+            const int auth_now = playden_ps4_auth_state();
+            if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && auth_now != 1 && auth_now != 8) {
+                playden_ps4_auth_password_start(user);
+                changed = 1;
+            }
+            if ((pressed & ORBIS_PAD_BUTTON_TRIANGLE) && playden_ps4_auth_guard_code_wanted()) {
+                playden_ps4_auth_guard_code(user);
+                changed = 1;
+            }
+            /* Steam Guard prompts and results arrive on their own. */
+            static int shown_auth = -1;
+            if (auth_now != shown_auth) { shown_auth = auth_now; changed = 1; }
         } else if (page == 2) {
             if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
                 page = 0;
@@ -626,6 +645,11 @@ int playden_ps4_main(int argc, char **argv) {
                 game_focus = 0;
             }
             if (!game_focus) {
+                if (pressed & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN | ORBIS_PAD_BUTTON_LEFT |
+                               ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CIRCLE)) {
+                    if (playden_ps4_signout_armed) changed = 1;
+                    playden_ps4_signout_armed = 0;
+                }
                 if ((pressed & ORBIS_PAD_BUTTON_UP) && selected > 0) { --selected; changed = 1; }
                 const int saves_state = playden_ps4_saves_state();
                 const int auth_state = playden_ps4_auth_state();
@@ -635,7 +659,7 @@ int playden_ps4_main(int argc, char **argv) {
                 const int max_selection = tab == 1 ? library_rows - (steam_connected ? 1 : 0) : tab == 3 && saves_state == 3 ? 2 :
                                           tab == 3 && saves_state == 1 ? 0 :
                                           tab == 3 ? (installed_games > 0 ? installed_games - 1 : 0) :
-                                          tab == 4 ? 6 : 0;
+                                          tab == 4 ? 7 : 0;
                 if ((pressed & ORBIS_PAD_BUTTON_DOWN) && selected < max_selection) { ++selected; changed = 1; }
                 /* Library search and sort from the views menu too. */
                 if (tab == 1 && (pressed & (ORBIS_PAD_BUTTON_TRIANGLE | ORBIS_PAD_BUTTON_R1))) {
@@ -675,6 +699,19 @@ int playden_ps4_main(int argc, char **argv) {
                         playden_ps4_saves_start(saves_app_id, 0);
                         changed = 1;
                     }
+                } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 4 && selected == 7) {
+                    /* Steam account: sign out (second Cross), or sign in when signed out. */
+                    if (!steam_connected) {
+                        playden_ps4_signout_armed = 0;
+                        playden_ps4_auth_start();
+                        page = 1;
+                    } else if (playden_ps4_signout_armed) {
+                        playden_ps4_auth_sign_out();
+                        playden_ps4_signout_armed = 0;
+                    } else {
+                        playden_ps4_signout_armed = 1;
+                    }
+                    changed = 1;
                 } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 4 && selected == 6) {
                     /* Playden update: download, cancel, or try again. Installing stays GoldHEN's. */
                     PwUpdateDownload d;
