@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <set>
 #include <charconv>
+#include <chrono>
 #include <string_view>
+#include <thread>
 
 namespace playden::steam {
 
@@ -559,16 +561,36 @@ InstallRunner::Result SteamInstallRunner::Run(const StoredSession& session, std:
   if (update) target.may_apply = may_apply;
   if (step) step(InstallStep::kDownloading);
   InstallPhase phase = InstallPhase::kDownloading;
-  const auto outcome = installer_.Run(session, target, cancel, [&](const InstallProgress& state) {
-    server_name_ = state.server_name;
-    if (state.phase != phase) {
-      phase = state.phase;
-      if (step) step(phase == InstallPhase::kCheckingFiles ? InstallStep::kCheckingFiles
-                     : phase == InstallPhase::kApplying  ? InstallStep::kApplying
-                                                         : InstallStep::kDownloading);
+  InstallOutcome outcome;
+  // A chunk can use up its per-server retries while Steam's CDN has a short outage. Run() keeps its journal, so
+  // running it again fetches only the missing chunks instead of restarting the download. Bounded: a longer outage
+  // still ends in the resumable network error.
+  constexpr int kAutomaticNetworkRetries = 4;
+  for (int attempt = 0;; ++attempt) {
+    outcome = installer_.Run(session, target, cancel, [&](const InstallProgress& state) {
+      server_name_ = state.server_name;
+      if (state.phase != phase) {
+        phase = state.phase;
+        if (step) step(phase == InstallPhase::kCheckingFiles ? InstallStep::kCheckingFiles
+                       : phase == InstallPhase::kApplying  ? InstallStep::kApplying
+                                                           : InstallStep::kDownloading);
+      }
+      if (phase == InstallPhase::kDownloading && progress)
+        progress(state.download_done, state.download_total, state.held_bytes);
+    });
+    if (outcome.error != InstallError::kNetwork || attempt >= kAutomaticNetworkRetries || cancel.load()) break;
+    const int delay_seconds = 1 << attempt;  // 1, 2, 4, 8 s
+    log("install_retry", "network", ("attempt=" + std::to_string(attempt + 1) + "/" +
+                                     std::to_string(kAutomaticNetworkRetries) + " delay=" +
+                                     std::to_string(delay_seconds) + "s cause=" + outcome.detail).c_str());
+    for (int waited = 0; waited < delay_seconds * 1000 && !cancel.load(); waited += 100)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (cancel.load()) {
+      outcome.error = InstallError::kCanceled;
+      outcome.detail = "canceled during automatic retry wait";
+      break;
     }
-    if (phase == InstallPhase::kDownloading && progress) progress(state.download_done, state.download_total, state.held_bytes);
-  });
+  }
   if (!outcome.skipped_depots.empty()) {
     std::string skipped;
     for (const auto id : outcome.skipped_depots) skipped += (skipped.empty() ? "" : " ") + std::to_string(id);
