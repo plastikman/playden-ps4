@@ -3,6 +3,7 @@
 #ifndef PLAYDEN_PS4_WINE_RUNTIME_H
 #define PLAYDEN_PS4_WINE_RUNTIME_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -17,6 +18,8 @@ int playden_ps4_wine_dispatch(int argc, char **argv);
 /* Prepare Playden-owned Wine prefixes and launch Steam games in game mode. */
 int playden_ps4_wine_prepare_hl2_install(void);
 int playden_ps4_wine_prepare_game_prefix(uint32_t app_id);
+/* The game's Wine prefix folder (from its launch profile) into out; 0, or -1 when it has none. */
+int playden_ps4_wine_prefix_path(uint32_t app_id, char *out, size_t capacity);
 int playden_ps4_wine_launch_hl2(void);
 int playden_ps4_wine_launch_game(uint32_t app_id);
 const char *playden_ps4_wine_status(void);

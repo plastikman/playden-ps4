@@ -66,6 +66,9 @@ int playden_ps4_overrides_toggle(size_t item);
 int playden_ps4_install_sheet_open(uint32_t app_id);
 void playden_ps4_install_sheet_step(int row, int direction);
 int playden_ps4_game_details_incomplete(void);
+void playden_ps4_game_verify_start(uint32_t app_id);
+int playden_ps4_maintenance_start(uint32_t app_id, int action);
+int playden_ps4_maintenance_state(void);
 int playden_ps4_library_search_edit(int user_id);
 int playden_ps4_library_sort_cycle(void);
 size_t playden_ps4_library_collection_count(void);
@@ -74,6 +77,8 @@ int playden_ps4_library_collection_delete(size_t index);
 int playden_ps4_library_collection_toggle(uint32_t app_id, size_t index);
 const char *playden_ps4_auth_challenge(void);
 
+/* Maintenance (page 10): the prefix reset takes a second Cross; ui.cpp shows it. */
+int playden_ps4_maintenance_armed = 0;
 /* The game the collection picker (page 9) is for; ui.cpp draws from it. */
 uint32_t playden_ps4_collection_app_id = 0;
 /* The Library tab's views (Home uses 0: the installed list, unsearched); ui.cpp has the same rule. */
@@ -219,6 +224,14 @@ int playden_ps4_main(int argc, char **argv) {
                                           strcmp(playden_ps4_game_store_controller_support(), "full") != 0);
                 page = 5;
                 delete_choice = 0;
+                changed = 1;
+            }
+            /* Maintenance: check and repair, save backups, prefix reset. */
+            if ((pressed & ORBIS_PAD_BUTTON_OPTIONS) && playden_ps4_game_details_installed() &&
+                playden_ps4_game_details_state() == 2 && playden_ps4_game_install_state() != 1) {
+                page = 10;
+                delete_choice = 0;
+                playden_ps4_maintenance_armed = 0;
                 changed = 1;
             }
             if ((pressed & ORBIS_PAD_BUTTON_CROSS) &&
@@ -413,6 +426,40 @@ int playden_ps4_main(int argc, char **argv) {
                 const int count = (int)playden_ps4_library_visible_count(filter);
                 if (count <= 0) { game_selected = 0; game_focus = 0; }
                 else if (game_selected >= count) game_selected = count - 1;
+                changed = 1;
+            }
+        } else if (page == 10) {
+            const int working = playden_ps4_maintenance_state() == 1;
+            if (pressed & ORBIS_PAD_BUTTON_CIRCLE) { page = 2; playden_ps4_maintenance_armed = 0; changed = 1; }
+            if ((pressed & ORBIS_PAD_BUTTON_UP) && delete_choice > 0) {
+                --delete_choice; playden_ps4_maintenance_armed = 0; changed = 1;
+            }
+            if ((pressed & ORBIS_PAD_BUTTON_DOWN) && delete_choice < 4) {
+                ++delete_choice; playden_ps4_maintenance_armed = 0; changed = 1;
+            }
+            if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !working) {
+                if (delete_choice == 0) {
+                    /* The check runs as an install job: its progress shows on the details screen. */
+                    playden_ps4_game_verify_start(detail_app_id);
+                    page = 2;
+                } else if (delete_choice == 1 || delete_choice == 2) {
+                    playden_ps4_maintenance_start(detail_app_id, delete_choice);
+                } else if (delete_choice == 3) {
+                    if (playden_ps4_maintenance_armed) {
+                        playden_ps4_maintenance_start(detail_app_id, 3);
+                        playden_ps4_maintenance_armed = 0;
+                    } else {
+                        playden_ps4_maintenance_armed = 1;
+                    }
+                } else {
+                    page = 2;
+                }
+                changed = 1;
+            }
+            /* A running job's message and the backup line change on their own. */
+            static int shown_state = -1;
+            if (playden_ps4_maintenance_state() != shown_state) {
+                shown_state = playden_ps4_maintenance_state();
                 changed = 1;
             }
         } else if (page == 9) {

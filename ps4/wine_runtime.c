@@ -422,6 +422,14 @@ static int profile_prefix_name(uint32_t app_id, char *name, size_t capacity)
     return found ? 0 : -1;
 }
 
+int playden_ps4_wine_prefix_path(uint32_t app_id, char *out, size_t capacity)
+{
+    char name[96];
+    if (!out || capacity == 0 || app_id == 0 || profile_prefix_name(app_id, name, sizeof(name)) != 0) return -1;
+    const int length = snprintf(out, capacity, PLAYDEN_ROOT "/prefixes/%s", name);
+    return length > 0 && (size_t)length < capacity ? 0 : -1;
+}
+
 int playden_ps4_wine_prepare_game_prefix(uint32_t app_id)
 {
     char name[96];

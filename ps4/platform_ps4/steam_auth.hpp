@@ -174,9 +174,13 @@ class SteamQrAuth
         std::string note;
     };
     InstallSheet sheet_;
+    std::uint32_t verify_requested_ = 0;  // start_game_verify's game, taken by the next start_game_install
     void sheet_measure_locked();
   public:
     bool install_sheet_open(std::uint32_t app_id);
+    // Check and repair: an update of the installed game with its file list set aside, so every file is
+    // hashed and only the missing or changed ones are downloaded again.
+    void start_game_verify(std::uint32_t app_id);
     void install_sheet_step(int row, int direction);
     std::string install_sheet_value(int row) const;
     std::string install_sheet_note() const;

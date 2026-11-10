@@ -52,6 +52,11 @@ extern "C" std::size_t playden_ps4_library_collection_count();
 extern "C" const char *playden_ps4_library_collection_name(std::size_t index);
 extern "C" std::size_t playden_ps4_library_collection_size(std::size_t index);
 extern "C" int playden_ps4_library_in_collection(std::uint32_t app_id, std::size_t index);
+extern "C" int playden_ps4_maintenance_state(void);
+extern "C" const char *playden_ps4_maintenance_message(void);
+extern "C" const char *playden_ps4_maintenance_backup_label(std::uint32_t app_id);
+// Maintenance (page 10): main.c arms the prefix reset with a first Cross.
+extern "C" int playden_ps4_maintenance_armed;
 // The game the collection picker (page 9) is for; main.c sets it when the picker opens.
 extern "C" std::uint32_t playden_ps4_collection_app_id;
 // The Library tab's views (Home uses 0: the installed list, unsearched); main.c has the same rule.
@@ -883,11 +888,11 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 install_state == 1 ? "INSTALL IN PROGRESS     LEFT / RIGHT  SECTIONS" :
                 !installed ? "CROSS  INSTALL     CIRCLE  BACK TO LIBRARY" :
                 installed && playden_ps4_game_details_update()
-                    ? "CROSS  UPDATE     TRIANGLE  GAME SETTINGS     SQUARE  DELETE     CIRCLE  BACK" :
+                    ? "CROSS  UPDATE     TRIANGLE  SETTINGS     OPTIONS  MAINTENANCE     SQUARE  DELETE     CIRCLE  BACK" :
                 can_launch ? (playden_ps4_game_details_app_id() == 220
-                                  ? "CROSS  PLAY     TRIANGLE  GAME SETTINGS     SQUARE  DELETE     CIRCLE  BACK"
-                                  : "CROSS  TRY LAUNCH     TRIANGLE  GAME SETTINGS     SQUARE  DELETE     CIRCLE  BACK") :
-                "TRIANGLE  GAME SETTINGS     SQUARE  DELETE     CIRCLE  BACK TO LIBRARY";
+                                  ? "CROSS  PLAY     TRIANGLE  SETTINGS     OPTIONS  MAINTENANCE     SQUARE  DELETE     CIRCLE  BACK"
+                                  : "CROSS  TRY LAUNCH     TRIANGLE  SETTINGS     OPTIONS  MAINTENANCE     SQUARE  DELETE     CIRCLE  BACK") :
+                "TRIANGLE  SETTINGS     OPTIONS  MAINTENANCE     SQUARE  DELETE     CIRCLE  BACK TO LIBRARY";
             hint_text(list, font, detail_hint, 96, 970, 17, secondary);
         }
     }
@@ -1114,6 +1119,47 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                           21, delete_choice == i ? ink : secondary);
             }
             hint_text(list, font, "UP / DOWN  CHOOSE     CROSS  SELECT     CIRCLE  BACK",
+                      96, 970, 17, secondary);
+        }
+    }
+    else if (page == 10)
+    {
+        // Maintenance for the game on the details screen.
+        const std::uint32_t app_id = playden_ps4_game_details_app_id();
+        list.rounded_rect({420, 190, 1080, 720}, 16, panel);
+        if (font_ready)
+        {
+            const char *title = playden_ps4_library_title_by_app_id(app_id);
+            list.text(font, 0, "MAINTENANCE", 500, 268, 24, accent);
+            list.text(font, 0, font.fit(title[0] ? title : "Selected game", 34, 920), 500, 322, 34, ink);
+            const char *choices[] = {"CHECK AND REPAIR FILES", "BACK UP SAVES", "RESTORE LAST BACKUP",
+                                     playden_ps4_maintenance_armed ? "PRESS CROSS AGAIN TO RESET THE PREFIX"
+                                                                   : "RESET WINE PREFIX", "CLOSE"};
+            const char *notes[] = {"Hashes every file; downloads only what is missing or changed.",
+                                   "Copies the Wine prefix's user folders (Documents, AppData, Saved Games).",
+                                   "Copies the newest backup back over the prefix's user folders.",
+                                   "Backs up, then rebuilds Windows and the registry at the next launch. Saves stay.",
+                                   ""};
+            for (int i = 0; i < 5; ++i)
+            {
+                const float y = 362.0F + static_cast<float>(i) * 76.0F;
+                const Rect row{500, y, 920, 62};
+                if (delete_choice == i)
+                    list.bordered_rect(row, 8, Color::rgb(0xf0863a, 0.16F), 1.5F, accent);
+                else
+                    list.rounded_rect(row, 8, bg);
+                list.text(font, 0, choices[i], 526, y + (notes[i][0] ? 28.0F : 40.0F), 21,
+                          i == 3 && playden_ps4_maintenance_armed ? accent : delete_choice == i ? ink : secondary);
+                if (notes[i][0]) list.text(font, 0, notes[i], 526, y + 52, 15, secondary);
+            }
+            const int state = playden_ps4_maintenance_state();
+            const char *message = playden_ps4_maintenance_message();
+            if (state != 0 && message[0])
+                list.text(font, 0, font.fit(message, 18, 920), 500, 778, 18,
+                          state == 3 ? Color::rgb(0xffc477) : state == 2 ? accent : secondary);
+            const char *backup = playden_ps4_maintenance_backup_label(app_id);
+            list.text(font, 0, backup[0] ? backup : "No save backup yet.", 500, 812, 16, secondary);
+            hint_text(list, font, state == 1 ? "WORKING…     CIRCLE  BACK" : "UP / DOWN  CHOOSE     CROSS  RUN     CIRCLE  BACK",
                       96, 970, 17, secondary);
         }
     }

@@ -1674,14 +1674,26 @@ bool SteamQrAuth::game_store_windows_supported() const
     return store_windows_supported_;
 }
 
+void SteamQrAuth::start_game_verify(std::uint32_t app_id)
+{
+    if (app_id == 0 || !HasInstalledRecord(app_id)) return;
+    {
+        const std::lock_guard<std::mutex> guard(details_mutex_);
+        verify_requested_ = app_id;
+    }
+    start_game_install(app_id);
+}
+
 void SteamQrAuth::start_game_install(std::uint32_t app_id)
 {
     if (app_id == 0) return;
-    bool repair = false;
+    bool repair = false, verify = false;
     {
         const std::lock_guard<std::mutex> guard(details_mutex_);
+        verify = verify_requested_ == app_id;
+        verify_requested_ = 0;
         // An update downloads the changed files beside the game, then swaps them in (the shared UpdateApp).
-        repair = details_app_id_ == app_id && (details_incomplete_ || details_update_);
+        repair = verify || (details_app_id_ == app_id && (details_incomplete_ || details_update_));
     }
     if (HasInstalledRecord(app_id) && !repair)
     {
@@ -1750,7 +1762,7 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
     }
     install_cancel_.store(false);
     playden::StoredSession session = std::move(*loaded.value());
-    install_worker_ = std::thread([this, app_id, install_root, repair,
+    install_worker_ = std::thread([this, app_id, install_root, repair, verify,
                                    session = std::move(session)]() mutable {
         std::string message;
         bool installed = false;
@@ -1827,6 +1839,20 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
             if (!options.branch.empty() || !options.language.empty())
                 LogNetworkLine("install app=" + std::to_string(app_id) + " step=sheet branch=" + options.branch +
                                " language=" + options.language);
+            // Check and repair: without its file list the update hashes every file (DepotInstaller::Run).
+            // The list comes back when the check stops before staging anything; once an update has
+            // started, the next update or check hashes again instead.
+            const std::string tree = install_root + "/" + playden::steam::DepotInstaller::kFileTree;
+            const std::string tree_aside = tree + ".before-check";
+            if (verify) {
+                std::remove(tree_aside.c_str());
+                const bool aside = std::rename(tree.c_str(), tree_aside.c_str()) == 0;
+                LogNetworkLine("install app=" + std::to_string(app_id) + " step=verify tree=" +
+                               (aside ? "set-aside" : "none errno=" + std::to_string(errno)));
+                const std::lock_guard<std::mutex> guard(install_mutex_);
+                install_message_ = "Checking the game's files…";
+                ++install_version_;
+            }
             playden::installs::InstallRunner::Result outcome;
             try {
                 outcome = repair ? runner.UpdateApp(
@@ -1843,7 +1869,20 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
                 outcome.failure = "Install stopped unexpectedly. Progress is saved; try again to resume.";
             }
             installed = outcome.ok;
-            message = installed ? InstalledMessage(app_id) : outcome.canceled
+            if (verify) {
+                struct stat info {};
+                const bool new_tree = ::lstat(tree.c_str(), &info) == 0;
+                const bool update_started =
+                    ::lstat((install_root + "/" + playden::steam::DepotInstaller::kUpdateDir).c_str(), &info) == 0;
+                if (!new_tree && !update_started) std::rename(tree_aside.c_str(), tree.c_str());
+                else std::remove(tree_aside.c_str());
+                LogNetworkLine("install app=" + std::to_string(app_id) + " step=verify result=" +
+                               (installed ? "ok" : "stopped") + " tree=" +
+                               (new_tree ? "rewritten" : update_started ? "missing-until-next-update" : "restored"));
+            }
+            message = installed ? (verify ? std::string("Files checked: anything missing or changed was downloaded again.")
+                                          : InstalledMessage(app_id))
+                : outcome.canceled
                 ? "Download canceled. Completed files are saved; Cross resumes the install."
                 : (outcome.failure.empty() ? "Install failed. See the console network log." : outcome.failure);
             if (installed) {
@@ -2953,6 +2992,7 @@ extern "C" int playden_ps4_game_store_windows_supported()
     return auth().game_store_windows_supported() ? 1 : 0;
 }
 extern "C" void playden_ps4_game_install_start(std::uint32_t app_id) { auth().start_game_install(app_id); }
+extern "C" void playden_ps4_game_verify_start(std::uint32_t app_id) { auth().start_game_verify(app_id); }
 extern "C" int playden_ps4_game_prepare_steamworks(std::uint32_t app_id)
 {
     return auth().prepare_game_steamworks(app_id) ? 1 : 0;

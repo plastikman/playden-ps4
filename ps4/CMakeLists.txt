@@ -203,6 +203,7 @@ target_compile_definitions(playden_ps4_miniz PUBLIC
 set_target_properties(playden_ps4_miniz PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(playden_ps4_game_settings STATIC
     platform_ps4/game_controls.cpp
+    platform_ps4/game_maintenance.cpp
     "${PLAYDEN_ROOT}/src/runtime/game_settings.cpp"
     "${PLAYDEN_ROOT}/src/runtime/prospero_profile.cpp"
     "${PLAYDEN_ROOT}/src/runtime/game_probe.cpp"
