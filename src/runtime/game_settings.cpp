@@ -1,10 +1,13 @@
 #include "runtime/game_settings.h"
 #include "runtime/game_probe.h"
+#include "runtime/pe_architecture.h"
 
 #include "homebrew/json.hpp"
 #include "platform/managed_directory.h"
 #include "steam/backend/app_info.h"
 #include "steam/backend/json.h"
+
+#include <dirent.h>
 
 #include <algorithm>
 #include <array>
@@ -90,7 +93,10 @@ std::vector<SettingDefinition> BuildCatalogue() {
   // Display.
   list.push_back(Choice("resolution", "Resolution", "Size of the game's screen. Higher is sharper and slower.",
                         "[display] desktop", G::kDisplay,
-                        {{"1280x720", "1280×720", "Smoother frame rate in heavy scenes. Softer on a 4K TV."},
+                        {{"1024x768", "1024×768", "4:3, for older games that expect it."},
+                         {"1152x864", "1152×864", "4:3, for older games that expect it."},
+                         {"1280x960", "1280×960", "4:3, for older games that expect it."},
+                         {"1280x720", "1280×720", "Smoother frame rate in heavy scenes. Softer on a 4K TV."},
                          {"1920x1080", "1920×1080", "Full HD."},
                          {"2560x1440", "2560×1440", "Sharper image. May drop below 60 fps."},
                          {"3840x2160", "3840×2160", "The TV's own size. For light games; heavy ones run slowly."}},
@@ -155,7 +161,9 @@ std::vector<SettingDefinition> BuildCatalogue() {
                         {{"none", "None", "Only the buttons set here."},
                          {"gamepad", "Gamepad", "Xbox controller layout; no stick moves the pointer."},
                          {"mouse", "Mouse", "Left stick moves the pointer; Cross clicks, Circle right-clicks, Options Enter."},
-                         {"arrows", "Arrow keys", "D-pad sends the arrows; Cross Z, Circle X, Triangle C, Options Enter."}},
+                         {"arrows", "Arrow keys", "D-pad sends the arrows; Cross Z, Circle X, Triangle C, Options Enter."},
+                         {"mouselook", "Mouse look",
+                          "Left stick W A S D, right stick looks; R2 clicks, L2 right-clicks, Options Escape."}},
                         "none"));
   // Controls › Button mapping.
   static const std::map<std::string, std::string> button_names = {
@@ -172,6 +180,11 @@ std::vector<SettingDefinition> BuildCatalogue() {
   // Controls › Controller tuning.
   list.push_back(Choice("pointer_stick", "Pointer stick", "Move the mouse pointer with a stick, for menus.",
                         "[input] mouse", G::kControllerTuning,
+                        {{"none", "None", ""}, {"left_stick", "Left stick", ""}, {"right_stick", "Right stick", ""},
+                         {"touchpad", "Touchpad", "Slide a finger on the touchpad to move the pointer."}},
+                        "none"));
+  list.push_back(Choice("movement_stick", "Movement stick", "A stick sends W A S D, for games that walk with the keys.",
+                        "[input] keyboard_stick", G::kControllerTuning,
                         {{"none", "None", ""}, {"left_stick", "Left stick", ""}, {"right_stick", "Right stick", ""}},
                         "none"));
   list.push_back(Choice("pointer_speed", "Pointer speed", "How fast the pointer moves, in pixels per second.",
@@ -611,6 +624,9 @@ const std::map<std::string, std::map<std::string, std::string>>& ControllerPrese
       {"arrows", {{"controller", "keyboard"}, {"pointer_stick", "none"}}},
       {"gamepad", {{"controller", "xinput"}, {"pointer_stick", "none"}}},
       {"mouse", {{"controller", "keyboard"}, {"pointer_stick", "left_stick"}, {"pointer_speed", "900"}}},
+      {"mouselook",
+       {{"controller", "keyboard"}, {"pointer_stick", "right_stick"}, {"pointer_speed", "1200"},
+        {"movement_stick", "left_stick"}}},
   };
   return inputs;
 }
@@ -623,6 +639,10 @@ const std::map<std::string, std::map<std::string, std::string>>& ControllerPrese
       {"gamepad", {}},
       {"mouse", {{"cross", "mouse_left"}, {"circle", "mouse_right"}, {"square", "mouse_middle"}, {"r2", "mouse_left"},
                  {"l2", "mouse_right"}, {"options", "enter"}}},
+      {"mouselook", {{"r2", "mouse_left"}, {"l2", "mouse_right"}, {"cross", "space"}, {"circle", "ctrl"},
+                     {"square", "e"}, {"triangle", "r"}, {"l1", "q"}, {"r1", "f"}, {"l3", "shift"}, {"r3", "mouse_middle"},
+                     {"up", "up"}, {"down", "down"}, {"left", "left"}, {"right", "right"}, {"options", "escape"},
+                     {"create", "tab"}, {"touchpad", "enter"}}},
   };
   return buttons;
 }
@@ -663,6 +683,14 @@ std::string SettingChoiceUnavailable(const EffectiveSettings& settings, std::str
   if (id == "controller") {
     if (value != "playstation" || settings.input_playstation || settings.input_playstation_needs_update) return {};
     return "Needs a runtime kit with the PlayStation controller.";
+  }
+  if (id == "pointer_stick") {
+    if (value != "touchpad" || settings.input_touchpad) return {};
+    return "Needs a runtime with the touchpad pointer.";
+  }
+  if (id == "movement_stick") {
+    if (value == "none" || settings.input_keyboard_stick) return {};
+    return "Needs a runtime where a stick can send W A S D.";
   }
   if (id != "frame_limit" || value == "off") return {};
   const bool high = value == "120" || value == "40";
@@ -826,6 +854,13 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
   out.display_120hz_needs_update = kit.display_120hz_needs_update;
   out.input_playstation = kit.input_playstation;
   out.input_playstation_needs_update = kit.input_playstation_needs_update;
+  out.input_touchpad = kit.input_touchpad;
+  out.input_keyboard_stick = kit.input_keyboard_stick;
+  // Mouse look sets a movement stick; on a runtime without it the preset is not applied.
+  if (out.values["controller_preset"].value == "mouselook" && !kit.input_keyboard_stick) {
+    out.values["controller_preset"].value = "none";
+    out.values["controller_preset"].reason = "Needs a runtime where a stick can send W A S D.";
+  }
 
   // A controller preset (runtime/input/<name>.input) brings its own mode, pointer stick and speed. Rows set less
   // deliberately than the preset show the preset's values, so the sheet tells the truth and Pointer speed can be tuned.
@@ -883,7 +918,8 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
   // says why. The refresh row comes after Frame limit in the catalogue, so this runs once every row is resolved.
   // A choice that waits for the title's update (Frame limit 120 on an older runtime) is kept for then, and the
   // default applies until the update.
-  for (const char* id : {"frame_limit"}) {
+  // Pointer stick Touchpad needs a runtime with the touchpad pointer (kit input-touchpad).
+  for (const char* id : {"frame_limit", "pointer_stick", "movement_stick"}) {
     auto& value = out.values[id];
     const auto& fallback = FindSetting(id)->playden_default;
     if (!value.available) {
@@ -1171,6 +1207,9 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
   if (chosen("pointer_stick")) text += "mouse = " + value("pointer_stick") + "\n";
   if (settings.values.at("pointer_speed").available && chosen("pointer_speed"))
     text += "mouse_speed = " + value("pointer_speed") + "\n";
+  const bool keyboard_stick = settings.input_keyboard_stick && settings.values.at("movement_stick").available &&
+                              value("movement_stick") != "none" && chosen("movement_stick");
+  if (keyboard_stick) text += "keyboard_stick = " + value("movement_stick") + "\n";
   // Written only when they differ from the runtime's defaults (no dead zone, full rumble).
   const bool tuned_deadzone = settings.values.at("stick_deadzone").available && value("stick_deadzone") != "0";
   const bool tuned_rumble = settings.values.at("rumble").available && value("rumble") != "100";
@@ -1305,6 +1344,8 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
   features.display_framegen = display_framegen;
   features.display_fps_counter = fps_counter;
   features.input_playstation = value("controller") == "playstation";
+  features.input_touchpad = value("pointer_stick") == "touchpad";
+  features.input_keyboard_stick = keyboard_stick;
   features.runtime_version = settings.profile_version == 2;
   features.launcher_section = launcher_section;
   if (!CheckProsperoProfile(text, &why, features)) return fail("generated profile is invalid: " + why);
@@ -1883,8 +1924,9 @@ namespace {
 // Finds a game-relative path the way Windows would, ignoring case, and returns the
 // spelling on disk. Symbolic links are not followed.
 std::optional<std::string> ResolveGameFile(const std::string& root, const std::string& relative) {
-  namespace fs = std::filesystem;
-  fs::path cursor(root);
+  // POSIX directory and status calls rather than std::filesystem: on PS4 the toolchain's
+  // std::filesystem found no program that opendir/readdir/lstat find (Mafia's Game.exe, 01.90).
+  std::string cursor = root;
   std::string resolved;
   std::size_t start = 0;
   while (start <= relative.size()) {
@@ -1892,55 +1934,29 @@ std::optional<std::string> ResolveGameFile(const std::string& root, const std::s
     const auto part = relative.substr(start, end - start);
     start = end + 1;
     if (part.empty()) return std::nullopt;
-    std::error_code error;
-    // The spelling stored in the directory, exact first (filesystems may ignore case).
+    // The spelling as asked when it exists (a filesystem may ignore case: the console's does, and
+    // its directory listing found no name there), else the spelling stored in the directory.
     std::string match;
     const auto wanted = LowerAscii(part);
-    for (fs::directory_iterator it(cursor, error), last; !error && it != last; it.increment(error)) {
-      const auto name = it->path().filename().string();
-      if (name == part) { match = name; break; }
-      if (match.empty() && LowerAscii(name) == wanted) match = name;
+    struct stat exact {};
+    if (::lstat((cursor + "/" + part).c_str(), &exact) == 0) match = part;
+    else if (DIR* directory = ::opendir(cursor.c_str())) {
+      while (const dirent* entry = ::readdir(directory)) {
+        const std::string name = entry->d_name;
+        if (name == part) { match = name; break; }
+        if (match.empty() && LowerAscii(name) == wanted) match = name;
+      }
+      ::closedir(directory);
     }
     if (match.empty()) return std::nullopt;
-    cursor /= match;
+    cursor += "/" + match;
     resolved += (resolved.empty() ? "" : "/") + match;
-    const auto status = fs::symlink_status(cursor, error);
-    if (error || fs::is_symlink(status)) return std::nullopt;
-    if (end == relative.size()) return fs::is_regular_file(status) ? std::optional<std::string>(resolved) : std::nullopt;
-    if (!fs::is_directory(status)) return std::nullopt;
+    struct stat info {};
+    if (::lstat(cursor.c_str(), &info) != 0 || S_ISLNK(info.st_mode)) return std::nullopt;
+    if (end == relative.size()) return S_ISREG(info.st_mode) ? std::optional<std::string>(resolved) : std::nullopt;
+    if (!S_ISDIR(info.st_mode)) return std::nullopt;
   }
   return std::nullopt;
-}
-
-// "pe32" or "pe64" from a Windows executable's PE header; empty when it is neither.
-std::string ExecutableArchitecture(const std::string& path) {
-  const int file = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-  if (file < 0) return {};
-  const auto read_at = [file](off_t offset, unsigned char* buffer, std::size_t size) {
-    std::size_t done = 0;
-    while (done < size) {
-      const auto count = ::pread(file, buffer + done, size - done, offset + static_cast<off_t>(done));
-      if (count < 0 && errno == EINTR) continue;
-      if (count <= 0) return false;
-      done += static_cast<std::size_t>(count);
-    }
-    return true;
-  };
-  unsigned char dos[64];
-  unsigned char header[26];
-  std::string architecture;
-  if (read_at(0, dos, sizeof(dos)) && dos[0] == 'M' && dos[1] == 'Z') {
-    const std::uint32_t pe = dos[0x3c] | (dos[0x3d] << 8) | (dos[0x3e] << 16) | (static_cast<std::uint32_t>(dos[0x3f]) << 24);
-    if (pe < 64u * 1024u * 1024u && read_at(static_cast<off_t>(pe), header, sizeof(header)) &&
-        header[0] == 'P' && header[1] == 'E' && header[2] == 0 && header[3] == 0) {
-      const unsigned machine = header[4] | (header[5] << 8);
-      const unsigned magic = header[24] | (header[25] << 8);
-      if (machine == 0x014c && magic == 0x010b) architecture = "pe32";
-      if (machine == 0x8664 && magic == 0x020b) architecture = "pe64";
-    }
-  }
-  ::close(file);
-  return architecture;
 }
 
 }  // namespace
@@ -3335,7 +3351,9 @@ namespace playden::runtime {
 const std::vector<std::string>& SettingsKitCapabilityNames() {
   // Sorted, as a kit manifest lists them.
   static const std::vector<std::string> names = {kKitDisplay120Hz, kKitDisplayFpsCounter, kKitDisplayFramegen,
-                                                 kKitInputPlaystation, kKitInputRumble, kKitLauncherMode,
+                                                 kKitInputKeyboardStick, kKitInputPlaystation, kKitInputRumble,
+                                                 kKitInputTouchpad,
+                                                 kKitLauncherMode,
                                                  kKitAudioVolume, kKitDxvkConfig, kKitDxvkPresent,
                                                  kKitInputTuning, kKitInputWheel, kKitEnvironment};
   return names;
@@ -3370,6 +3388,8 @@ KitCapabilities KitCapabilitiesFromManifest(const std::vector<std::string>& capa
   kit.display_fps_counter = has(kKitDisplayFpsCounter);
   kit.launcher_mode = has(kKitLauncherMode);
   kit.input_playstation = has(kKitInputPlaystation);
+  kit.input_touchpad = has(kKitInputTouchpad);
+  kit.input_keyboard_stick = has(kKitInputKeyboardStick);
   kit.registry = bottle_access;
   return kit;
 }

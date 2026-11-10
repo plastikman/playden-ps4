@@ -1,0 +1,31 @@
+; A keyboard-and-mouse 3D game on the DualSense: the left stick walks with
+; W A S D, the right stick looks around as the mouse, R2 clicks and L2
+; right-clicks. Cross Space (jump), Circle Ctrl (crouch), Square E (use),
+; Triangle R (reload), L1 Q, R1 F, L3 Shift (run), R3 middle click, the d-pad
+; sends the arrows, Options Escape (menu), Create Tab and the touchpad Enter.
+; Fits older first- and third-person PC games; change single buttons in Game
+; Settings where a game uses other keys.
+[input]
+mode = keyboard
+mouse = right_stick
+mouse_speed = 1200
+keyboard_stick = left_stick
+; As Orbis-Win's Oblivion profile: a stick that drifts must not press keys.
+stick_deadzone = 25
+r2 = mouse_left
+l2 = mouse_right
+cross = space
+circle = ctrl
+square = e
+triangle = r
+l1 = q
+r1 = f
+l3 = shift
+r3 = mouse_middle
+up = up
+down = down
+left = left
+right = right
+options = escape
+create = tab
+touchpad = enter

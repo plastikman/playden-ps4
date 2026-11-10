@@ -16,14 +16,20 @@
 
 namespace playden::steam {
 
-// What the Steam store says about a game, for its details page: the short
-// description and genres as plain text, and the controller support Steam lists
-// ("full", "partial", or empty).
+// Store metadata shown on the game's details page. HTML fields are normalized
+// to plain text by the parser; score/date/platform fields may be absent.
 struct StoreDetails {
   GameId id;
+  bool available = false;
   std::string description;
   std::vector<std::string> genres;
+  std::vector<std::string> developers;
+  std::vector<std::string> publishers;
+  std::vector<std::string> categories;
+  std::string release_date;
+  std::string metacritic_score;
   std::string controller_support;
+  bool windows_supported = false;
 };
 
 // The store's appdetails URL for one game, in English.

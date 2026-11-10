@@ -9,7 +9,8 @@
 #include <string>
 #include <thread>
 
-#if defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5
+#if (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
 #include <arpa/inet.h>
 #include <cerrno>
 #include <netinet/in.h>
@@ -35,14 +36,35 @@ int sceNetSetsockopt(int socket, int level, int option, const void* value,
 namespace playden::steam::internal {
 namespace {
 
-#if defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5
+#if (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
 using Clock = std::chrono::steady_clock;
+
+struct PreflightDetail {
+  std::mutex mutex;
+  std::string text;
+};
+
+// Function-local: the PS4 UI module's static initializers do not run.
+PreflightDetail& LastPreflight() {
+  static PreflightDetail detail;
+  return detail;
+}
+
+void NotePreflight(const std::string& detail) {
+  auto& last = LastPreflight();
+  const std::lock_guard<std::mutex> guard(last.mutex);
+  last.text = detail;
+}
 
 bool NativeNonblockingPreflight() {
   constexpr int kSceNetSolSocket = 0xffff;
   constexpr int kSceNetSoNonblock = 0x1200;
   int listener = socket(AF_INET, SOCK_STREAM, 0);
-  if (listener < 0) return false;
+  if (listener < 0) {
+    NotePreflight("socket errno=" + std::to_string(errno));
+    return false;
+  }
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -51,6 +73,7 @@ bool NativeNonblockingPreflight() {
   if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
       listen(listener, 1) != 0 ||
       getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_size) != 0) {
+    NotePreflight("listen errno=" + std::to_string(errno));
     close(listener);
     return false;
   }
@@ -59,6 +82,7 @@ bool NativeNonblockingPreflight() {
   const bool connected = client >= 0 &&
                          connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
   if (!connected) {
+    NotePreflight("connect errno=" + std::to_string(errno));
     if (client >= 0) close(client);
     close(listener);
     return false;
@@ -73,19 +97,20 @@ bool NativeNonblockingPreflight() {
     if (!release_watchdog.load(std::memory_order_acquire)) shutdown(client, SHUT_RDWR);
   });
   int enabled = 1;
-  const int option_result = connected
-                                ? sceNetSetsockopt(client, kSceNetSolSocket, kSceNetSoNonblock,
-                                                   &enabled, sizeof(enabled))
-                                : -1;
+  const int native_option_result = connected
+      ? sceNetSetsockopt(client, kSceNetSolSocket, kSceNetSoNonblock,
+                         &enabled, sizeof(enabled))
+      : -1;
   unsigned char byte = 0;
   const auto native_start = Clock::now();
-  const int native_result = option_result == 0 ? sceNetRecv(client, &byte, 1, 0) : 0;
+  const int native_result = native_option_result == 0
+                                ? sceNetRecv(client, &byte, 1, 0) : 0;
   const int native_error = native_result < 0 && sceNetErrnoLoc() ? *sceNetErrnoLoc() : 0;
   const auto native_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       Clock::now() - native_start).count();
   errno = 0;
   const auto posix_start = Clock::now();
-  const ssize_t posix_result = option_result == 0 ? recv(client, &byte, 1, 0) : 0;
+  const ssize_t posix_result = native_option_result == 0 ? recv(client, &byte, 1, 0) : 0;
   const int posix_error = posix_result < 0 ? errno : 0;
   const auto posix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       Clock::now() - posix_start).count();
@@ -94,9 +119,15 @@ bool NativeNonblockingPreflight() {
   watchdog.join();
   close(client);
   close(listener);
-  return option_result == 0 && native_result < 0 && native_error == EWOULDBLOCK &&
-         native_ms < 20 && posix_result < 0 &&
-         (posix_error == EAGAIN || posix_error == EWOULDBLOCK) && posix_ms < 20;
+  const bool passed = native_option_result == 0 && native_result < 0 && native_error == EWOULDBLOCK &&
+                      native_ms < 20 && posix_result < 0 &&
+                      (posix_error == EAGAIN || posix_error == EWOULDBLOCK) && posix_ms < 20;
+  if (!passed)
+    NotePreflight("option=" + std::to_string(native_option_result) +
+                  " native=" + std::to_string(native_result) + "/" + std::to_string(native_error) +
+                  " " + std::to_string(native_ms) + "ms posix=" + std::to_string(posix_result) + "/" +
+                  std::to_string(posix_error) + " " + std::to_string(posix_ms) + "ms");
+  return passed;
 }
 
 bool InitializeNativeNetworkOnce() {
@@ -109,7 +140,8 @@ bool InitializeNativeNetworkOnce() {
 }  // namespace
 
 bool InitializeNativeNetworkForBootstrap() {
-#if defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5
+#if (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
   static std::once_flag once;
   static bool ready = false;
   std::call_once(once, [] { ready = InitializeNativeNetworkOnce(); });
@@ -121,13 +153,26 @@ bool InitializeNativeNetworkForBootstrap() {
 
 bool InitializeNativeNetwork() {
   if (!InitializeNativeNetworkForBootstrap()) return false;
-#if defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5
-  static std::once_flag once;
+#if (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
+  static std::mutex mutex;
   static bool ready = false;
-  std::call_once(once, [] { ready = NativeNonblockingPreflight(); });
+  const std::lock_guard<std::mutex> guard(mutex);
+  for (int attempt = 0; !ready && attempt < 3; ++attempt) ready = NativeNonblockingPreflight();
   return ready;
 #else
   return true;
+#endif
+}
+
+std::string NativeNetworkPreflightDetail() {
+#if (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
+  auto& last = LastPreflight();
+  const std::lock_guard<std::mutex> guard(last.mutex);
+  return last.text;
+#else
+  return {};
 #endif
 }
 
@@ -139,7 +184,8 @@ NativeResolveError AttachNativeResolution(CURL* easy, const std::string& url,
                                           std::uint32_t timeout_ms,
                                           const std::atomic<bool>& cancel,
                                           curl_slist** entries) {
-#if defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5
+#if (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
   if (!easy || !entries || timeout_ms == 0) return NativeResolveError::kFailed;
   CURLU* parsed = curl_url();
   if (!parsed) return NativeResolveError::kFailed;

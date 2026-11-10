@@ -900,6 +900,33 @@ void InstalledGamesCompareWithTheirRecord() {
   assert(has_beta(details) && !has_beta(DetailsFromAppInfo(8000, buffer, grant, "english", bought)));
 }
 
+void BorrowedDepotsRepairOldInstall() {
+  const std::string buffer = R"("appinfo" {
+    "depots" {
+      "280" { "manifests" { "public" { "gid" "2800" "size" "10" "download" "5" } } }
+      "221" { "depotfromapp" "220" }
+      "222" { "depotfromapp" "220" }
+    }
+  })";
+  auto source = ParseAppInfo(220, R"("appinfo" { "depots" {
+    "221" { "manifests" { "public" { "gid" "2210" "size" "20" "download" "9" } } }
+    "222" { "manifests" { "public" { "gid" "2220" "size" "30" "download" "12" } } }
+    "223" { "manifests" { "public" { "gid" "2230" "size" "40" "download" "18" } } }
+  } })");
+  const auto borrower = ParseAppInfo(280, buffer);
+  assert(source && borrower);
+  KeepDepotsBorrowedBy(*borrower, &*source);
+  installs::InstalledRecord record;
+  record.app_id = 280;
+  record.depots = {{280, 2800, 280, 280}};
+  const LicensedDepots::Grant grant{{280}, {280}};
+  const auto details = DetailsFromAppInfo(280, buffer, grant, "english", record, {*source});
+  const auto target = DepotsToUpdate(280, buffer, grant, record, {*source});
+  assert(details.update.newer && target.size() == 3);
+  assert(details.update.target == UpdateTarget(target));
+  assert(details.install_bytes == 60 && details.download_bytes == 26);
+}
+
 int main() {
   SizeChecksAreAnsweredOncePerChoice();
   InstallSizesGoAheadOfUpdates();
@@ -926,4 +953,5 @@ int main() {
   LaunchesFollowInstalledDlc();
   VersionsAreOffered();
   InstalledGamesCompareWithTheirRecord();
+  BorrowedDepotsRepairOldInstall();
 }

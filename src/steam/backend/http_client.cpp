@@ -2,6 +2,7 @@
 
 #include <strings.h>
 
+#include "steam/backend/native_http_ps4.h"
 #include "steam/backend/native_network.h"
 #include "steam/backend/native_resolution_cache.h"
 
@@ -41,6 +42,72 @@ struct TransferBuffer {
   bool malformed_header = false;
 };
 
+struct TransferTrace {
+  std::function<void(const std::string&)> emit;
+  std::string method;
+  std::size_t request_header_bytes = 0;
+  std::size_t upload_bytes = 0;
+  std::size_t response_header_bytes = 0;
+  std::size_t response_bytes = 0;
+  std::size_t tls_out_bytes = 0;
+  std::size_t tls_in_bytes = 0;
+  long response_status = 0;
+};
+
+void TraceLine(TransferTrace* trace, std::string line) {
+  if (!trace || !trace->emit) return;
+  try {
+    trace->emit("http " + trace->method + " " + line);
+  } catch (...) {
+    // A platform logger must not unwind through libcurl's C callback.
+  }
+}
+
+int CurlDebug(CURL*, curl_infotype type, char* data, size_t size, void* context) {
+  auto* trace = static_cast<TransferTrace*>(context);
+  if (!trace) return 0;
+  switch (type) {
+    case CURLINFO_HEADER_OUT:
+      trace->request_header_bytes += size;
+      TraceLine(trace, "request headers sent bytes=" + std::to_string(size));
+      break;
+    case CURLINFO_DATA_OUT:
+      trace->upload_bytes += size;
+      break;
+    case CURLINFO_HEADER_IN: {
+      trace->response_header_bytes += size;
+      std::string_view line(data, size);
+      if (line.rfind("HTTP/", 0) == 0) {
+        const auto first_space = line.find(' ');
+        if (first_space != std::string_view::npos && first_space + 4 <= line.size()) {
+          long status = 0;
+          const auto parsed = std::from_chars(line.data() + first_space + 1,
+                                              line.data() + first_space + 4, status);
+          if (parsed.ec == std::errc{}) {
+            trace->response_status = status;
+            TraceLine(trace, "response status=" + std::to_string(status));
+          }
+        }
+      }
+      break;
+    }
+    case CURLINFO_DATA_IN:
+      trace->response_bytes += size;
+      break;
+    case CURLINFO_SSL_DATA_OUT:
+      trace->tls_out_bytes += size;
+      break;
+    case CURLINFO_SSL_DATA_IN:
+      trace->tls_in_bytes += size;
+      break;
+    case CURLINFO_TEXT:
+    default:
+      // Curl text can include URL or header details; never log it verbatim.
+      break;
+  }
+  return 0;
+}
+
 bool MultiplyWithin(std::size_t left, std::size_t right, std::size_t limit,
                     std::size_t& product) {
   if (right != 0 && left > limit / right) return false;
@@ -69,6 +136,18 @@ std::string_view Trim(std::string_view value) {
           value.back() == '\n'))
     value.remove_suffix(1);
   return value;
+}
+
+std::string RequestHost(const std::string& url) {
+  CURLU* parsed = curl_url();
+  if (!parsed) return "unknown";
+  char* host = nullptr;
+  const bool ok = curl_url_set(parsed, CURLUPART_URL, url.c_str(), 0) == CURLUE_OK &&
+                  curl_url_get(parsed, CURLUPART_HOST, &host, 0) == CURLUE_OK && host;
+  std::string result = ok ? host : "unknown";
+  curl_free(host);
+  curl_url_cleanup(parsed);
+  return result;
 }
 
 size_t WriteHeader(char* bytes, size_t size, size_t count, void* context) {
@@ -216,10 +295,17 @@ std::string HttpFailureName(const HttpResponse& response) {
 
 class HttpClient::Impl {
  public:
-  explicit Impl(std::string ca_bundle) : ca_bundle_(std::move(ca_bundle)) {
-    native_ready_ = internal::InitializeNativeNetwork();
-    curl_ready_ = native_ready_ && GlobalCurl().ready;
-    if (curl_ready_) multi_ = internal::NativeResolutionCache::CreateTransport();
+  explicit Impl(std::string ca_bundle, std::function<void(const std::string&)> trace)
+      : ca_bundle_(std::move(ca_bundle)), trace_(std::move(trace)) {
+    native_ready_ = internal::InitializeNativeNetworkForBootstrap();
+    curl_ready_ = GlobalCurl().ready;
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+    native_http_ready_ = native_ready_ && internal::InitializeNativeHttpPs4();
+#else
+    native_http_ready_ = native_ready_ && internal::InitializeNativeNetwork();
+    if (curl_ready_ && native_http_ready_)
+      multi_ = internal::NativeResolutionCache::CreateTransport();
+#endif
   }
 
   ~Impl() {
@@ -228,10 +314,17 @@ class HttpClient::Impl {
   }
 
   HttpResponse Perform(const HttpRequest& request, const std::atomic<bool>& cancel) {
-    if (!curl_ready_ || !multi_ || ca_bundle_.empty())
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+    if (!native_ready_ || !native_http_ready_ || !curl_ready_)
+#else
+    if (!curl_ready_ || !native_http_ready_ || !multi_ || ca_bundle_.empty())
+#endif
       return {HttpError::kInitializationFailed, 0, {}, {}};
     if (!ValidRequest(request)) return {HttpError::kInvalidRequest, 0, {}, {}};
     if (cancel.load(std::memory_order_acquire)) return {HttpError::kCanceled, 0, {}, {}};
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+    return internal::PerformNativeHttpPs4(request, cancel, trace_);
+#endif
     const auto request_start = Clock::now();
     const auto deadline = request_start + std::chrono::milliseconds(request.timeout_ms);
 
@@ -240,6 +333,12 @@ class HttpClient::Impl {
     curl_slist* request_headers = nullptr;
     auto transfer_buffer = std::make_unique<TransferBuffer>();
     auto& transfer = *transfer_buffer;
+    TransferTrace trace;
+    trace.emit = trace_;
+    trace.method = request.method == HttpMethod::kGet ? "GET" :
+                   request.method == HttpMethod::kPut ? "PUT" : "POST";
+    TraceLine(&trace, "start host=" + RequestHost(request.url) + " timeout=" +
+                         std::to_string(request.timeout_ms) + "ms");
     transfer.body_limit = request.max_response_bytes;
     CURLcode result = CURLE_FAILED_INIT;
     internal::NativeResolveError resolve_error = internal::NativeResolveError::kFailed;
@@ -280,6 +379,11 @@ class HttpClient::Impl {
     PLAYDEN_SETOPT(CURLOPT_PROTOCOLS_STR, request.allow_plain_http ? "http,https" : "https");
     PLAYDEN_SETOPT(CURLOPT_REDIR_PROTOCOLS_STR, "https");
     PLAYDEN_SETOPT(CURLOPT_NOSIGNAL, 1L);
+    if (trace.emit) {
+      PLAYDEN_SETOPT(CURLOPT_VERBOSE, 1L);
+      PLAYDEN_SETOPT(CURLOPT_DEBUGFUNCTION, CurlDebug);
+      PLAYDEN_SETOPT(CURLOPT_DEBUGDATA, &trace);
+    }
     PLAYDEN_SETOPT(CURLOPT_TCP_KEEPALIVE, 1L);
     if (request.method != HttpMethod::kGet) {
       PLAYDEN_SETOPT(CURLOPT_FRESH_CONNECT, 1L);
@@ -307,7 +411,8 @@ class HttpClient::Impl {
       resolve_error = resolution_cache_.Attach(easy, request.url, request.timeout_ms, cancel,
                                                &resolve_entries_, Clock::now());
       transfer.response.address = resolution_cache_.address();
-#if PLAYDEN_PLATFORM_PS5
+#if (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
       transfer.response.timing.resolve_ms = static_cast<std::uint32_t>(
           std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
 #else
@@ -375,30 +480,50 @@ class HttpClient::Impl {
 
   cleanup:
     if (easy) {
-      curl_off_t lookup = 0, connect = 0, tls = 0, first = 0;
+      curl_off_t lookup = 0, connect = 0, tls = 0, first = 0, uploaded = 0;
       long connections = 0;
       curl_easy_getinfo(easy, CURLINFO_NAMELOOKUP_TIME_T, &lookup);
       curl_easy_getinfo(easy, CURLINFO_CONNECT_TIME_T, &connect);
       curl_easy_getinfo(easy, CURLINFO_APPCONNECT_TIME_T, &tls);
       curl_easy_getinfo(easy, CURLINFO_STARTTRANSFER_TIME_T, &first);
+      curl_easy_getinfo(easy, CURLINFO_SIZE_UPLOAD_T, &uploaded);
       curl_easy_getinfo(easy, CURLINFO_NUM_CONNECTS, &connections);
       const auto ms = [](curl_off_t us) { return static_cast<std::uint32_t>(std::max<curl_off_t>(0, us) / 1000); };
       transfer.response.timing.connect_ms = ms(connect - lookup);
       transfer.response.timing.tls_ms = ms(tls - connect);
       transfer.response.timing.first_byte_ms = ms(first);
       transfer.response.timing.new_connections = static_cast<std::uint32_t>(std::max(0L, connections));
+      transfer.response.timing.uploaded_bytes =
+          static_cast<std::uint64_t>(std::max<curl_off_t>(0, uploaded));
     }
     transfer.response.timing.body_bytes = transfer.response.body.size();
+    transfer.response.timing.total_ms = static_cast<std::uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - request_start).count());
     if (added) curl_multi_remove_handle(multi, easy);
     if (easy) curl_easy_cleanup(easy);
     curl_slist_free_all(request_headers);
     transfer.response.error = MapError(result, transfer, canceled);
+    // A transport failure is not an HTTP response, even if curl saw a status
+    // line before the connection failed. Callers use zero to distinguish it
+    // from a complete 4xx/5xx response when choosing a retry.
+    if (result != CURLE_OK) transfer.response.status_code = 0;
+    TraceLine(&trace, "complete curl=" + std::to_string(static_cast<int>(result)) +
+                         " status=" + std::to_string(transfer.response.status_code) +
+                         " tx_headers=" + std::to_string(trace.request_header_bytes) +
+                         " tx_body=" + std::to_string(trace.upload_bytes) +
+                         " rx_headers=" + std::to_string(trace.response_header_bytes) +
+                         " rx_body=" + std::to_string(trace.response_bytes) +
+                         " tls_tx=" + std::to_string(trace.tls_out_bytes) +
+                         " tls_rx=" + std::to_string(trace.tls_in_bytes) +
+                         " connect=" + std::to_string(transfer.response.timing.connect_ms) +
+                         "ms tls=" + std::to_string(transfer.response.timing.tls_ms) +
+                         "ms first=" + std::to_string(transfer.response.timing.first_byte_ms) +
+                         "ms total=" + std::to_string(transfer.response.timing.total_ms) + "ms");
     if (!transfer.response.ok()) {
       transfer.response.transport_code = result == CURLE_OK ? 0 : static_cast<int>(result);
       // Clearing both caches covers transport failure and abandonment before curl consumes
       // staged DNS removals. Successful GETs retain their multi connection and DNS caches.
       resolution_cache_.ResetTransport(multi_);
-      transfer.response.status_code = 0;
       transfer.response.headers.clear();
       transfer.response.body.clear();
     }
@@ -410,12 +535,14 @@ class HttpClient::Impl {
   CURLM* multi_ = nullptr;
   curl_slist* resolve_entries_ = nullptr;
   internal::NativeResolutionCache resolution_cache_;
+  std::function<void(const std::string&)> trace_;
   bool native_ready_ = false;
   bool curl_ready_ = false;
+  bool native_http_ready_ = false;
 };
 
-HttpClient::HttpClient(std::string ca_bundle)
-    : impl_(std::make_unique<Impl>(std::move(ca_bundle))) {}
+HttpClient::HttpClient(std::string ca_bundle, std::function<void(const std::string&)> trace)
+    : impl_(std::make_unique<Impl>(std::move(ca_bundle), std::move(trace))) {}
 HttpClient::~HttpClient() = default;
 HttpClient::HttpClient(HttpClient&&) noexcept = default;
 HttpClient& HttpClient::operator=(HttpClient&&) noexcept = default;

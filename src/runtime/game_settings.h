@@ -90,6 +90,10 @@ struct KitCapabilities {
   // controller. Counts only for a title that runs this kit's runtime, like display_120hz.
   bool input_playstation = false;
   bool input_playstation_needs_update = false;
+  // [input] mouse = touchpad: the touchpad moves the pointer (Orbis-Win's PS4 runtime).
+  bool input_touchpad = false;
+  // [input] keyboard_stick: a stick sends the four direction keys, W A S D by default (prospero-win #736).
+  bool input_keyboard_stick = false;
 };
 
 struct SettingChoice {
@@ -280,6 +284,10 @@ struct EffectiveSettings {
   // The title's runtime takes [input] mode = playstation (KitCapabilities::input_playstation).
   bool input_playstation = false;
   bool input_playstation_needs_update = false;
+  // The runtime takes [input] mouse = touchpad (KitCapabilities::input_touchpad).
+  bool input_touchpad = false;
+  // The runtime takes [input] keyboard_stick (KitCapabilities::input_keyboard_stick).
+  bool input_keyboard_stick = false;
 };
 
 // The launch entry id of a program the player chose from the game folder.
@@ -621,6 +629,12 @@ inline constexpr const char* kKitLauncherMode = "launcher-mode";
 // The title takes [input] mode = playstation: the game's Wine finds the DualSense as a wired DualShock 4 on its HID
 // bus, with the controller's own reports, and XInput reports no controller. Runtimes without it refuse the value.
 inline constexpr const char* kKitInputPlaystation = "input-playstation";
+// The title takes [input] mouse = touchpad: the DualShock/DualSense touchpad moves the pointer (Orbis-Win's PS4
+// runtime). Runtimes without it refuse the value.
+inline constexpr const char* kKitInputTouchpad = "input-touchpad";
+// The title takes [input] keyboard_stick = left_stick|right_stick: one stick sends W A S D (prospero-win #736), for
+// keyboard games that walk with the keys and look with the mouse. Runtimes without it refuse the key.
+inline constexpr const char* kKitInputKeyboardStick = "input-keyboard-stick";
 const std::vector<std::string>& SettingsKitCapabilityNames();
 
 // Settings gates from a verified kit's capabilities. bottle_access: the adapter can edit the

@@ -18,6 +18,10 @@ struct AuthClientHooks {
   std::function<bool(std::uint32_t, const std::atomic<bool>&)> wait;
   // Optional sanitized failure report: method name, HTTP status and X-EResult number only.
   std::function<void(const char* method, long http_status, int eresult)> failure;
+  // Sanitized transport failure category for platform diagnostics; excludes URL and payload.
+  std::function<void(const char* method, const HttpResponse& response)> transport_failure;
+  // Sanitized curl phase trace. Implementations must never receive request/response contents.
+  std::function<void(const std::string& line)> transport_trace;
   // Renews the access token through an authenticated CM session, the only place the refresh token is sent
   // after sign-in. Returns the updated session or an error; without it no token can be renewed.
   std::function<AuthResult(const StoredSession&, const std::atomic<bool>&)> cm_renew;
@@ -39,6 +43,13 @@ class AuthClient final : public AuthBackend {
   // Installs the sanitized failure report on a production client before first use.
   void SetFailureReport(std::function<void(const char*, long, int)> report) {
     hooks_.failure = std::move(report);
+  }
+  void SetTransportFailureReport(
+      std::function<void(const char*, const HttpResponse&)> report) {
+    hooks_.transport_failure = std::move(report);
+  }
+  void SetTransportTraceReport(std::function<void(const std::string&)> report) {
+    hooks_.transport_trace = std::move(report);
   }
   void SetRestoreReport(std::function<void(const char*, const std::string&, const std::string&)> report) {
     hooks_.restored = std::move(report);

@@ -23,6 +23,7 @@ using playden::steam::ChunkError;
 using playden::steam::DecodeDepotChunk;
 using playden::steam::DepotChunkAdler32;
 using playden::steam::ProcessDepotChunk;
+using playden::steam::ProcessDepotChunkInPlace;
 using playden::steam::SymmetricDecrypt;
 using Bytes = std::vector<std::uint8_t>;
 
@@ -372,8 +373,14 @@ void TestRoundTrip(const Bytes& enc) {
   Bytes out;
   CHECK(ProcessDepotChunk(enc, Key(), kPlainSize, kAdler0, Sha(), &out) == ChunkError::kNone);
   CHECK(IsPlain(out));
+  Bytes writable = enc;
+  CHECK(ProcessDepotChunkInPlace(&writable, Key(), kPlainSize, kAdler0, Sha(), &out) == ChunkError::kNone);
+  CHECK(IsPlain(out));
   // Zero manifest crc falls back to the chunk SHA-1.
   CHECK(ProcessDepotChunk(enc, Key(), kPlainSize, 0, Sha(), &out) == ChunkError::kNone);
+  CHECK(IsPlain(out));
+  writable = enc;
+  CHECK(ProcessDepotChunkInPlace(&writable, Key(), kPlainSize, 0, Sha(), &out) == ChunkError::kNone);
   CHECK(IsPlain(out));
 }
 

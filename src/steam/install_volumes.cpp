@@ -19,6 +19,7 @@ extern "C" int sceKernelDlsym(int, const char*, void**);
 namespace playden::steam {
 namespace {
 
+#if !PLAYDEN_PLATFORM_PS4
 std::string ExternalRoot(const std::string& path) {
   for (const auto* root : {"/mnt/ext0", "/mnt/ext1", "/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3", "/mnt/usb4",
                            "/mnt/usb5", "/mnt/usb6", "/mnt/usb7"}) {
@@ -47,6 +48,7 @@ std::string QueryPath(const std::string& path) {
   }
   return result.empty() ? "." : result;
 }
+#endif
 
 bool IsDirectory(const std::string& path) {
   struct stat info {};
@@ -116,7 +118,12 @@ Fstatfs ResolvedFstatfs() {
 }  // namespace
 
 bool VolumeSpaceSupported() {
-#if PLAYDEN_PLATFORM_PS5
+#if PLAYDEN_PLATFORM_PS4
+  // PS4's app-process fstatvfs path reports zero available blocks even when the volume has
+  // substantial free space. Until a working native volume query is available, let writes be
+  // authoritative; the installer handles ENOSPC and retains its download journal.
+  return false;
+#elif PLAYDEN_PLATFORM_PS5
   return ResolvedFstatfs() != nullptr;
 #else
   return true;
@@ -139,8 +146,14 @@ VolumeSpace detail::WithoutConsoleReserve(VolumeSpace space, std::uint64_t reser
 }
 
 bool detail::VolumeMountMatches(const std::string& path, const std::string& mount) {
+#if PLAYDEN_PLATFORM_PS4
+  (void)path;
+  (void)mount;
+  return false;
+#else
   const auto root = ExternalRoot(path);
   return root.empty() || mount == root;
+#endif
 }
 
 std::vector<InstallVolume> DiscoverInstallVolumes(const std::vector<VolumeCandidate>& candidates, const AsRoot& as_root) {
@@ -182,6 +195,11 @@ std::vector<VolumeCandidate> ConsoleVolumeCandidates(const std::string& title_ro
 }
 
 std::optional<VolumeSpace> QueryVolumeSpace(const std::string& path, std::uint64_t console_reserve) {
+#if PLAYDEN_PLATFORM_PS4
+  (void)path;
+  (void)console_reserve;
+  return std::nullopt;
+#else
   std::string directory = QueryPath(path);
   if (directory.empty()) return std::nullopt;
   const auto external_root = ExternalRoot(directory);
@@ -226,6 +244,7 @@ std::optional<VolumeSpace> QueryVolumeSpace(const std::string& path, std::uint64
     return std::nullopt;
   return detail::VolumeSpaceFromBlocks(static_cast<std::int64_t>(unit), info.f_blocks,
                                       static_cast<std::int64_t>(info.f_bavail));
+#endif
 #endif
 }
 

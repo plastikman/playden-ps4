@@ -28,9 +28,10 @@ void SetSchema(LibrarySnapshot* snapshot) {
 LibraryService::LibraryService(steam::LibraryBackend& backend,
                                SessionRepository& sessions,
                                LibraryRepository* cache,
-                               std::function<std::uint64_t()> unix_seconds)
+                               std::function<std::uint64_t()> unix_seconds,
+                               std::function<void(const char*)> trace)
     : backend_(backend), sessions_(sessions), cache_(cache),
-      unix_seconds_(std::move(unix_seconds)), worker_([this] { Run(); }) {
+      unix_seconds_(std::move(unix_seconds)), trace_(std::move(trace)), worker_([this] { Run(); }) {
   backend_.SetLateGamesCallback([this] { NotifyLateGames(); });
 }
 
@@ -266,8 +267,10 @@ void LibraryService::ExecuteLoadCached(const Job& job) {
 }
 
 void LibraryService::ExecuteRefresh(const Job& job) {
+  if (trace_) trace_("refresh-start");
   if (!Current(job)) return;
   auto session = sessions_.Load();
+  if (trace_) trace_("session-loaded");
   if (!Current(job)) return;
   if (!session.ok()) {
     EmitFailure(job, steam::LibraryError::kPersistence);
@@ -284,7 +287,9 @@ void LibraryService::ExecuteRefresh(const Job& job) {
   // Acquisition dates from the previous snapshot, kept when a refresh cannot obtain them.
   std::unordered_map<GameId, std::uint64_t> previous_added_at;
   if (cache_) {
+    if (trace_) trace_("cache-read-start");
     auto loaded = cache_->Load(job.account);
+    if (trace_) trace_(loaded.ok() ? "cache-read-ok" : "cache-read-unavailable");
     if (!Current(job)) return;
     if (loaded.ok() && loaded.value().retrieved_at_unix_seconds <= kMaximumTimestamp) {
       cache_available = true;
@@ -307,7 +312,9 @@ void LibraryService::ExecuteRefresh(const Job& job) {
     }
   }
   if (!Current(job)) return;
+  if (trace_) trace_("network-fetch-start");
   auto result = backend_.Fetch(*session.value(), *job.cancel);
+  if (trace_) trace_("network-fetch-done");
   if (!Current(job)) return;
   if (result.error != steam::LibraryError::kNone) {
     EmitFailure(job, result.error, cache_error, cache_available);
@@ -325,7 +332,9 @@ void LibraryService::ExecuteRefresh(const Job& job) {
   snapshot.metadata_partial = result.metadata_partial;
   SetSchema(&snapshot);
   if (cache_) {
+    if (trace_) trace_("cache-write-start");
     const auto saved = cache_->Save(job.account, snapshot);
+    if (trace_) trace_(saved.ok() ? "cache-write-ok" : "cache-write-failed");
     if (!Current(job)) return;
     if (saved.ok()) {
       cache_available = true;

@@ -140,7 +140,7 @@ AuthError AuthClient::Post(const char* method, const std::vector<std::uint8_t>& 
   if (hooks_.perform) response = hooks_.perform(req, cancel);
   else {
     if (ca_bundle_.empty()) return AuthError::kProtocol;
-    if (!http_) http_ = std::make_unique<HttpClient>(ca_bundle_);
+    if (!http_) http_ = std::make_unique<HttpClient>(ca_bundle_, hooks_.transport_trace);
     response = http_->Perform(req, cancel);
   }
   if (cancel.load() || response.error == HttpError::kCanceled) return AuthError::kCanceled;
@@ -150,7 +150,10 @@ AuthError AuthClient::Post(const char* method, const std::vector<std::uint8_t>& 
     if (hooks_.failure) hooks_.failure(method, response.status_code, eresult);
     return error;
   };
-  if (!response.ok()) return report(AuthError::kNetwork, 0);
+  if (!response.ok()) {
+    if (hooks_.transport_failure) hooks_.transport_failure(method, response);
+    return report(AuthError::kNetwork, 0);
+  }
   if (response.status_code == 401 || response.status_code == 403)
     return report(AuthError::kRejected, 0);
   if (response.status_code == 429 || response.status_code >= 500) return report(AuthError::kNetwork, 0);

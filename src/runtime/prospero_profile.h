@@ -84,6 +84,8 @@ struct ProsperoProfileFeatures {
   bool display_fps_counter = false;  // [display] fps_counter = true|false (kit capability display-fps-counter)
   bool launcher_section = false;     // [launcher] (kit launcher-mode)
   bool input_playstation = false;    // [input] mode = playstation (kit capability input-playstation)
+  bool input_touchpad = false;       // [input] mouse = touchpad (kit capability input-touchpad)
+  bool input_keyboard_stick = false; // [input] keyboard_stick (kit capability input-keyboard-stick)
   bool runtime_version = false;      // [runtime] version = 1|2 (kit capability profile-version-2)
 };
 // A [debug] env variable the runtime takes: PW_, DXVK_, MESA_, GALLIUM_, ZINK_, RADV_ or VK_ names, without the ones

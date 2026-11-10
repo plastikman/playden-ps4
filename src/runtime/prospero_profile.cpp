@@ -347,10 +347,15 @@ bool CheckProsperoProfile(std::string_view text, std::string* reason, ProsperoPr
           return bad("not keyboard or xinput");
         }
       } else if (key == "mouse") {
-        if (!OneOf(value, {"none", "left_stick", "right_stick"})) return bad("unknown pointer stick");
+        if (features.input_touchpad && value == "touchpad") {
+        } else if (!OneOf(value, {"none", "left_stick", "right_stick"})) {
+          return bad("unknown pointer stick");
+        }
       } else if (key == "mouse_speed") {
         const long speed = IsDigits(value, 9) ? std::atol(std::string(value).c_str()) : 0;
         if (speed < 1 || speed > 20000) return bad("not 1-20000");
+      } else if (features.input_keyboard_stick && key == "keyboard_stick") {
+        if (!OneOf(value, {"none", "left_stick", "right_stick"})) return bad("unknown movement stick");
       } else if (features.input_wheel && key == "wheel") {
         if (!OneOf(value, {"none", "left_stick", "right_stick"})) return bad("unknown wheel stick");
       } else if ((features.input_tuning && (key == "stick_deadzone" || key == "trigger_deadzone")) ||

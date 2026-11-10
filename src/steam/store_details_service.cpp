@@ -38,6 +38,24 @@ std::string PlainText(std::string_view html) {
   return collapsed;
 }
 
+std::vector<std::string> StringArray(const json::Value* value) {
+  std::vector<std::string> out;
+  if (!value || !value->is_array()) return out;
+  for (const auto& item : value->array())
+    if (item.is_string() && !item.text().empty()) out.push_back(PlainText(item.text()));
+  return out;
+}
+
+std::vector<std::string> DescriptionArray(const json::Value* value) {
+  std::vector<std::string> out;
+  if (!value || !value->is_array()) return out;
+  for (const auto& item : value->array()) {
+    const auto* name = item.Find("description");
+    if (name && name->is_string() && !name->text().empty()) out.push_back(PlainText(name->text()));
+  }
+  return out;
+}
+
 }  // namespace
 
 std::string StoreDetailsUrl(std::uint32_t app) {
@@ -62,8 +80,20 @@ std::optional<StoreDetails> ParseStoreDetails(std::uint32_t id, std::string_view
     for (const auto& genre : genres->array())
       if (const auto* name = genre.Find("description"); name && name->is_string() && !name->text().empty())
         details.genres.push_back(PlainText(name->text()));
+  details.developers = StringArray(data->Find("developers"));
+  details.publishers = StringArray(data->Find("publishers"));
+  details.categories = DescriptionArray(data->Find("categories"));
+  if (const auto* release = data->Find("release_date"); release && release->is_object())
+    if (const auto* date = release->Find("date"); date && date->is_string())
+      details.release_date = PlainText(date->text());
+  if (const auto* score = data->Find("metacritic"); score && score->is_object())
+    if (const auto* value = score->Find("score"); value && value->AsUint64() && *value->AsUint64() <= 100)
+      details.metacritic_score = std::to_string(*value->AsUint64());
   if (const auto* support = data->Find("controller_support"); support && support->is_string())
     details.controller_support = support->text();
+  if (const auto* platforms = data->Find("platforms"); platforms && platforms->is_object())
+    if (const auto* windows = platforms->Find("windows"); windows && windows->is_bool())
+      details.windows_supported = windows->boolean();
   return details;
 }
 
@@ -113,7 +143,13 @@ void StoreDetailsService::Run() {
     const auto app = *id.steam_app();
     const auto body = fetch_ ? fetch_(StoreDetailsUrl(app), cancel_) : std::nullopt;
     auto details = body ? ParseStoreDetails(app, *body) : std::nullopt;
-    if (!details) continue;
+    if (!details) {
+      StoreDetails unavailable;
+      unavailable.id = GameId::Steam(app);
+      details = std::move(unavailable);
+    } else {
+      details->available = true;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     results_.push_back(std::move(*details));
   }

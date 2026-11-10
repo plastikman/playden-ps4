@@ -171,6 +171,8 @@ struct InstallerHooks {
   std::function<void(const std::vector<ContentServer>&, const char* preference)> server_list;
   // Optional: step markers for diagnosing native failures (no identifiers).
   std::function<void(const char* step)> trace;
+  // Optional detail trace for a single failing stage, such as a depot chunk's allocation limits.
+  std::function<void(const char* step, const std::string& detail)> trace_detail;
   // Optional: how the merge settled a file and a folder of the same name in different depots (the result,
   // then both entries: depot, kind, size and path). At most DepotInstaller::kMergeLogLimit lines, then a count.
   std::function<void(const char* result, const std::string& detail)> merge;
@@ -273,6 +275,9 @@ class DepotInstaller {
     hooks_.server_list = std::move(listed);
   }
   void SetTrace(std::function<void(const char*)> trace) { hooks_.trace = std::move(trace); }
+  void SetTraceDetail(std::function<void(const char*, const std::string&)> trace) {
+    hooks_.trace_detail = std::move(trace);
+  }
   void SetMerge(std::function<void(const char*, const std::string&)> merge) { hooks_.merge = std::move(merge); }
   void SetRace(std::function<void(const char*, const char*, const std::string&)> race) { hooks_.race = std::move(race); }
   void SetFastestCache(std::function<std::optional<std::string>()> cached, std::function<void(const std::string&)> remember) {

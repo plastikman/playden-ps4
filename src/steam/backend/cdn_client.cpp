@@ -69,13 +69,14 @@ ServerOrder PreferServer(std::vector<ContentServer>* servers, const std::string&
   return {true, index};
 }
 
-CdnClient::CdnClient(std::string ca_bundle) : ca_bundle_(std::move(ca_bundle)) {}
+CdnClient::CdnClient(std::string ca_bundle, std::function<void(const std::string&)> trace)
+    : ca_bundle_(std::move(ca_bundle)), trace_(std::move(trace)) {}
 CdnClient::CdnClient(Perform perform) : perform_(std::move(perform)) {}
 CdnClient::~CdnClient() = default;
 
 CdnError CdnClient::Get(const std::string& url, std::size_t max_bytes, std::uint32_t timeout_ms,
                         const std::atomic<bool>& cancel, std::vector<std::uint8_t>* out, bool plain_http,
-                        bool depot_manifest) {
+                        bool depot_manifest, bool preallocate_response) {
   HttpRequest request;
   request.url = url;
   request.allow_plain_http = plain_http;
@@ -83,12 +84,13 @@ CdnError CdnClient::Get(const std::string& url, std::size_t max_bytes, std::uint
   request.headers = {{"User-Agent", "Valve/Steam HTTP Client 1.0"}};
   request.timeout_ms = timeout_ms;
   request.max_response_bytes = max_bytes;
+  request.preallocate_response = preallocate_response;
   HttpResponse response;
   if (perform_) {
     response = perform_(request, cancel);
   } else {
     if (ca_bundle_.empty()) return CdnError::kProtocol;
-    if (!http_) http_ = std::make_unique<HttpClient>(ca_bundle_);
+    if (!http_) http_ = std::make_unique<HttpClient>(ca_bundle_, trace_);
     response = http_->Perform(request, cancel);
   }
   const auto error = FromHttp(response);
@@ -178,7 +180,7 @@ CdnError CdnClient::Chunk(const ContentServer& server, std::uint32_t depot_id, c
       !std::all_of(sha_hex.begin(), sha_hex.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
     return CdnError::kProtocol;
   return Get(Scheme(server) + server.vhost + "/depot/" + std::to_string(depot_id) + "/chunk/" + sha_hex,
-             max_bytes, 30'000, cancel, out, !server.https);
+             max_bytes, 30'000, cancel, out, !server.https, false, true);
 }
 
 }  // namespace playden::steam

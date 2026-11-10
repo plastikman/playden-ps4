@@ -29,5 +29,12 @@ ChunkError DecodeDepotChunk(const std::uint8_t* data, std::size_t size, std::vec
 ChunkError ProcessDepotChunk(const std::vector<std::uint8_t>& encrypted, const std::array<std::uint8_t, 32>& key,
                              std::size_t expected_size, std::uint32_t expected_checksum,
                              const std::array<std::uint8_t, 20>& chunk_sha, std::vector<std::uint8_t>* out);
+// The install path owns the downloaded buffer and can decrypt it in place. This avoids holding
+// a second compressed-size buffer while allocating the uncompressed chunk on PS4.
+ChunkError ProcessDepotChunkInPlace(std::vector<std::uint8_t>* encrypted,
+                                   const std::array<std::uint8_t, 32>& key,
+                                   std::size_t expected_size, std::uint32_t expected_checksum,
+                                   const std::array<std::uint8_t, 20>& chunk_sha,
+                                   std::vector<std::uint8_t>* out);
 
 }  // namespace playden::steam

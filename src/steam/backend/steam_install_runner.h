@@ -127,6 +127,9 @@ class SteamInstallRunner final : public SessionInstallRunner {
       }
     });
     installer_.SetTrace([this, log](const char* step) { LogInstallTrace(log, current_app_.load(), step); });
+    installer_.SetTraceDetail([this, log](const char* step, const std::string& detail) {
+      if (log) log(current_app_.load(), "trace", step, detail.c_str());
+    });
     installer_.SetMerge([this, log](const char* result, const std::string& detail) {
       if (log) log(current_app_.load(), "merge", result, detail.c_str());
     });

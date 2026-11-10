@@ -40,7 +40,8 @@ class LibraryService {
  public:
   LibraryService(steam::LibraryBackend&, SessionRepository&,
                  LibraryRepository* cache = nullptr,
-                 std::function<std::uint64_t()> unix_seconds = {});
+                 std::function<std::uint64_t()> unix_seconds = {},
+                 std::function<void(const char*)> trace = {});
   ~LibraryService();
   LibraryService(const LibraryService&) = delete;
   LibraryService& operator=(const LibraryService&) = delete;
@@ -87,6 +88,7 @@ class LibraryService {
   SessionRepository& sessions_;
   LibraryRepository* cache_;
   std::function<std::uint64_t()> unix_seconds_;
+  std::function<void(const char*)> trace_;
   mutable std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<Job> pending_;

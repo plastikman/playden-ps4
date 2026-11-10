@@ -473,19 +473,27 @@ bool InLanguage(const DepotInfo& depot, const std::string& language) {
 }  // namespace
 
 void KeepDepotsDemoBorrows(const AppInfo& demo, AppInfo* game) {
+  if (!game) return;
+  AppInfo borrowed = demo;
+  borrowed.depots.erase(std::remove_if(borrowed.depots.begin(), borrowed.depots.end(), [](const DepotInfo& depot) {
+    return depot.manifest_gid.has_value() || !depot.branches.empty();
+  }), borrowed.depots.end());
+  KeepDepotsBorrowedBy(borrowed, game);
+}
+
+void KeepDepotsBorrowedBy(const AppInfo& borrower, AppInfo* source) {
+  if (!source) return;
   std::vector<DepotInfo> kept;
-  for (DepotInfo& depot : game->depots) {
-    const bool borrowed = std::any_of(demo.depots.begin(), demo.depots.end(), [&](const DepotInfo& listed) {
-      return listed.id == depot.id && listed.depot_from_app == game->app_id && !listed.manifest_gid &&
-             listed.branches.empty();
+  for (DepotInfo& depot : source->depots) {
+    const bool borrowed = std::any_of(borrower.depots.begin(), borrower.depots.end(), [&](const DepotInfo& listed) {
+      return listed.id == depot.id && listed.depot_from_app == source->app_id;
     });
     if (!borrowed) continue;
-    // Still borrowed: an account that doesn't get its key installs the demo without it.
-    depot.depot_from_app = game->app_id;
+    depot.depot_from_app = source->app_id;
     kept.push_back(std::move(depot));
   }
-  game->depots = std::move(kept);
-  game->dlc_app_ids.clear();
+  source->depots = std::move(kept);
+  source->dlc_app_ids.clear();
 }
 
 bool SelectDepots(const AppInfo& app, const std::vector<AppInfo>& dlc_apps, const std::set<std::uint32_t>& owned_apps,

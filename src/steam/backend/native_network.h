@@ -16,7 +16,12 @@ bool InitializeNativeNetworkForBootstrap();
 // Initializes and semantically checks the process-wide native network runtime before curl global
 // initialization. The PS5 runtime is intentionally retained until process exit so this adapter
 // never terminates networking initialized or used by another subsystem.
+// A passed check is kept for the process; a failed one is retried on the next call, because the
+// check is timed and a busy moment must not disable Steam networking until restart.
 bool InitializeNativeNetwork();
+
+// What the last failed nonblocking check measured; empty when none has failed.
+std::string NativeNetworkPreflightDetail();
 
 // Resolves the URL host through the bounded PS5 resolver and attaches the numeric address through
 // CURLOPT_RESOLVE. Host builds use curl's normal resolver and leave entries null.

@@ -1,0 +1,39 @@
+--- a/lib/curl_setup.h
++++ b/lib/curl_setup.h
+@@ -1622,7 +1622,7 @@
+ #endif
+ 
+ /* NetBSD before 6.1 did not set SS_NBIO for SOCK_NONBLOCK. */
+-#if defined(SOCK_NONBLOCK) && \
++#if defined(SOCK_NONBLOCK) && !defined(PLAYDEN_PS4_NATIVE_NONBLOCK) && \
+   (!defined(__NetBSD__) || (__NetBSD_Version__ >= 601000000))
+ #define CURL_USE_SOCK_NONBLOCK
+ #endif
+--- a/lib/curlx/nonblock.c
++++ b/lib/curlx/nonblock.c
+@@ -37,6 +37,11 @@
+ 
+ #include "curlx/nonblock.h"
+ 
++#ifdef PLAYDEN_PS4_NATIVE_NONBLOCK
++extern int sceNetSetsockopt(int socket, int level, int option,
++                            const void *value, unsigned int size);
++#endif
++
+ /*
+  * curlx_nonblock() set the given socket to either blocking or non-blocking
+  * mode based on the 'nonblock' boolean argument. This function is highly
+@@ -45,7 +50,12 @@
+ int curlx_nonblock(curl_socket_t sockfd,    /* operate on this */
+                    int nonblock   /* TRUE or FALSE */)
+ {
+-#ifdef HAVE_FCNTL_O_NONBLOCK
++#ifdef PLAYDEN_PS4_NATIVE_NONBLOCK
++  /* PS4 curl must use SceNet's native socket option, not fcntl/ioctl. */
++  int enabled = nonblock ? 1 : 0;
++  return sceNetSetsockopt(sockfd, 0xffff, 0x1200, &enabled, sizeof(enabled));
++
++#elif defined(HAVE_FCNTL_O_NONBLOCK)
+   /* most recent Unix versions */
+   int flags;
+   flags = sfcntl(sockfd, F_GETFL, 0);

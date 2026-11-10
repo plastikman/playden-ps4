@@ -889,6 +889,7 @@ CmError CmClient::Open(const StoredSession& stored, const std::atomic<bool>& can
   *transport = hooks_.transport ? hooks_.transport() : std::make_unique<WebSocketClient>(ca_bundle_);
   if (!*transport) return CmError::kProtocol;
   CmError connect_error = CmError::kNetwork;
+  HttpError last_transport_error = HttpError::kConnectionFailed;
   bool connected = false;
   for (const auto& endpoint : endpoints) {
     const auto remaining = RemainingMs(deadline);
@@ -896,8 +897,9 @@ CmError CmClient::Open(const StoredSession& stored, const std::atomic<bool>& can
       connect_error = CmError::kTimeout;
       break;
     }
-    connect_error = FromTransport((*transport)->Connect("wss://" + endpoint + "/cmsocket/",
-                                                        remaining, cancel));
+    last_transport_error = (*transport)->Connect("wss://" + endpoint + "/cmsocket/",
+                                                 remaining, cancel);
+    connect_error = FromTransport(last_transport_error);
     if (connect_error == CmError::kNone) {
       connected = true;
       break;
@@ -906,7 +908,8 @@ CmError CmClient::Open(const StoredSession& stored, const std::atomic<bool>& can
   }
   if (!connected) {
     if (connect_error != CmError::kCanceled)
-      Log(std::string("step=connect error=") + CmErrorName(connect_error));
+      Log(std::string("step=connect error=") + CmErrorName(connect_error) +
+          " transport=" + HttpErrorName(last_transport_error));
     return connect_error;
   }
 

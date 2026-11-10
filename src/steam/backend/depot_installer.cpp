@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <system_error>
 
 namespace playden::steam {
 namespace {
@@ -132,31 +133,54 @@ std::string Parent(const std::string& path) {
 }
 
 bool WriteAt(const std::string& path, std::uint64_t file_size, std::uint64_t offset,
-             const std::vector<std::uint8_t>& data) {
+             const std::vector<std::uint8_t>& data,
+             const std::function<void(const char*)>& trace = {}) {
+  if (trace) trace("first-write-open");
   const int fd = open(path.c_str(), O_WRONLY | O_CREAT, 0666);
   if (fd < 0) return false;
+  if (trace) trace("first-write-opened");
   bool ok = true;
+  int failure_errno = 0;
   struct stat info {};
-  if (fstat(fd, &info) != 0) ok = false;
-  if (ok && static_cast<std::uint64_t>(info.st_size) != file_size &&
-      ftruncate(fd, static_cast<off_t>(file_size)) != 0)
-    ok = false;
+  if (trace) trace("first-write-fstat");
+  if (fstat(fd, &info) != 0) { ok = false; failure_errno = errno; }
+  if (ok && static_cast<std::uint64_t>(info.st_size) != file_size) {
+    if (trace) trace("first-write-ftruncate");
+    if (ftruncate(fd, static_cast<off_t>(file_size)) != 0) {
+      ok = false;
+      failure_errno = errno;
+    }
+  }
   std::size_t written = 0;
+  if (trace) trace("first-write-pwrite");
   while (ok && written < data.size()) {
     const auto result = pwrite(fd, data.data() + written, data.size() - written,
                                static_cast<off_t>(offset + written));
-    if (result <= 0) ok = false;
+    if (result < 0) { ok = false; failure_errno = errno; }
+    else if (result == 0) { ok = false; failure_errno = EIO; }
     else written += static_cast<std::size_t>(result);
   }
-  if (close(fd) != 0) ok = false;
+  if (trace) trace("first-write-close");
+  if (close(fd) != 0) {
+    if (ok) failure_errno = errno;
+    ok = false;
+  }
+  if (trace) trace(ok ? "first-write-done" : "first-write-failed");
+  if (!ok) errno = failure_errno ? failure_errno : EIO;
   return ok;
 }
 
 bool EnsureFileSize(const std::string& path, std::uint64_t size) {
   const int fd = open(path.c_str(), O_WRONLY | O_CREAT, 0666);
   if (fd < 0) return false;
-  const bool ok = ftruncate(fd, static_cast<off_t>(size)) == 0;
-  return close(fd) == 0 && ok;
+  bool ok = ftruncate(fd, static_cast<off_t>(size)) == 0;
+  int failure_errno = ok ? 0 : errno;
+  if (close(fd) != 0) {
+    if (ok) failure_errno = errno;
+    ok = false;
+  }
+  if (!ok) errno = failure_errno ? failure_errno : EIO;
+  return ok;
 }
 
 std::uint64_t DefaultFreeBytes(const std::string& path) {
@@ -169,6 +193,46 @@ std::uint64_t DefaultFreeBytes(const std::string& path) {
 // A folder's entries other than "." and "..", read before any is deleted: deleting while reading
 // can make readdir skip entries. False when the folder cannot be opened.
 bool ListEntries(const std::string& path, std::vector<std::string>& names) {
+#if defined(__PS4__)
+  // Orbis-Win's PS4 library scanner uses open()+getdents() for /data. The SDK's libc opendir()
+  // path fails with EPERM on title-owned /data directories, so use the same kernel enumeration
+  // route here. /data directory records need a full 64 KiB buffer (see prospero-win/native/
+  // pw_wine_library.c and the Orbis-Win PS4 findings).
+  const int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd < 0) return false;
+  alignas(8) char buffer[64 * 1024];
+  bool ok = true;
+  for (;;) {
+    const int got = getdents(fd, reinterpret_cast<struct dirent*>(buffer), sizeof(buffer));
+    if (got == 0) break;
+    if (got < 0) { ok = false; break; }
+    std::size_t offset = 0;
+    while (offset < static_cast<std::size_t>(got)) {
+      if (static_cast<std::size_t>(got) - offset < 8) {
+        errno = EINVAL;
+        ok = false;
+        break;
+      }
+      std::uint16_t record_length = 0;
+      std::memcpy(&record_length, buffer + offset + 4, sizeof(record_length));
+      const auto name_length = static_cast<unsigned char>(buffer[offset + 7]);
+      if (record_length < 8 || record_length > static_cast<std::size_t>(got) - offset ||
+          static_cast<std::size_t>(name_length) + 8 > record_length) {
+        errno = EINVAL;
+        ok = false;
+        break;
+      }
+      std::string name(buffer + offset + 8, name_length);
+      if (name != "." && name != "..") names.push_back(std::move(name));
+      offset += record_length;
+    }
+    if (!ok) break;
+  }
+  const int error = errno;
+  close(fd);
+  if (!ok) errno = error;
+  return ok;
+#else
   DIR* dir = opendir(path.c_str());
   if (!dir) return false;
   while (dirent* entry = readdir(dir)) {
@@ -177,21 +241,34 @@ bool ListEntries(const std::string& path, std::vector<std::string>& names) {
   }
   closedir(dir);
   return true;
+#endif
 }
 
-bool RemoveTree(const std::string& path, int* error = nullptr) {
-  const auto failed = [error] {
+// Use remove() for directories too. The PS4 Orbis compatibility layer interposes remove() and
+// routes directory removal through sceKernelRmdir; libc's standalone rmdir() path is not
+// interposed and can return EPERM even for empty directories under /data. See
+// deps/orbis-sdk-v1/orbis-compat/src/orbis_paths.cpp.
+bool RemoveDirectory(const std::string& path) {
+  return std::remove(path.c_str()) == 0;
+}
+
+bool RemoveTree(const std::string& path, int* error = nullptr, std::string* failed_path = nullptr,
+                std::string* failed_operation = nullptr) {
+  const auto failed = [error, failed_path, failed_operation, &path](const char* operation) {
     if (error && *error == 0) *error = errno;
+    if (failed_path && failed_path->empty()) *failed_path = path;
+    if (failed_operation && failed_operation->empty()) *failed_operation = operation;
     return false;
   };
   struct stat info {};
-  if (lstat(path.c_str(), &info) != 0) return errno == ENOENT || failed();
-  if (!S_ISDIR(info.st_mode)) return unlink(path.c_str()) == 0 || failed();
+  if (lstat(path.c_str(), &info) != 0) return errno == ENOENT || failed("lstat");
+  if (!S_ISDIR(info.st_mode)) return unlink(path.c_str()) == 0 || failed("unlink");
   std::vector<std::string> names;
-  if (!ListEntries(path, names)) return failed();
+  if (!ListEntries(path, names)) return failed("opendir");
   bool ok = true;
-  for (const auto& name : names) ok = RemoveTree(path + "/" + name, error) && ok;
-  return (rmdir(path.c_str()) == 0 || failed()) && ok;
+  for (const auto& name : names)
+    ok = RemoveTree(path + "/" + name, error, failed_path, failed_operation) && ok;
+  return (RemoveDirectory(path) || failed("rmdir")) && ok;
 }
 
 // Bytes the filesystem has allocated to a file, at most its size; 0 when absent.
@@ -364,7 +441,11 @@ bool SameContent(const std::string& path, std::uint64_t size, const std::array<s
   if (size == 0) return true;
   FILE* file = std::fopen(path.c_str(), "rb");
   if (!file) return false;
-  std::vector<std::uint8_t> buffer(1024 * 1024);
+  // Keep verification allocations small enough for the PS4 title's contiguous
+  // heap. A 1 MiB request can fail there even while the console reports ample
+  // total flexible memory, terminating the installer instead of returning an
+  // ordinary verification error.
+  std::vector<std::uint8_t> buffer(64 * 1024);
   mbedtls_sha1_context context;
   mbedtls_sha1_init(&context);
   bool ok = mbedtls_sha1_starts(&context) == 0;
@@ -476,8 +557,8 @@ bool ClearFolderForFile(const std::string& root, const std::string& path, const 
   std::sort(folders.begin(), folders.end(),
             [](const std::string& left, const std::string& right) { return left.size() > right.size(); });
   for (const auto& folder : folders)
-    if (RealParents(root, folder)) rmdir((root + "/" + folder).c_str());
-  return rmdir((root + "/" + path).c_str()) == 0;
+    if (RealParents(root, folder)) RemoveDirectory(root + "/" + folder);
+  return RemoveDirectory(root + "/" + path);
 }
 
 }  // namespace
@@ -633,8 +714,10 @@ DepotInstaller::DepotInstaller(CmClient& cm, CdnClient& cdn) {
     return InstallError::kNone;
   };
   const auto ca_bundle = cdn.ca_bundle();
-  hooks_.make_fetcher = [ca_bundle] {
-    auto client = std::make_shared<CdnClient>(ca_bundle);
+  hooks_.make_fetcher = [this, ca_bundle] {
+    auto client = std::make_shared<CdnClient>(ca_bundle, [this](const std::string& line) {
+      if (hooks_.trace_detail) hooks_.trace_detail("cdn", line);
+    });
     InstallerHooks::ChunkFetcher fetcher;
     fetcher.fetch = [client](const ContentServer& server, std::uint32_t depot, const std::string& sha,
                               std::size_t cap, const std::atomic<bool>& cancel, std::vector<std::uint8_t>* out) {
@@ -793,9 +876,9 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
     hooks_.stats(phase, stats);
   };
   ScopeExit end_stats{[&] { emit("end"); emit("servers"); }};
-  auto fail = [&outcome](InstallError error, const char* detail) {
+  auto fail = [&outcome](InstallError error, std::string detail) {
     outcome.error = error;
-    outcome.detail = detail;
+    outcome.detail = std::move(detail);
     return outcome;
   };
   if (target.app_id == 0 || target.install_root.empty() || target.install_root[0] != '/' ||
@@ -917,6 +1000,11 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
   };
   auto merged = MergeDepotManifests(manifests, log_merge);
   if (!merged.conflict.empty()) return fail(InstallError::kCorrupt, ("conflicting depots " + merged.conflict).c_str());
+  // A fresh install writes into the game directory in place. If an older install record
+  // survives there, a crash halfway through this run must not make the partial files look
+  // launchable. The record is written again only after every file has been downloaded.
+  if (!target.update && std::remove((target.install_root + "/" + kInstallRecord).c_str()) != 0 && errno != ENOENT)
+    return fail(InstallError::kStorage, "cannot invalidate previous install record");
   const auto& placements = merged.placements;
   for (const auto& [key, folder] : merged.files_over_folders) {
     const auto& winner = placements.at(key);
@@ -927,7 +1015,7 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
       const std::string full = target.install_root + "/" + path;
       struct stat info{};
       if (lstat(full.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) continue;
-      if (rmdir(full.c_str()) != 0) {
+      if (!RemoveDirectory(full)) {
         log_merge("disk-folder-kept", "path=" + path + " errno=" + std::to_string(errno));
         return fail(InstallError::kStorage, ("cannot replace folder " + path).c_str());
       }
@@ -966,7 +1054,7 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
         }
         std::sort(folders.begin(), folders.end(),
                   [](const std::string& left, const std::string& right) { return left.size() > right.size(); });
-        for (const auto& folder : folders) rmdir((staging + "/" + folder).c_str());
+        for (const auto& folder : folders) RemoveDirectory(staging + "/" + folder);
       }
       int error = 0;
       if (!RemoveTree(staging, &error)) return fail(InstallError::kStorage, "cannot clear update staging");
@@ -1195,7 +1283,10 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
   trace("space");
   const auto available_bytes = hooks_.free_bytes(target.install_root);
   if (available_bytes < kInstallSpaceMargin || remaining_bytes > available_bytes - kInstallSpaceMargin)
-    return fail(InstallError::kNoSpace, "not enough free space");
+    return fail(InstallError::kNoSpace,
+                "not enough free space available=" + std::to_string(available_bytes) +
+                    " required=" + std::to_string(remaining_bytes) +
+                    " margin=" + std::to_string(kInstallSpaceMargin));
   if (on_progress) on_progress(progress);
 
   stats.prepare_ms = Milliseconds(Clock::now() - phase_start);
@@ -1468,10 +1559,17 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
   workers_running = true;
   if (!chunks.empty()) trace("first-chunk");
   pthread_attr_t attr;
+  if (!chunks.empty()) trace("worker-attr-init");
   const bool attr_ready = pthread_attr_init(&attr) == 0;
+  if (!chunks.empty()) trace(attr_ready ? "worker-attr-ready" : "worker-attr-failed");
+  // Keep the worker stack at the previously working size. The 2 MiB increase consumed a large
+  // contiguous allocation before each install worker started and the console later failed to
+  // allocate its ~1 MiB CDN response buffer.
   const bool stack_ready = attr_ready && pthread_attr_setstacksize(&attr, 256 * 1024) == 0;
+  if (!chunks.empty()) trace(stack_ready ? "worker-stack-ready" : "worker-stack-failed");
   if (!stack_ready && !chunks.empty()) publish_failure(InstallError::kNetwork, "cannot start workers");
   for (int index = 0; stack_ready && index < slots && !chunks.empty() && !stop.load(); ++index) {
+    if (index == 0) trace("worker-create-start");
     auto worker = std::make_unique<Worker>();
 #if defined(__cpp_exceptions)
     try {
@@ -1484,6 +1582,7 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
     if (!worker->fetcher.fetch) { publish_failure(InstallError::kNetwork, "cannot create fetcher"); break; }
     auto* self = worker.get();
     self->run = [&, self, slot = static_cast<std::size_t>(index)] {
+      if (slot == 0) trace("worker-enter");
       // Destroy the HTTP client on the same thread that used it, after publishing its counters.
       ScopeExit release_fetcher{[self] { self->fetcher = {}; }};
       std::size_t server_cursor = 0, last_base = 0;
@@ -1549,9 +1648,15 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
             if (!probe_chunk) chunks_since_failover = 0;
           };
           const auto& work = chunks[self->work];
+          if (slot == 0 && self->work == 0) trace("worker-first-work");
           const auto& placement = files[work.file].placement;
           const auto& grant = access.grants[placement.depot];
           const auto& chunk = *work.chunk;
+          const auto chunk_detail = "work=" + std::to_string(self->work) +
+                                    " compressed=" + std::to_string(chunk.compressed_size) +
+                                    " original=" + std::to_string(chunk.original_size) +
+                                    " cap=" + std::to_string(chunk.compressed_size + 4096);
+          if (hooks_.trace_detail) hooks_.trace_detail("chunk-fetch-start", chunk_detail);
           InstallError result = InstallError::kNetwork;
           std::string detail;
           std::vector<std::uint8_t> plain;
@@ -1570,6 +1675,10 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
                                            static_cast<std::size_t>(chunk.compressed_size) + 4096, stop, &encrypted);
               });
             });
+            if (hooks_.trace_detail)
+              hooks_.trace_detail(fetched == CdnError::kNone ? "chunk-fetch-done" : "chunk-fetch-failed",
+                                  chunk_detail + " attempt=" + std::to_string(attempt));
+            if (slot == 0 && self->work == 0 && attempt == 0) trace(fetched == CdnError::kNone ? "worker-first-fetch-ok" : "worker-first-fetch-failed");
             const auto after = self->fetcher.stats ? self->fetcher.stats() : CdnStats{};
             auto& server = server_stats[bucket];
             ++server.requests;
@@ -1595,8 +1704,9 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
               continue;
             }
             const auto processed = Timed(process_time, [&] {
-              return ProcessDepotChunk(encrypted, grant.key, chunk.original_size, chunk.crc, chunk.sha, &plain);
+              return ProcessDepotChunkInPlace(&encrypted, grant.key, chunk.original_size, chunk.crc, chunk.sha, &plain);
             });
+            if (slot == 0 && self->work == 0 && attempt == 0) trace(processed == ChunkError::kNone ? "worker-first-process-ok" : "worker-first-process-failed");
             if (processed == ChunkError::kNone) {
               if (!probe_chunk && server_cursor % server_count == 0) {
                 returning = false;
@@ -1634,6 +1744,7 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
             self->plain = std::move(plain); self->compressed_bytes = compressed_bytes;
             self->served = attempts.empty() ? base : attempts.back().server;
             self->ready = true;
+            if (slot == 0 && self->work == 0) trace("worker-first-ready");
             ++waiting;
             peak_waiting = std::max(peak_waiting, static_cast<std::uint32_t>(waiting));
             changed.notify_all();
@@ -1650,25 +1761,46 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
       publish_failure(InstallError::kNetwork, "cannot start workers"); break;
     }
     self->started = true;
+    if (index == 0) trace("worker-create-done");
   }
   if (attr_ready) pthread_attr_destroy(&attr);
+  int prepare_errno = 0;
   const auto prepare_file = [&](std::size_t index) {
+    prepare_errno = 0;
     auto& work = files[index];
     if (work.prepared) return true;
     const auto& file = *work.placement.file;
     const auto path = write_root + "/" + file.path;
+    if (stats.chunks_done == 0) trace("first-prepare-start");
     if (file.is_directory()) {
-      if (!Timed(create, [&] { return MakeDirs(path, &stats.folders_created); })) return false;
+      if (stats.chunks_done == 0) trace("first-prepare-dir");
+      if (!Timed(create, [&] {
+            const bool okay = MakeDirs(path, &stats.folders_created);
+            if (!okay) prepare_errno = errno;
+            return okay;
+          })) return false;
     } else {
-      if (!Timed(create, [&] { return MakeDirs(Parent(path), &stats.folders_created); })) return false;
+      if (stats.chunks_done == 0) trace("first-prepare-parent");
+      if (!Timed(create, [&] {
+            const bool okay = MakeDirs(Parent(path), &stats.folders_created);
+            if (!okay) prepare_errno = errno;
+            return okay;
+          })) return false;
+      if (stats.chunks_done == 0) trace("first-prepare-exists");
       const bool existed = Exists(path);
+      if (stats.chunks_done == 0) trace("first-prepare-ensure");
       if (file.chunks.empty() || !existed) {
-        if (!Timed(create, [&] { return EnsureFileSize(path, file.size); })) return false;
+        if (!Timed(create, [&] {
+              const bool okay = EnsureFileSize(path, file.size);
+              if (!okay) prepare_errno = errno;
+              return okay;
+            })) return false;
         if (!existed) ++stats.files_created;
         const auto now_held = AllocatedBytes(path, file.size);
         if (now_held > work.allocated) { progress.held_bytes += now_held - work.allocated; work.allocated = now_held; }
       }
     }
+    if (stats.chunks_done == 0) trace("first-prepare-done");
     work.prepared = true;
     return true;
   };
@@ -1722,15 +1854,29 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
       const auto& file = *files[work.file].placement.file;
       last_served = ready->served;
       if (!racing) show(last_served);
-      if (!prepare_file(work.file)) { publish_failure(InstallError::kStorage, "cannot create file"); break; }
+      if (!prepare_file(work.file)) {
+        publish_failure(prepare_errno == ENOSPC ? InstallError::kNoSpace : InstallError::kStorage,
+                        prepare_errno == ENOSPC ? "not enough free space" : "cannot create file");
+        break;
+      }
       if (stats.chunks_done == 0) trace("first-write");
       const auto path = write_root + "/" + file.path;
-      if (!Timed(write, [&] { return WriteAt(path, file.size, work.chunk->offset, ready->plain); })) {
-        publish_failure(InstallError::kStorage, "cannot write file"); break;
+      const auto write_trace = stats.chunks_done == 0 ? hooks_.trace : std::function<void(const char*)>{};
+      int write_errno = 0;
+      if (!Timed(write, [&] {
+            const bool okay = WriteAt(path, file.size, work.chunk->offset, ready->plain, write_trace);
+            if (!okay) write_errno = errno;
+            return okay;
+          })) {
+        publish_failure(write_errno == ENOSPC ? InstallError::kNoSpace : InstallError::kStorage,
+                        write_errno == ENOSPC ? "not enough free space" : "cannot write file");
+        break;
       }
+      if (stats.chunks_done == 0) trace("first-write-returned");
       const bool recorded = Timed(journal_time, [&] {
         return std::fprintf(journal, "%s\n", work.journal_key.c_str()) >= 0 && std::fflush(journal) == 0;
       });
+      if (stats.chunks_done == 0) trace(recorded ? "first-journal-done" : "first-journal-failed");
       if (!recorded) { publish_failure(InstallError::kStorage, "cannot write journal"); break; }
       ++stats.chunks_done; ++written_chunks; --files[work.file].pending;
       stats.compressed_bytes += ready->compressed_bytes;
@@ -1741,24 +1887,34 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
       const auto grow = std::min<std::uint64_t>(work.chunk->original_size, file.size - written.allocated);
       written.allocated += grow;
       progress.held_bytes += grow;
+      if (stats.chunks_done == 1) trace("first-progress-start");
       if (on_progress) on_progress(progress);
+      if (stats.chunks_done == 1) trace("first-progress-done");
       // Release the occupied slot only after its output has been written and freed.
       std::vector<std::uint8_t>().swap(ready->plain);
       {
         std::lock_guard<std::mutex> lock(mutex);
         ready->busy = false; --occupied; changed.notify_all();
       }
+      if (stats.chunks_done == 1) trace("first-slot-released");
       continue;
     }
     while (front_file < files.size() && files[front_file].prepared && files[front_file].pending == 0) ++front_file;
     while (prepare_next < files.size() && files[prepare_next].prepared) ++prepare_next;
     if (prepare_next < files.size() && prepare_next - std::min(prepare_next, front_file) < static_cast<std::size_t>(ahead_files)) {
-      if (!prepare_file(prepare_next++)) { publish_failure(InstallError::kStorage, "cannot create file"); break; }
+      if (!prepare_file(prepare_next++)) {
+        publish_failure(prepare_errno == ENOSPC ? InstallError::kNoSpace : InstallError::kStorage,
+                        prepare_errno == ENOSPC ? "not enough free space" : "cannot create file");
+        break;
+      }
       continue;
     }
     if (written_chunks == chunks.size() && prepare_next == files.size()) break;
     std::unique_lock<std::mutex> lock(mutex);
-    changed.wait_for(lock, std::chrono::milliseconds(50), [&] { return stop.load() || waiting != 0; });
+    // Workers notify when a chunk is ready and when the install stops. Avoid
+    // libc++'s timed wait here: OpenOrbis ships an out-of-line system-clock
+    // implementation that treats the PS4 timeout errno as an exception.
+    changed.wait(lock, [&] { return stop.load() || waiting != 0; });
   }
   join_workers();
   tick();  // a race that ended with the last chunk
@@ -1807,10 +1963,12 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
   if (target.before_apply && !target.before_apply(target.install_root, outcome.skipped_depots))
     return fail(InstallError::kStorage, "cannot finish install");
   if (!WriteText(target.install_root + "/" + kFileTree, tree_text())) return fail(InstallError::kStorage, "cannot write file tree");
+  if (std::remove(journal_path.c_str()) != 0 && errno != ENOENT)
+    return fail(InstallError::kStorage, "cannot remove download journal");
+  if (!RemoveDirectory(journal_dir) && errno != ENOENT)
+    return fail(InstallError::kStorage, "cannot finish download journal cleanup");
   if (!WriteText(target.install_root + "/" + kInstallRecord, record_text()))
     return fail(InstallError::kStorage, "cannot write install record");
-  std::remove(journal_path.c_str());
-  rmdir(journal_dir.c_str());
   outcome.error = InstallError::kNone;
   outcome.progress = progress;
   return outcome;
@@ -1903,7 +2061,7 @@ InstallOutcome DepotInstaller::FinishUpdate(const std::string& install_root, con
             [](const std::string& left, const std::string& right) { return left.size() > right.size(); });
   for (const auto& folder : folders)
     if (!plan.new_dirs.count(Lower(folder)) && GamePath(folder) && RealParents(install_root, folder))
-      rmdir((install_root + "/" + folder).c_str());
+      RemoveDirectory(install_root + "/" + folder);
   if (std::remove((work + "/" + kUpdateOld).c_str()) != 0 && errno != ENOENT)
     return fail(InstallError::kStorage, "cannot finish deleting");
   step("update-record");
@@ -1959,7 +2117,7 @@ bool DiscardManagedUpdate(const std::string& install_root, std::string* failure)
     }
     std::sort(folders.begin(), folders.end(),
               [](const std::string& left, const std::string& right) { return left.size() > right.size(); });
-    for (const auto& folder : folders) rmdir((work + "/" + kUpdateStaging + "/" + folder).c_str());
+    for (const auto& folder : folders) RemoveDirectory(work + "/" + kUpdateStaging + "/" + folder);
   }
   int error = 0;
   if (!RemoveTree(work, &error)) return fail("Some of the update's files could not be deleted (" + std::string(std::strerror(error)) + ").");
@@ -2004,38 +2162,49 @@ bool RemoveManagedInstall(const std::string& install_root, std::string* failure)
   for (const char* name : {DepotInstaller::kFileTree, ".playden-tree.tmp"}) std::remove((install_root + "/" + name).c_str());
   std::sort(directories.begin(), directories.end(),
             [](const std::string& left, const std::string& right) { return left.size() > right.size(); });
-  for (const auto& directory : directories) rmdir(directory.c_str());
+  for (const auto& directory : directories) RemoveDirectory(directory);
   // Parent folders of recorded files that the manifest did not list explicitly.
   std::vector<std::string> parents;
   for (const auto& file : files)
     for (auto parent = Parent(file); parent.size() > install_root.size(); parent = Parent(parent)) parents.push_back(parent);
   std::sort(parents.begin(), parents.end(),
             [](const std::string& left, const std::string& right) { return left.size() > right.size(); });
-  for (const auto& parent : parents) rmdir(parent.c_str());
+  for (const auto& parent : parents) RemoveDirectory(parent);
   // Files the list did not cover (Playden's journals, files the game or other tools wrote) go in a walk.
   // The install record goes last: a folder that could not be emptied stays Playden's, so
   // uninstalling it again tries again.
   int error = 0;
   bool emptied = true;
+  std::string failed_path;
+  std::string failed_operation;
   std::vector<std::string> names;
   if (ListEntries(install_root, names)) {
     for (const auto& name : names)
-      if (name != DepotInstaller::kInstallRecord) emptied = RemoveTree(install_root + "/" + name, &error) && emptied;
+      if (name != DepotInstaller::kInstallRecord)
+        emptied = RemoveTree(install_root + "/" + name, &error, &failed_path, &failed_operation) && emptied;
   } else {
     emptied = false;
     error = errno;
+    failed_path = install_root;
+    failed_operation = "opendir";
   }
   if (emptied) {
     if (std::remove((install_root + "/" + DepotInstaller::kInstallRecord).c_str()) != 0 && errno != ENOENT) {
       emptied = false;
       error = errno;
-    } else if (rmdir(install_root.c_str()) != 0) {
+      failed_path = install_root + "/" + DepotInstaller::kInstallRecord;
+      failed_operation = "unlink";
+    } else if (!RemoveDirectory(install_root)) {
       emptied = false;
       error = errno;
+      failed_path = install_root;
+      failed_operation = "rmdir";
     }
   }
   if (emptied) return true;
-  return fail("Some of the game's files could not be deleted (" + std::string(std::strerror(error)) + ").");
+  return fail("Could not " + (failed_operation.empty() ? std::string("delete") : failed_operation) +
+              " '" + (failed_path.empty() ? install_root : failed_path) +
+              "' (" + std::string(std::strerror(error)) + ").");
 }
 
 }  // namespace playden::steam

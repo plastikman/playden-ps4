@@ -62,8 +62,13 @@ Storage::Storage(std::string root) : root_(std::move(root)) {
 Result<void> Storage::EnsureRootDirectory() const {
   if(root_.empty() || root_.find('\0')!=std::string::npos)
     return Result<void>::Failure(StorageError::kInvalidPath,"Storage root is invalid.");
-  if(mkdir(root_.c_str(),0700)!=0 && errno!=EEXIST)
+  const mode_t root_mode = traversable_root_ ? 0711 : 0700;
+  if(mkdir(root_.c_str(),root_mode)!=0 && errno!=EEXIST)
     return Result<void>::Failure(StorageError::kOpenFailed,"Storage root could not be created.");
+  // A collaborating title can traverse to known public children (such as the game library),
+  // but cannot list this directory. Private session files retain their own 0600 modes.
+  if (traversable_root_ && chmod(root_.c_str(), root_mode) != 0)
+    return Result<void>::Failure(StorageError::kPermissionFailed,"Storage root could not be made traversable.");
   struct stat info{};
   if(stat(root_.c_str(),&info)!=0 || !S_ISDIR(info.st_mode))
     return Result<void>::Failure(StorageError::kOpenFailed,"Storage root is unavailable.");

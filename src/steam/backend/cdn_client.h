@@ -38,7 +38,8 @@ enum class CdnError { kNone, kCanceled, kNetwork, kNotFound, kProtocol };
 class CdnClient {
  public:
   using Perform = std::function<HttpResponse(const HttpRequest&, const std::atomic<bool>&)>;
-  explicit CdnClient(std::string ca_bundle);
+  explicit CdnClient(std::string ca_bundle,
+                     std::function<void(const std::string&)> trace = {});
   explicit CdnClient(Perform perform);  // tests
   ~CdnClient();
 
@@ -63,8 +64,9 @@ class CdnClient {
  private:
   CdnError Get(const std::string& url, std::size_t max_bytes, std::uint32_t timeout_ms,
                const std::atomic<bool>& cancel, std::vector<std::uint8_t>* out, bool plain_http = false,
-               bool depot_manifest = false);
+               bool depot_manifest = false, bool preallocate_response = false);
   std::string ca_bundle_;
+  std::function<void(const std::string&)> trace_;
   Perform perform_;
   std::unique_ptr<HttpClient> http_;
   std::string last_failure_;

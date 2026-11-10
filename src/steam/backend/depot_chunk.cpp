@@ -225,4 +225,39 @@ ChunkError ProcessDepotChunk(const std::vector<std::uint8_t>& encrypted, const s
   return ChunkError::kNone;
 }
 
+ChunkError ProcessDepotChunkInPlace(std::vector<std::uint8_t>* encrypted,
+                                   const std::array<std::uint8_t, 32>& key,
+                                   std::size_t expected_size, std::uint32_t expected_checksum,
+                                   const std::array<std::uint8_t, 20>& chunk_sha,
+                                   std::vector<std::uint8_t>* out) {
+  if (!encrypted || !out || encrypted->size() <= kAesBlock || encrypted->size() % kAesBlock != 0)
+    return ChunkError::kDecrypt;
+  out->clear();
+  mbedtls_aes_context ctx;
+  mbedtls_aes_init(&ctx);
+  std::uint8_t iv[kAesBlock];
+  auto* payload = encrypted->data() + kAesBlock;
+  const std::size_t payload_size = encrypted->size() - kAesBlock;
+  const bool decrypted = mbedtls_aes_setkey_dec(&ctx, key.data(), 256) == 0 &&
+      mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_DECRYPT, encrypted->data(), iv) == 0 &&
+      mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_DECRYPT, payload_size, iv, payload, payload) == 0;
+  mbedtls_aes_free(&ctx);
+  if (!decrypted) return ChunkError::kDecrypt;
+  const std::uint8_t pad = payload[payload_size - 1];
+  if (pad == 0 || pad > kAesBlock || pad > payload_size) return ChunkError::kDecrypt;
+  for (std::size_t i = payload_size - pad; i < payload_size; ++i)
+    if (payload[i] != pad) return ChunkError::kDecrypt;
+  const auto decoded = DecodeDepotChunk(payload, payload_size - pad, out);
+  if (decoded != ChunkError::kNone) return decoded;
+  if (out->size() != expected_size) return ChunkError::kSize;
+  if (expected_checksum != 0) {
+    if (DepotChunkAdler32(out->data(), out->size()) != expected_checksum) return ChunkError::kChecksum;
+  } else {
+    std::array<std::uint8_t, 20> digest{};
+    if (mbedtls_sha1(out->data(), out->size(), digest.data()) != 0 || digest != chunk_sha)
+      return ChunkError::kChecksum;
+  }
+  return ChunkError::kNone;
+}
+
 }  // namespace playden::steam

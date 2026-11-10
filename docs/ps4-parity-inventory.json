@@ -1,0 +1,331 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-11-09",
+  "hardware_build": "01.83 (library loads; Mafia manifest allocation fails before download)",
+  "areas": [
+    {
+      "id": "navigation_and_ui_state",
+      "area": "Navigation and UI state",
+      "status": "partial",
+      "reference": "Shared Home, Library, Downloads, Saves, Settings, Details, Session, Save details, and Manage games routes",
+      "target": "Drive all routes and focus/modal state from the shared model; render the same actions and messages",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "home",
+      "area": "Home",
+      "status": "partial",
+      "reference": "Continue playing, recent/installed shelves, active work, notices",
+      "target": "Project the shared Home shelves, status badges, notices, and details navigation",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "steam_sign_in",
+      "area": "Steam sign-in",
+      "status": "partial",
+      "reference": "QR and password, Steam Guard approval/codes, restore, stay signed in, switch account, sign out, offline/error recovery",
+      "target": "Wire the shared account service and complete every sign-in/account action",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "library_cache",
+      "area": "Library cache",
+      "status": "partial",
+      "reference": "Cached/offline library, refresh, license-change refresh",
+      "target": "Use `LibraryService` and `LibraryController`, including stale/offline state and refresh",
+      "host_evidence": [
+        "PS4 links LibraryService, but 01.82 aborted in LibraryCache::Save; 01.83 temporarily passes no cache to the service"
+      ],
+      "ps4_hardware_evidence": ["01.82 reached cache-write-start and then SIGABRT; cache path is disabled in 01.83 pending console test"],
+      "host_tests": []
+    },
+    {
+      "id": "library_organization",
+      "area": "Library organization",
+      "status": "partial",
+      "reference": "Favorites, Hidden, collections, pinned collections, compatibility rating, notes, search, sort, filters, durable selection",
+      "target": "Use `OrganizationSnapshot` and its persistence controller without a PS4-only format",
+      "host_evidence": [
+        "PS4 loads and saves shared organization.v2; legacy favorites/hidden migrate; PS4 target compiled"
+      ],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "library_sources",
+      "area": "Library sources",
+      "status": "missing",
+      "reference": "Steam plus imported/local games",
+      "target": "Use the store registry; add Local only when PS4 storage access is ready",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": [],
+      "status_detail": "missing local source"
+    },
+    {
+      "id": "artwork",
+      "area": "Artwork",
+      "status": "partial",
+      "reference": "Cached covers, hero/logo/program/title art, fallbacks, failure state",
+      "target": "Adopt shared artwork state and cache policy; render the same fallbacks and pending/error states",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "game_details",
+      "area": "Game details",
+      "status": "partial",
+      "reference": "Store metadata, install/update/play, game settings, maintenance, notes, compatibility, collections, run-once tools",
+      "target": "Project the shared details actions and runtime/update state; remove record-exists shortcuts",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "install_choices",
+      "area": "Install choices",
+      "status": "partial",
+      "reference": "Storage, branch/version, content language, DLC, measured size, reservation/no-space behavior",
+      "target": "Use the shared install sheet and size checks; keep PS4 volume reporting capability-aware",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "downloads",
+      "area": "Downloads",
+      "status": "partial",
+      "reference": "Multiple jobs, pause/resume, cancel, reorder/download-now, verify/apply states, rates/ETA, completed history",
+      "target": "Use `InstallService` and the shared Downloads model",
+      "host_evidence": [
+        "PS4 uses one supported connection; parallel selector removed; depot write/create failures preserve errno for no-space reporting; PS4 target compiled"
+      ],
+      "ps4_hardware_evidence": [],
+      "host_tests": [
+        "steam_depot_chunk"
+      ]
+    },
+    {
+      "id": "interrupted_installs",
+      "area": "Interrupted installs",
+      "status": "partial",
+      "reference": "Resume journal, truthful incomplete state, repair/update of stale records",
+      "target": "Validate selected depots against the record; never show Play for incomplete content",
+      "host_evidence": [
+        "PS4 details compare selected base depot IDs with the record and check the launch executable; PS4 target compiled"
+      ],
+      "ps4_hardware_evidence": [],
+      "host_tests": [
+        "steam_app_info (depot selection fixtures)"
+      ]
+    },
+    {
+      "id": "game_updates",
+      "area": "Game updates",
+      "status": "missing",
+      "reference": "Installed-game check, changed-file sizing, DLC changes, per-game and batch updates",
+      "target": "Wire `AppDetailsService`, update-check persistence, details update, and Manage games > Updates",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "runtime_preparation",
+      "area": "Runtime preparation",
+      "status": "partial",
+      "reference": "Readiness, queue, repair, recreate, settings publication, runtime update, progress and refusal reasons",
+      "target": "Add a PS4 runtime-host implementation behind a shared interface and project the same lifecycle",
+      "host_evidence": [
+        "New generic games prepare private prefix steam-<app_id> after install; existing steam-generic profiles retained for data safety; PS4 target compiled"
+      ],
+      "ps4_hardware_evidence": [],
+      "host_tests": [],
+      "status_detail": "partial and ps4-specific"
+    },
+    {
+      "id": "launch_session",
+      "area": "Launch/session",
+      "status": "partial",
+      "reference": "Preflight, Cloud-before-play, preparation, launch state, failure evidence, return and post-play work",
+      "target": "Preserve PS4 same-title launch while exposing the shared Play/Session state machine",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "steamworks_support",
+      "area": "Steamworks support",
+      "status": "partial",
+      "reference": "Prepared globally as part of game setup",
+      "target": "Make it shared setup behavior for every applicable game; no app-specific branch",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "per_game_settings",
+      "area": "Per-game settings",
+      "status": "partial",
+      "reference": "Presets, executable/launch choice, graphics, architecture, overrides, input, writable folders, reset/export",
+      "target": "Use the shared recipes/settings contract with PS4-supported capabilities",
+      "host_evidence": [
+        "Generated profiles use an installed PE header or Steam osarch for architecture; pe_architecture test passed; new generic installs get a private prefix; PS4 target compiled"
+      ],
+      "ps4_hardware_evidence": [],
+      "host_tests": [
+        "pe_architecture"
+      ]
+    },
+    {
+      "id": "maintenance",
+      "area": "Maintenance",
+      "status": "missing",
+      "reference": "Apply settings, verify/repair, clear shader cache, back up saves, recreate bottle, update runtime kit",
+      "target": "Implement PS4 equivalents and gate only genuinely unsupported actions",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "steam_cloud",
+      "area": "Steam Cloud",
+      "status": "partial",
+      "reference": "Quick check, Sync all, per-game details, conflicts, use-local/use-Cloud, automatic pre/post-play sync, leftover data",
+      "target": "Use `CloudService` and shared controller lifecycle with generic prefix/save locations",
+      "host_evidence": [
+        "PS4 Cloud uses the game profile prefix when available; PS4 target compiled"
+      ],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "uninstall",
+      "area": "Uninstall",
+      "status": "partial",
+      "reference": "Cloud gate, runtime removal, files, keep/delete saves, queued/batch flow, truthful stopped states",
+      "target": "Use the shared uninstall flow adapted to the single PS4 title",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "manage_installed_games",
+      "area": "Manage installed games",
+      "status": "missing",
+      "reference": "Updates, runtime-kit migrations, move, batch uninstall",
+      "target": "Add shared route; mark Move unavailable until multiple writable volumes exist",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "internal_storage",
+      "area": "Internal storage",
+      "status": "present",
+      "reference": "Managed install root and install records",
+      "target": "Keep transactional ownership, record, and resume rules",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": [],
+      "status_detail": "present for current flow"
+    },
+    {
+      "id": "external_storage",
+      "area": "External storage",
+      "status": "deferred",
+      "reference": "Discover, select default, install/move, disconnect/reconnect",
+      "target": "Keep in the model as unavailable with a reason; implement after a reviewed PS4 access mechanism exists",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "local_import",
+      "area": "Local import",
+      "status": "deferred",
+      "reference": "Scan drop folders, add/play in place, copy/move into Playden, remove from library",
+      "target": "Port the shared Local store once its PS4 directory policy and mounts are defined",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": [],
+      "status_detail": "missing and deferred with storage access"
+    },
+    {
+      "id": "settings",
+      "area": "Settings",
+      "status": "partial",
+      "reference": "Downloads, updates, account, storage, web access, runtime kit/about, accessibility plus game settings",
+      "target": "Render shared settings, with PS4 diagnostics in an Advanced/Diagnostics section",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "self_update",
+      "area": "Self-update",
+      "status": "missing",
+      "reference": "Check/download/stage/relaunch/rollback and release notes",
+      "target": "Point to `plastikman/playden-ps4`, use PS4 package install/relaunch mechanics, and preserve the shared state model",
+      "host_evidence": [
+        "Native PS4 HTTP rejects cleartext URLs unless explicitly allowed; GitHub response-header and update workflow remain missing; PS4 target compiled"
+      ],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "runtime_kit_update",
+      "area": "Runtime-kit update",
+      "status": "missing",
+      "reference": "Install/admit version and update prepared games",
+      "target": "Define the PS4 runtime bundle contract, update it transactionally, then expose shared status/actions",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": [],
+      "status_detail": "missing shared workflow"
+    },
+    {
+      "id": "web_access_and_logs",
+      "area": "Web access and logs",
+      "status": "missing",
+      "reference": "Paired local web service, redacted logs/files, in-app log viewer",
+      "target": "Port service where PS4 networking permits; always retain an in-app redacted log path",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "download_server_selection",
+      "area": "Download-server selection",
+      "status": "missing",
+      "reference": "List/test/prefer Steam CDN server",
+      "target": "Wire `DownloadServerService`; do not expose raw concurrency as the normal player control",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    },
+    {
+      "id": "accessibility_and_polish",
+      "area": "Accessibility and polish",
+      "status": "partial",
+      "reference": "Shared HUI layout, button glyphs, focus behavior, motion preference, font fallbacks, keyboard",
+      "target": "Render from the shared view contract and implement required PS4 HUI/platform primitives",
+      "host_evidence": [],
+      "ps4_hardware_evidence": [],
+      "host_tests": []
+    }
+  ],
+  "local_package": {
+    "version": "01.84",
+    "sha256": "002a35cc4ff962da330f3db29cc3aba89a8fde4f160589aca84b43fb04399d2d",
+    "package_validation": "passed",
+    "uploaded": true,
+    "console_tested": false
+  }
+}
