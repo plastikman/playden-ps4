@@ -1,6 +1,7 @@
 #include "runtime/game_settings.h"
 #include "runtime/game_probe.h"
 #include "runtime/pe_architecture.h"
+#include "runtime/artifact_hash.h"
 
 #include "homebrew/json.hpp"
 #include "platform/managed_directory.h"
@@ -35,10 +36,6 @@ namespace json = homebrew::json;
 namespace storage_json = steam::json;
 using platform::DirectoryPolicy;
 using platform::ManagedDirectory;
-
-// Rows this build no longer has. Settings data written for an earlier build (presets, recipes) may still name them;
-// they are dropped where read, so the file still loads.
-bool RetiredSetting(std::string_view id) { return id == "opengl_thread"; }
 
 SettingDefinition Choice(std::string id, std::string label, std::string effect, std::string also_called,
                          SettingGroup group, std::vector<SettingChoice> choices, std::string playden_default,
@@ -270,6 +267,17 @@ std::vector<SettingDefinition> BuildCatalogue() {
                         {{"emulate", "Offline emulation", "Playden's Steam emulator answers the game."},
                          {"game", "Game's own files", "The game's Steam library, unchanged."}},
                         "game", 1, ApplyMode::kGameClosed));
+  // A game with a Steam Input map gets it from the emulator, as Steam would give it. Some of those games read the
+  // controller themselves too and stop once Steam Input reports one (Euro Truck Simulator 2), and the emulator can't
+  // drive a stick that moves the mouse in the map, so Automatic leaves out a map that would lose a stick or trigger.
+  list.push_back(Choice("steam_input", "Steam Input", "Whether the game gets its Steam Input controller layout.",
+                        "steam_settings/controller", G::kWindows,
+                        {{"auto", "Automatic",
+                          "The game's Steam Input layout, unless a stick or trigger in it can't work. Then the game "
+                          "reads the controller itself."},
+                         {"on", "Steam Input", "Always the game's Steam Input layout. Sticks that move the mouse in it don't work."},
+                         {"off", "Game's own", "No Steam Input: the game reads the controller itself, as an Xbox controller."}},
+                        "auto", 1, ApplyMode::kGameClosed));
   list.push_back(Choice("windows_version", "Windows version", "Which Windows the game is told it runs on.",
                         "winver · registry", G::kWindows,
                         {{"win10", "Windows 10", ""}, {"win81", "Windows 8.1", ""}, {"win7", "Windows 7", ""},
@@ -288,6 +296,26 @@ std::vector<SettingDefinition> BuildCatalogue() {
                         "WINE_CPU_TOPOLOGY", G::kWindows,
                         {{"kit", "Runtime default", ""}, {"4", "4 cores", "For games that fail with many cores."},
                          {"8", "8 cores", ""}},
+                        "kit", 3, ApplyMode::kGameClosed));
+  list.push_back(Choice("address_space", "Address space", "How much memory a 32-bit program can use.",
+                        "WINE_LARGE_ADDRESS_AWARE", G::kWindows,
+                        {{"kit", "Runtime default", "2 GB, unless the program asks for more."},
+                         {"4gb", "4 GB", "For 32-bit games that run out of memory."}},
+                        "kit", 3, ApplyMode::kGameClosed));
+  // A 32-bit program runs on the console's processor; the translator is slower but keeps FS on the thread's TEB when
+  // the program reloads it (Watcom's runtime does, and Fallout faulted at its start), so DefaultsFor picks it then.
+  list.push_back(Choice("cpu", "32-bit code", "How a 32-bit program's code runs.", "[runtime] cpu", G::kWindows,
+                        {{"native", "Native", "On the console's processor. Fastest."},
+                         {"translator", "Translator", "Translated as it runs. Slower; for programs that crash on Native."}},
+                        "native", 3, ApplyMode::kGameClosed));
+  // A 64-bit game hosts nsiproxy, so it can list the console's network adapters; Off is for a game that hangs there.
+  // A 32-bit game hosts none either way, so Off changes nothing for it; the row stays open because a game not prepared
+  // yet has no architecture to tell.
+  list.push_back(Choice("network_adapters", "Network adapters",
+                        "Whether a 64-bit game can list the console's network adapters.", "PW_NSIPROXY_DISABLE",
+                        G::kWindows,
+                        {{"kit", "Runtime default", "The game can list them."},
+                         {"off", "Off", "For 64-bit games that hang at start or lose the network with them listed."}},
                         "kit", 3, ApplyMode::kGameClosed));
   list.push_back(Choice("logging", "Logging", "How much detail goes into the game's log file.", "WINEDEBUG",
                         G::kWindows,
@@ -544,6 +572,10 @@ std::string Unavailable(const SettingDefinition& definition, const std::string& 
     // latency and VRAM, VSync off does not change the display's pacing.
     if (id == "vsync" && !kit.dxvk_present) return "The PS5 display always waits for the TV; VSync cannot be turned off yet.";
   }
+  if (id == "steam_input") {
+    const auto steam = values.find("steam_features");
+    if (steam == values.end() || steam->second.value != "emulate") return "Only with Offline emulation.";
+  }
   if ((id == "windows_version" || id == "text_scale") && !kit.registry)
     return "Needs a verified runtime kit with access to the game's bottle.";
   // A Zink kit's runtime (upstream prospero-win) reads MESA_, DXVK_, RADV_ and the like as [debug] env.
@@ -574,6 +606,23 @@ std::string Unavailable(const SettingDefinition& definition, const std::string& 
   if (id == "registry_dll_overrides") return "Needs a newer runtime kit that lets Playden write more registry values.";
   // Wine reads WINE_CPU_TOPOLOGY from the [environment] section; [debug] env does not take WINE_ names.
   if (id == "cpu_topology" && !kit.environment) return "Needs a newer runtime kit that reads [environment].";
+  if (id == "address_space") {
+    if (kit.large_address_aware_needs_update) return kAppliesAfterKitUpdate;
+    if (!kit.large_address_aware) return "Needs a newer runtime kit that gives 32-bit games 4 GB.";
+    if (const auto program = values.find("architecture"); program != values.end() && program->second.value == "pe64")
+      return "Only for 32-bit programs.";
+  }
+  if (id == "network_adapters") {
+    if (kit.nsiproxy_switch_needs_update) return kAppliesAfterKitUpdate;
+    if (!kit.nsiproxy_switch) return "Needs a newer runtime kit that can turn network adapters off.";
+  }
+  if (id == "cpu") {
+    if (const auto program = values.find("architecture"); program != values.end() && program->second.value == "pe64")
+      return "Only for 32-bit programs.";
+    // [runtime] is read by titles of a runtime kit with profile version 2.
+    if (kit.profile_version_2_needs_update) return kAppliesAfterKitUpdate;
+    if (!kit.profile_version_2) return "Needs a newer runtime kit.";
+  }
   if (id == "start_through_launcher" || id == "launcher_controller_preset") {
     if (kit.launcher_mode_needs_update) return kAppliesAfterKitUpdate;
     if (!kit.launcher_mode) return "Needs a runtime kit with launcher mode.";
@@ -679,6 +728,29 @@ bool IsUnlockKey(std::string_view key) {
   return definition != nullptr;
 }
 
+std::map<std::string, std::string> PresetSettingsFromGame(const GameRecipe& recipe, const EffectiveSettings& settings,
+                                                          PresetCapture capture) {
+  const bool community = capture == PresetCapture::kSave && IsCommunityRecipeId(recipe.id);
+  const auto controller = settings.values.find("controller_preset");
+  const auto& inputs = ControllerPresetInputs();
+  const auto own_inputs = controller != settings.values.end() && controller->second.source == ValueSource::kUser
+                              ? inputs.find(ChosenValue(controller->second)) : inputs.end();
+  std::map<std::string, std::string> kept;
+  for (const auto& [id, value] : settings.values) {
+    // A user-selected controller layout replaces lower-layer input rows with kPreset values.
+    // They must move with the layout on Update, or the old preset's explicit inputs win again.
+    const bool own_input = value.source == ValueSource::kPreset && own_inputs != inputs.end() && own_inputs->second.count(id);
+    const bool chosen = value.source == ValueSource::kUser ||
+                        own_input ||
+                        (capture == PresetCapture::kSave && value.source == ValueSource::kPreset) ||
+                        (community && value.source == ValueSource::kRecipe);
+    if (!chosen || value.locked || (!value.available && !value.waits_for_update)) continue;
+    const auto& wanted = ChosenValue(value);
+    if (ValidatePresetSetting(id, wanted, nullptr)) kept[id] = wanted;
+  }
+  return kept;
+}
+
 std::string SettingChoiceUnavailable(const EffectiveSettings& settings, std::string_view id, std::string_view value) {
   if (id == "controller") {
     if (value != "playstation" || settings.input_playstation || settings.input_playstation_needs_update) return {};
@@ -731,7 +803,8 @@ bool ValidateSettingValue(const GameRecipe& recipe, std::string_view id, std::st
     return fail("not one of the choices");
   }
   if (id == "extra_arguments" || id == "program_arguments" || id == "arguments") {
-    if (value.size() > kProsperoMaxArgumentBytes) return fail("too long");
+    // Up to what the newest titles take; BuildEffectiveSettings checks the game's own runtime kit.
+    if (value.size() > kProsperoMaxLongArgumentBytes) return fail("too long");
     // Required arguments may name where the Resolution size goes; nothing else uses braces.
     std::string rest(value);
     if (id == "arguments") ReplaceAll(&rest, "{resolution}", "");
@@ -797,9 +870,31 @@ std::vector<std::string> SplitDllOverrides(const std::string& list) {
   return entries;
 }
 
+bool UsesGeneratedLaunch(const GameRecipe& recipe) { return IsGeneratedRecipeId(recipe.id) || recipe.generated_launch; }
+
 bool IsGraphicsDllOverride(const GameRecipe& recipe, const std::string& entry) {
-  return IsGeneratedRecipeId(recipe.id) && entry == kDxvkOverrides;
+  return UsesGeneratedLaunch(recipe) && entry == kDxvkOverrides;
 }
+
+namespace {
+// Whether an Environment variables value (NAME=value entries separated by ';') sets the variable name: the name
+// before an entry's first '=', trimmed. A value that merely contains the name sets nothing.
+bool EnvironmentSetsName(std::string_view entries, std::string_view name) {
+  std::size_t start = 0;
+  while (start <= entries.size()) {
+    const auto end = std::min(entries.find(';', start), entries.size());
+    auto entry = entries.substr(start, end - start);
+    start = end + 1;
+    const auto equals = entry.find('=');
+    if (equals == std::string_view::npos) continue;
+    auto key = entry.substr(0, equals);
+    while (!key.empty() && key.front() == ' ') key.remove_prefix(1);
+    while (!key.empty() && key.back() == ' ') key.remove_suffix(1);
+    if (key == name) return true;
+  }
+  return false;
+}
+}  // namespace
 
 bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* preset,
                             const std::map<std::string, std::string>& overrides, const KitCapabilities& kit,
@@ -850,6 +945,7 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
   out.environment_as_debug_env = !kit.environment && kit.opengl_zink;
   out.debug_env_lines = kit.opengl_zink;
   out.profile_version = kit.profile_version_2 ? 2 : 1;
+  out.long_profile = kit.launch_arguments_4096;
   out.display_120hz = kit.display_120hz;
   out.display_120hz_needs_update = kit.display_120hz_needs_update;
   out.input_playstation = kit.input_playstation;
@@ -1017,7 +1113,7 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
     ReplaceAll(&required.value, "--rendering-driver opengl3", "--rendering-driver vulkan");
   // Generated recipes ask Unity and Unreal for Direct3D 11, which DXVK draws. With Direct3D 12 on vkd3d-proton they
   // ask for Direct3D 12 instead (CULTIC stays black on 11). Arguments the player typed are left as they are.
-  if (IsGeneratedRecipeId(recipe.id) && required.source != ValueSource::kUser &&
+  if (UsesGeneratedLaunch(recipe) && required.source != ValueSource::kUser &&
       out.values["d3d12"].value == "vkd3d-proton") {
     ReplaceAll(&required.value, "-force-d3d11", "-force-d3d12");
     ReplaceAll(&required.value, "-dx11", "-dx12");
@@ -1033,7 +1129,7 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
   // A generated recipe picks the graphics API in Required arguments; a Steam launch option that picks one too is
   // dropped from it, or the engine stops: Severed Steel's "-noraytracing -d3d12" next to "-dx11" ends in "-d3d12,
   // -d3d11, -vulkan, and -opengl are mutually exclusive". Required arguments stay the one place to change it.
-  if (IsGeneratedRecipeId(recipe.id) && !launch_arguments.empty()) {
+  if (UsesGeneratedLaunch(recipe) && !launch_arguments.empty()) {
     static const std::vector<std::vector<std::string>> api_words = {
         {"-d3d11", "-dx11", "-d3d12", "-dx12", "-d3d10", "-dx10", "-vulkan", "-opengl", "-opengl4"},
         {"-force-d3d9", "-force-d3d11", "-force-d3d12", "-force-vulkan", "-force-glcore", "-force-gles",
@@ -1075,8 +1171,28 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
   const auto& extra = out.values["extra_arguments"].value;
   if (!extra.empty()) arguments += " " + extra;
   out.arguments = CollapseSpaces(arguments);
-  if (out.arguments.size() > kProsperoMaxArgumentBytes || !SplitProsperoArguments(out.arguments, nullptr))
+  if (out.arguments.size() > kProsperoMaxLongArgumentBytes || !SplitProsperoArguments(out.arguments, nullptr))
     return fail("extra_arguments", "arguments are too long or have too many words");
+  if (out.arguments.size() > kProsperoMaxArgumentBytes && !kit.launch_arguments_4096)
+    return fail("extra_arguments", kit.launch_arguments_4096_needs_update
+                                       ? "arguments past 512 bytes need the game's runtime kit update"
+                                       : "arguments past 512 bytes need a newer runtime kit");
+  // Environment variables that only newer titles take in [environment]: an older one refuses the whole profile.
+  if (const auto row = out.values.find("environment"); row != out.values.end() && row->second.available) {
+    const auto& entries = row->second.value;
+    const auto names = [&](std::string_view name) { return EnvironmentSetsName(entries, name); };
+    const auto refuse = [&](std::string_view name, bool needs_update) {
+      return fail("environment", std::string(name) + (needs_update ? " needs the game's runtime kit update"
+                                                                    : " needs a newer runtime kit"));
+    };
+    if (names("WINE_LARGE_ADDRESS_AWARE") && !kit.large_address_aware)
+      return refuse("WINE_LARGE_ADDRESS_AWARE", kit.large_address_aware_needs_update);
+    if (names("PW_NSIPROXY_DISABLE") && !kit.nsiproxy_switch)
+      return refuse("PW_NSIPROXY_DISABLE", kit.nsiproxy_switch_needs_update);
+    for (const char* budget : {"WINE_PS5_PARK_FILES", "WINE_PS5_CACHED_FILES"})
+      if (names(budget) && !kit.environment_file_budgets)
+        return refuse(budget, kit.environment_file_budgets_needs_update);
+  }
 
   // Library overrides: the recipe's, then the DXVK ones a generated recipe needs, then what an
   // earlier build let the player add; or the player's whole list.
@@ -1088,14 +1204,14 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
     };
     // A generated recipe reaches the bottle's DXVK through overrides that follow the graphics value,
     // so a player who changes graphics never keeps DXVK half on.
-    if (IsGeneratedRecipeId(recipe.id) && out.graphics == "dxvk") list = list.empty() ? std::string(kDxvkOverrides)
+    if (UsesGeneratedLaunch(recipe) && out.graphics == "dxvk") list = list.empty() ? std::string(kDxvkOverrides)
                                                                                      : kDxvkOverrides + (";" + list);
     append(out.values["library_overrides"].value);
     overrides_row.value = list;
     overrides_row.source = list.empty() ? ValueSource::kPlayden
                          : out.values["library_overrides"].source == ValueSource::kUser ? ValueSource::kUser
                                                                                          : ValueSource::kRecipe;
-  } else if (IsGeneratedRecipeId(recipe.id)) {
+  } else if (UsesGeneratedLaunch(recipe)) {
     // The player's list never holds the DXVK entry: it follows graphics here as well, so a list
     // saved while DXVK was on does not keep it after the player switches graphics.
     std::string list;
@@ -1150,7 +1266,9 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
   std::string name = recipe.name.empty() ? target.id : recipe.name;
   if (name.size() > kProsperoMaxNameBytes) name.resize(kProsperoMaxNameBytes);
 
-  std::string text = "; Generated by Playden from recipe " + recipe.id + " v" + std::to_string(recipe.version) +
+  // A comment line (the profile parser skips it); a community recipe's revision tag, so two revisions of
+  // one recipe never render byte-identical profiles.
+  std::string text = "; Generated by Playden from recipe " + recipe.id + " v" + RecipeVersionTag(recipe) +
                      ". Edit settings in Playden.\n[application]\n";
   text += "id = " + target.id + "\n";
   text += "name = " + name + "\n";
@@ -1250,7 +1368,13 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
   if (audio_section) text += "\n[audio]\nvolume = " + value("volume") + "\n";
 
   // [runtime] version 2: the title takes the driver's defaults. Without the line the profile is version 1.
-  if (settings.profile_version == 2) text += "\n[runtime]\nversion = 2\n";
+  const auto& cpu = OptionalValue(settings, "cpu");
+  const bool translator = cpu.available && cpu.value == "translator";
+  if (settings.profile_version == 2 || translator) {
+    text += "\n[runtime]\n";
+    if (settings.profile_version == 2) text += "version = 2\n";
+    if (translator) text += "cpu = translator\n";
+  }
   if (value("logging") == "verbose") text += std::string("\n[debug]\nwinedebug = ") + kVerboseWinedebug + "\n";
   if (value("logging") == "input") text += std::string("\n[debug]\nwinedebug = ") + kInputWinedebug + "\n";
 
@@ -1309,6 +1433,20 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
     environment_lines += "WINE_CPU_TOPOLOGY = " + topology + "\n";
     ++environment_count;
   }
+  // Address space: WINE_LARGE_ADDRESS_AWARE in [environment] too, unless Environment variables set it already.
+  const auto& address_space = OptionalValue(settings, "address_space");
+  if (address_space.available && address_space.value == "4gb" &&
+      (!environment.available || !EnvironmentSetsName(environment.value, "WINE_LARGE_ADDRESS_AWARE"))) {
+    environment_lines += "WINE_LARGE_ADDRESS_AWARE = 1\n";
+    ++environment_count;
+  }
+  // Network adapters Off: PW_NSIPROXY_DISABLE in [environment], unless Environment variables set it already.
+  const auto& network_adapters = OptionalValue(settings, "network_adapters");
+  if (network_adapters.available && network_adapters.value == "off" &&
+      (!environment.available || !EnvironmentSetsName(environment.value, "PW_NSIPROXY_DISABLE"))) {
+    environment_lines += "PW_NSIPROXY_DISABLE = 1\n";
+    ++environment_count;
+  }
   if (environment.available && !settings.environment_as_debug_env) {
     std::size_t start = 0;
     const auto& entries = environment_entries;
@@ -1347,6 +1485,9 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
   features.input_touchpad = value("pointer_stick") == "touchpad";
   features.input_keyboard_stick = keyboard_stick;
   features.runtime_version = settings.profile_version == 2;
+  // BuildEffectiveSettings let arguments past 512 bytes through only for a runtime that takes them; such a runtime
+  // also takes a profile up to 16384 bytes with short arguments.
+  features.long_arguments = settings.long_profile || settings.arguments.size() > kProsperoMaxArgumentBytes;
   features.launcher_section = launcher_section;
   if (!CheckProsperoProfile(text, &why, features)) return fail("generated profile is invalid: " + why);
   *profile = {target.id, std::move(text)};
@@ -1583,7 +1724,12 @@ std::string SerializeIniValues(const std::vector<IniValue>& values, const std::s
 
 }  // namespace
 
-bool ParseGameRecipe(std::string_view text, GameRecipe* recipe, std::string* reason) {
+namespace {
+
+// A recipe file. settings_only: a community recipe of community.format_version 2, which has no program of its own:
+// Playden fills its program-shaped fields from its own recipe for the copy (FillSettingsOnlyRecipe), so the file may
+// not carry them, and its launch_option default is checked once they are filled.
+bool ParseRecipeFile(std::string_view text, GameRecipe* recipe, std::string* reason, bool settings_only) {
   const auto fail = [&](std::string why) {
     if (reason) *reason = std::move(why);
     return false;
@@ -1593,19 +1739,31 @@ bool ParseGameRecipe(std::string_view text, GameRecipe* recipe, std::string* rea
   GameRecipe out;
   const auto* version = root->get("recipe_version");
   const auto* app = root->get("app_id");
-  std::uint64_t parsed_version = 0;
-  std::uint64_t parsed_app = 0;
-  if (!StringField(*root, "recipe_id", &out.id) ||
-      !ExactUnsigned(version, static_cast<std::uint64_t>(std::numeric_limits<int>::max()), &parsed_version, false) ||
-      !ExactUnsigned(app, std::numeric_limits<std::uint32_t>::max(), &parsed_app, false))
-    return fail("recipe needs recipe_id, recipe_version and app_id");
-  out.version = static_cast<int>(parsed_version);
-  out.app_id = static_cast<std::uint32_t>(parsed_app);
-  // Games from other stores name their store and game; absent, the recipe is for Steam's app_id.
   const auto* store = root->get("store");
   const auto* game = root->get("game");
-  if ((store == nullptr) != (game == nullptr)) return fail("recipe needs both store and game, or neither");
-  if (store) {
+  // A community recipe names its game with a game object ({store, key, name}, ParseCommunityRecipe) and has no app
+  // ID: the game it is applied to binds it (BindCommunityRecipe).
+  const bool community = game && game->object();
+  std::uint64_t parsed_version = 0;
+  std::uint64_t parsed_app = 0;
+  if (community) {
+    if (app || root->get("steam_appid")) return fail("app_id and steam_appid are obsolete: the game object names the game");
+    if (store) return fail("a community recipe names its store in the game object");
+    if (!StringField(*root, "recipe_id", &out.id) ||
+        !ExactUnsigned(version, static_cast<std::uint64_t>(std::numeric_limits<int>::max()), &parsed_version, false))
+      return fail("recipe needs recipe_id and recipe_version");
+  } else if (!StringField(*root, "recipe_id", &out.id) ||
+             !ExactUnsigned(version, static_cast<std::uint64_t>(std::numeric_limits<int>::max()), &parsed_version, false) ||
+             !ExactUnsigned(app, std::numeric_limits<std::uint32_t>::max(), &parsed_app, false)) {
+    return fail("recipe needs recipe_id, recipe_version and app_id");
+  }
+  out.version = static_cast<int>(parsed_version);
+  out.app_id = static_cast<std::uint32_t>(parsed_app);
+  // Empty until filled from Playden's own recipe; a graphics field the file sets wins over Playden's.
+  if (settings_only) out.architecture.clear(), out.graphics.clear();
+  // Games from other stores name their store and game; absent, the recipe is for Steam's app_id.
+  if (!community && (store == nullptr) != (game == nullptr)) return fail("recipe needs both store and game, or neither");
+  if (store && !community) {
     const auto parsed_store = store->string() ? ParseStoreKey(*store->string()) : std::nullopt;
     if (!parsed_store || !game->string()) return fail("recipe names an unknown store");
     out.game = GameId{*parsed_store, *game->string()};
@@ -1625,9 +1783,23 @@ bool ParseGameRecipe(std::string_view text, GameRecipe* recipe, std::string* rea
       return fail("recipe has a field of the wrong type");
     out.defaults_revision = static_cast<int>(parsed_revision);
   }
+  if (settings_only) {
+    for (const char* field : {"launch_entries", "architecture", "runtime", "prefix", "detected", "dll_overrides",
+                              "arguments", "resolution_arguments"})
+      if (root->get(field))
+        return fail(std::string("a settings-only recipe (community.format_version 2) can't carry ") + field +
+                    ": Playden takes it from its own recipe for the copy");
+    // What the bottle and the game folder get belongs to a recipe that names its program.
+    for (const char* field : {"registry", "ini", "game_files", "steam_api_copies"})
+      if (root->get(field))
+        return fail(std::string("a settings-only recipe (community.format_version 2) can't carry ") + field +
+                    ": only a recipe with its own program (format_version 1) can");
+  }
   const auto* entries = root->get("launch_entries");
-  if (!entries || !entries->array() || entries->array()->empty()) return fail("recipe needs launch_entries");
-  for (const auto& item : *entries->array()) {
+  if (!settings_only && (!entries || !entries->array() || entries->array()->empty()))
+    return fail("recipe needs launch_entries");
+  static const json::Value::Array kNoEntries;
+  for (const auto& item : entries ? *entries->array() : kNoEntries) {
     LaunchEntry entry;
     if (!item.object() || !StringField(item, "id", &entry.id) || !StringField(item, "label", &entry.label) ||
         !StringField(item, "executable", &entry.executable) ||
@@ -1722,15 +1894,44 @@ bool ParseGameRecipe(std::string_view text, GameRecipe* recipe, std::string* rea
     }
   }
   if (out.dll_overrides.size() && !IsProsperoDllOverrides(out.dll_overrides)) return fail("recipe dll_overrides are invalid");
-  if (out.architecture != "pe32" && out.architecture != "pe64") return fail("architecture must be pe32 or pe64");
+  if (!settings_only && out.architecture != "pe32" && out.architecture != "pe64")
+    return fail("architecture must be pe32 or pe64");
   for (const auto& [id, value] : out.defaults) {
     std::string why;
+    // A settings-only recipe's launch option names one of the entries Playden fills in.
+    if (settings_only && id == "launch_option") {
+      if (value.empty() || HasControl(value)) return fail("default launch_option: not a launch option id");
+      continue;
+    }
     if (!ValidateSettingValue(out, id, value, &why)) return fail("default " + id + ": " + why);
   }
-  if (!ValidateSettingValue(out, "graphics", out.graphics, nullptr)) return fail("unknown graphics mode");
+  // A settings-only recipe without graphics takes Playden's.
+  if ((!settings_only || !out.graphics.empty()) && !ValidateSettingValue(out, "graphics", out.graphics, nullptr))
+    return fail("unknown graphics mode");
   if (HasControl(out.arguments) || HasControl(out.resolution_arguments)) return fail("arguments contain a control character");
   *recipe = std::move(out);
   return true;
+}
+
+}  // namespace
+
+bool ParseGameRecipe(std::string_view text, GameRecipe* recipe, std::string* reason) {
+  return ParseRecipeFile(text, recipe, reason, false);
+}
+
+bool RetiredSetting(std::string_view id) { return id == "opengl_thread"; }
+
+bool ValidatePresetSetting(std::string_view id, std::string_view value, std::string* reason) {
+  // Presets bundle choices and button bindings; launch entries, graphics and free text belong to the recipe or the
+  // player.
+  const auto* definition = FindSetting(id);
+  const bool button = id.compare(0, 7, "button.") == 0;
+  if (!definition || id == "launch_option" || id == "graphics" || id == "architecture" || id == "start_check" ||
+      (definition->kind == SettingKind::kText && !button)) {
+    if (reason) *reason = "unsupported setting";
+    return false;
+  }
+  return ValidateSettingValue(GameRecipe{}, id, value, reason);
 }
 
 bool ParseSettingsPresets(std::string_view text, std::vector<SettingsPreset>* presets, std::string* reason) {
@@ -1748,17 +1949,12 @@ bool ParseSettingsPresets(std::string_view text, std::vector<SettingsPreset>* pr
         !StringField(item, "try_when", &preset.try_when, false) ||
         !StringField(item, "short_hint", &preset.short_hint, false) || !StringMap(item.get("settings"), &preset.settings))
       return fail("preset needs id, name and string settings");
+    // The player's own presets (my_presets.h) take this prefix.
+    if (preset.id.compare(0, 3, "my-") == 0) return fail("preset " + preset.id + ": ids starting with my- are the player's");
     for (auto it = preset.settings.begin(); it != preset.settings.end();) it = RetiredSetting(it->first) ? preset.settings.erase(it) : std::next(it);
     for (const auto& [id, value] : preset.settings) {
-      // Presets bundle choices and button bindings; launch entries, graphics and free text
-      // belong to the recipe or the player.
-      const auto* definition = FindSetting(id);
-      const bool button = id.compare(0, 7, "button.") == 0;
-      if (!definition || id == "launch_option" || id == "graphics" || id == "architecture" || id == "start_check" ||
-          (definition->kind == SettingKind::kText && !button))
-        return fail("preset " + preset.id + " sets unsupported setting " + id);
       std::string why;
-      if (!ValidateSettingValue(GameRecipe{}, id, value, &why)) return fail("preset " + preset.id + " " + id + ": " + why);
+      if (!ValidatePresetSetting(id, value, &why)) return fail("preset " + preset.id + " " + id + ": " + why);
     }
     out.push_back(std::move(preset));
   }
@@ -1795,6 +1991,35 @@ bool RecordFromValue(const storage_json::Value& root, GameSettingsRecord* out) {
   if (const auto waves = out->overrides.find("pixel_shader_waves");
       waves != out->overrides.end() && waves->second == "auto")
     out->overrides.erase(waves);
+  // A malformed choice is dropped (the game falls back to Playden's recipe), not the record.
+  if (const auto* chosen = root.Find("community_recipe"); chosen && chosen->is_object()) {
+    const auto* id = chosen->Find("id");
+    const auto* revision = chosen->Find("revision");
+    if (id && id->is_string() && revision && revision->is_string() && IsCommunityRecipeId(id->text()) &&
+        IsCommunityRevision(revision->text())) {
+      out->community_recipe = {id->text(), revision->text(), GameRef{}};
+      // Another game's recipe names that game; one that can't be read leaves the game's own (the runtime then
+      // refuses another game's recipe, never takes it for the wrong game).
+      if (const auto* game = chosen->Find("game"); game && game->is_string())
+        if (const auto ref = ParseGameRefText(game->text())) out->community_recipe.game = *ref;
+      // One base: a file that names both (written by hand, or by a build that didn't keep them
+      // exclusive) keeps the community recipe, never a preset stacked on it.
+      out->preset_id.clear();
+    }
+  }
+  if (const auto* linked = root.Find("linked_game"); linked && linked->is_string())
+    if (const auto ref = ParseGameRefText(linked->text())) out->linked_game = *ref;
+  if (const auto* shared = root.Find("shared_recipe"); shared && shared->is_object()) {
+    const auto* submission = shared->Find("submission_id");
+    const auto* id = shared->Find("recipe_id");
+    if (submission && submission->is_string() && id && id->is_string() && !submission->text().empty() &&
+        IsCommunityRecipeId(id->text()))
+      out->shared_recipe = {submission->text(), id->text(), GameRef{}};
+    // The game it was made for; missing or unreadable is unknown, never matched.
+    if (!out->shared_recipe.submission_id.empty())
+      if (const auto* game = shared->Find("game"); game && game->is_string())
+        if (const auto ref = ParseGameRefText(game->text())) out->shared_recipe.game = *ref;
+  }
   // Settings this build does not know are dropped so an older record still loads.
   for (auto it = out->overrides.begin(); it != out->overrides.end();)
     it = FindSetting(it->first) || IsUnlockKey(it->first) ? std::next(it) : out->overrides.erase(it);
@@ -1833,6 +2058,17 @@ std::string SerializeGameSettingsRecord(const GameSettingsRecord& record) {
   text += "}";
   if (record.steam_app_id) text += ",\"steam_app_id\":\"" + std::to_string(record.steam_app_id) + "\"";
   if (!record.steam_launch.empty()) text += ",\"steam_launch\":\"" + json::escape(record.steam_launch) + "\"";
+  if (!record.community_recipe.id.empty())
+    text += ",\"community_recipe\":{\"id\":\"" + json::escape(record.community_recipe.id) + "\",\"revision\":\"" +
+            json::escape(record.community_recipe.revision) + "\"" +
+            (record.community_recipe.game.valid() ? ",\"game\":\"" + json::escape(ToText(record.community_recipe.game)) + "\"" : "") +
+            "}";
+  if (record.linked_game.valid()) text += ",\"linked_game\":\"" + json::escape(ToText(record.linked_game)) + "\"";
+  if (!record.shared_recipe.submission_id.empty())
+    text += ",\"shared_recipe\":{\"submission_id\":\"" + json::escape(record.shared_recipe.submission_id) +
+            "\",\"recipe_id\":\"" + json::escape(record.shared_recipe.recipe_id) + "\"" +
+            (record.shared_recipe.game.valid() ? ",\"game\":\"" + json::escape(ToText(record.shared_recipe.game)) + "\"" : "") +
+            "}";
   return text + "}";
 }
 
@@ -1986,8 +2222,107 @@ RecipeChoices RecipeChoicesFrom(const GameSettingsRecord& record) {
   return choices;
 }
 
+namespace {
+
+constexpr std::string_view kCommunityPrefix = "community-";
+
+// ^[a-z0-9]+(-[a-z0-9]+)*$
+bool HyphenWords(std::string_view text) {
+  if (text.empty() || text.front() == '-' || text.back() == '-') return false;
+  for (std::size_t index = 0; index < text.size(); ++index) {
+    const char c = text[index];
+    if (c == '-') {
+      if (text[index - 1] == '-') return false;
+    } else if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 bool IsCommunityRecipeId(std::string_view id) {
-  return id.size() > 10 && id.substr(0, 10) == "community-";
+  if (id.size() > kCommunityRecipeIdMaxBytes || id.substr(0, kCommunityPrefix.size()) != kCommunityPrefix) return false;
+  const auto rest = id.substr(kCommunityPrefix.size());
+  const auto hyphen = rest.find('-');
+  if (hyphen == std::string_view::npos || !IsRecipeStore(rest.substr(0, hyphen))) return false;
+  return HyphenWords(rest.substr(hyphen + 1));
+}
+
+namespace {
+constexpr std::string_view kCommunityAliasPrefix = "community-h-";
+constexpr std::size_t kCommunityAliasHexBytes = 24;
+}  // namespace
+
+std::string InstalledRecipeId(std::string_view id) {
+  if (id.size() <= kInstalledRecipeIdMaxBytes) return std::string(id);
+  const auto digest = HashArtifactBytes(id).value_or(std::string());
+  return std::string(kCommunityAliasPrefix) + digest.substr(0, kCommunityAliasHexBytes);
+}
+
+bool IsCommunityRecipeAlias(std::string_view id) {
+  if (id.size() != kCommunityAliasPrefix.size() + kCommunityAliasHexBytes || id.substr(0, kCommunityAliasPrefix.size()) != kCommunityAliasPrefix)
+    return false;
+  const auto hex = id.substr(kCommunityAliasPrefix.size());
+  return std::all_of(hex.begin(), hex.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+bool IsInstalledCommunityRecipeId(std::string_view id) {
+  return (IsCommunityRecipeId(id) && id.size() <= kInstalledRecipeIdMaxBytes) || IsCommunityRecipeAlias(id);
+}
+
+bool IsValidCommunitySlug(std::string_view slug) {
+  return slug.size() <= kCommunitySlugMaxBytes && HyphenWords(slug);
+}
+
+std::string CommunityRecipeIdFor(const GameRef& game, std::string_view slug) {
+  std::string id = std::string(kCommunityPrefix) + game.store + "-" + game.key;
+  if (!slug.empty()) id += "-" + std::string(slug);
+  return id;
+}
+
+std::optional<std::string> CommunityRecipeSlug(std::string_view id, const GameRef& game) {
+  if (!game.valid()) return std::nullopt;
+  const auto prefix = CommunityRecipeIdFor(game, {}) + "-";
+  if (id.size() > kCommunityRecipeIdMaxBytes || id.substr(0, prefix.size()) != prefix) return std::nullopt;
+  const auto slug = id.substr(prefix.size());
+  if (!IsValidCommunitySlug(slug)) return std::nullopt;
+  return std::string(slug);
+}
+
+namespace {
+bool LowerHexOf(std::string_view text, std::size_t length) {
+  return text.size() == length && std::all_of(text.begin(), text.end(), [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+  });
+}
+}  // namespace
+
+bool IsCommunityRevision(std::string_view text) { return LowerHexOf(text, kCommunityRevisionBytes); }
+bool IsCommunityRevisionPrefix(std::string_view text) { return LowerHexOf(text, kCommunityRevisionPrefixBytes); }
+bool RevisionHasTag(std::string_view revision, std::string_view tag) {
+  return IsCommunityRevision(revision) && IsCommunityRevisionPrefix(tag) &&
+         revision.substr(0, kCommunityRevisionPrefixBytes) == tag;
+}
+
+std::string RecipeVersionTag(const GameRecipe& recipe) {
+  if (IsCommunityRecipeId(recipe.id) && IsCommunityRevision(recipe.revision))
+    return recipe.revision.substr(0, kCommunityRevisionPrefixBytes);
+  return std::to_string(recipe.version);
+}
+
+void ChooseCommunityRecipe(GameSettingsRecord* record, std::string id, std::string revision, GameRef game) {
+  record->preset_id.clear();
+  if (game.valid()) record->linked_game = game;
+  record->community_recipe = {std::move(id), std::move(revision), std::move(game)};
+  ++record->revision;
+}
+
+void ChoosePreset(GameSettingsRecord* record, std::string preset_id) {
+  record->community_recipe = {};
+  record->preset_id = std::move(preset_id);
+  ++record->revision;
 }
 
 namespace {
@@ -2175,6 +2510,7 @@ bool GenerateGameRecipe(const GameId& game, std::uint32_t runtime_number, const 
       out.defaults["steam_features"] = "emulate";
       if (!defaults.environment.empty()) out.defaults["environment"] = defaults.environment;
       if (!defaults.d3d12.empty()) out.defaults["d3d12"] = defaults.d3d12;
+      if (!defaults.cpu.empty()) out.defaults["cpu"] = defaults.cpu;
 
     } else if (architecture != out.architecture) {
       continue;
@@ -2220,13 +2556,44 @@ std::optional<std::string> ProgramInsteadOfSteamDefault(const GameRecipe& recipe
   return current->executable;
 }
 
+namespace {
+// Whether a summary (GameDefaults::summary) lists `fact` among its facts, before " graphics=".
+bool SummaryHasFact(std::string_view summary, std::string_view fact) {
+  summary = summary.substr(0, summary.find(' '));
+  for (std::size_t start = 0; start <= summary.size();) {
+    const auto end = std::min(summary.find(',', start), summary.size());
+    if (summary.substr(start, end - start) == fact) return true;
+    start = end + 1;
+  }
+  return false;
+}
+
+// A 32-bit program linked by Watcom gets Translator from DefaultsFor, but only recipes set up since then have it: one
+// set up before keeps Native and crashes at start (Fallout). Only "cpu" is added, so the engine's other defaults stay
+// as they were set up. The program's PE headers are read on each Play while the recipe has neither the default nor the fact.
+bool MayNeedWatcomTranslator(const GameRecipe& recipe) {
+  return recipe.architecture == "pe32" && !recipe.defaults.count("cpu") && !SummaryHasFact(recipe.detected, "watcom");
+}
+bool AddWatcomTranslator(const std::string& install_root, const std::string& on_disk, GameRecipe* recipe) {
+  if (!MayNeedWatcomTranslator(*recipe) || !WatcomProgram(install_root + "/" + on_disk)) return false;
+  recipe->defaults["cpu"] = "translator";
+  const auto space = recipe->detected.find(' ');
+  auto facts = recipe->detected.substr(0, space);
+  const auto rest = space == std::string::npos ? std::string() : recipe->detected.substr(space);
+  facts = facts.empty() || facts == "unknown" ? std::string("watcom") : facts + ",watcom";
+  recipe->detected = facts + rest;
+  return true;
+}
+}  // namespace
+
 bool RefreshRecipeDefaults(const std::string& install_root, const KitCapabilities& kit, GameRecipe* recipe) {
-  if (!IsGeneratedRecipeId(recipe->id) || recipe->launch_entries.empty() ||
-      recipe->defaults_revision >= DefaultsRevision(recipe->detected))
-    return false;
+  if (!IsGeneratedRecipeId(recipe->id) || recipe->launch_entries.empty()) return false;
+  const bool current = recipe->defaults_revision >= DefaultsRevision(recipe->detected);
+  if (current && !MayNeedWatcomTranslator(*recipe)) return false;
   const auto relative = steam::RelativeGamePath(recipe->launch_entries.front().executable);
   const auto on_disk = relative ? ResolveGameFile(install_root, *relative) : std::nullopt;
   if (!on_disk) return false;
+  if (current) return AddWatcomTranslator(install_root, *on_disk, recipe);
   RuntimeAbilities abilities;
   abilities.shared_sections = kit.shared_sections;
   abilities.wine_mono = kit.wine_mono;
@@ -2243,6 +2610,8 @@ bool RefreshRecipeDefaults(const std::string& install_root, const KitCapabilitie
   else refreshed.defaults["environment"] = defaults.environment;
   if (defaults.d3d12.empty()) refreshed.defaults.erase("d3d12");
   else refreshed.defaults["d3d12"] = defaults.d3d12;
+  if (defaults.cpu.empty()) refreshed.defaults.erase("cpu");
+  else refreshed.defaults["cpu"] = defaults.cpu;
   // The files no longer show this engine (an update changed it): that's for the files-changed path, not this one.
   if (refreshed.defaults_revision < DefaultsRevision(recipe->detected)) return false;
   *recipe = std::move(refreshed);
@@ -2511,7 +2880,8 @@ std::string SerializeSettingsFile(
   bool first = true;
   for (const auto& [id, record] : records) {
     if (!id.valid() || (record.preset_id.empty() && record.overrides.empty() && record.revision == 0 &&
-                         !record.steam_app_id && record.steam_launch.empty()))
+                         !record.steam_app_id && record.steam_launch.empty() && record.community_recipe.id.empty() &&
+                         record.shared_recipe.submission_id.empty()))
       continue;
     if (!first) text += ",";
     first = false;
@@ -2590,21 +2960,53 @@ bool ApplyGameSettings(const GameRecipe& recipe, const EffectiveSettings& settin
   return true;
 }
 
+PrivateSettingsRead ReadPrivateSettingsFile(const std::string& path, std::string* text) {
+  text->clear();
+  std::string name;
+  auto directory = OpenSafeParent(path, DirectoryPolicy::kPrivate, &name);
+  if (!directory) return errno == ENOENT ? PrivateSettingsRead::kMissing : PrivateSettingsRead::kError;
+  switch (ReadRegularAt(*directory, name.c_str(), storage_json::Limits{}.max_bytes, text, nullptr, true)) {
+    case RelativeRead::kMissing: return PrivateSettingsRead::kMissing;
+    case RelativeRead::kPresent: return PrivateSettingsRead::kPresent;
+    case RelativeRead::kError: break;
+  }
+  return PrivateSettingsRead::kError;
+}
+
+bool WritePrivateSettingsFile(const std::string& path, const std::string& text) {
+  std::string name;
+  auto directory = OpenSafeParent(path, DirectoryPolicy::kPrivate, &name);
+  if (!directory) return false;
+  struct stat status {};
+  const bool inspected = directory->InspectChild(name, &status);
+  if (inspected && (!S_ISREG(status.st_mode) || status.st_uid != ::geteuid() ||
+                    ((status.st_mode & 07777) != 0600 && (status.st_mode & 07777) != 0644)))
+    return false;
+  if (!inspected && errno != ENOENT) return false;
+  return WriteAtomicAt(*directory, name.c_str(), text, 0600, false, true);
+}
+
+bool SetPrivateSettingsFileAside(const std::string& path, const std::string& aside_name) {
+  std::string name;
+  auto directory = OpenSafeParent(path, DirectoryPolicy::kPrivate, &name);
+  if (!directory || aside_name.empty() || aside_name == name) return false;
+  struct stat status {};
+  if (!directory->InspectChild(name, &status) || !S_ISREG(status.st_mode) || status.st_uid != ::geteuid()) return false;
+  if (directory->InspectChild(aside_name, &status)) {
+    errno = EEXIST;
+    return false;
+  }
+  if (errno != ENOENT) return false;
+  return directory->RenameChild(name, *directory, aside_name, false) && directory->Sync();
+}
+
 bool LoadGameSettingsFile(const std::string& path, std::map<GameId, GameSettingsRecord>* records,
                           std::string* reason) {
   records->clear();
   std::string text;
-  std::string name;
-  auto directory = OpenSafeParent(path, DirectoryPolicy::kPrivate, &name);
-  if (!directory) {
-    if (errno == ENOENT) return true;
-    if (reason) *reason = "cannot read game settings";
-    return false;
-  }
-  const auto read = ReadRegularAt(*directory, name.c_str(), storage_json::Limits{}.max_bytes,
-                                  &text, nullptr, true);
-  if (read == RelativeRead::kMissing) return true;
-  if (read == RelativeRead::kError) {
+  const auto read = ReadPrivateSettingsFile(path, &text);
+  if (read == PrivateSettingsRead::kMissing) return true;
+  if (read == PrivateSettingsRead::kError) {
     if (reason) *reason = "cannot read game settings";
     return false;
   }
@@ -2617,26 +3019,7 @@ bool LoadGameSettingsFile(const std::string& path, std::map<GameId, GameSettings
 
 bool SaveGameSettingsFile(const std::string& path, const std::map<GameId, GameSettingsRecord>& records,
                           std::string* reason) {
-  const auto text = SerializeSettingsFile(records);
-  std::string name;
-  auto directory = OpenSafeParent(path, DirectoryPolicy::kPrivate, &name);
-  if (!directory) {
-    if (reason) *reason = "cannot write game settings";
-    return false;
-  }
-  struct stat status {};
-  const bool inspected = directory->InspectChild(name, &status);
-  if (inspected && (!S_ISREG(status.st_mode) || status.st_uid != ::geteuid() ||
-                    ((status.st_mode & 07777) != 0600 && (status.st_mode & 07777) != 0644))) {
-    if (reason) *reason = "cannot write game settings";
-    return false;
-  }
-  if (!inspected && errno != ENOENT) {
-    if (reason) *reason = "cannot write game settings";
-    return false;
-  }
-  const bool written = WriteAtomicAt(*directory, name.c_str(), text, 0600, false, true);
-  if (!written) {
+  if (!WritePrivateSettingsFile(path, SerializeSettingsFile(records))) {
     if (reason) *reason = "cannot write game settings";
     return false;
   }
@@ -2766,14 +3149,6 @@ bool ClearShaderCache(const LaunchEntry& launch, const std::string& install_root
   if (!removed) return fail("cannot delete the shader cache");
   return true;
 }
-
-namespace {
-constexpr const char* kBottleEnvironmentNames[] = {
-    "VKD3D_CONFIG",          "VKD3D_DEBUG",          "VKD3D_DISABLE_EXTENSIONS",   "VKD3D_FEATURE_LEVEL",
-    "VKD3D_FRAME_RATE",      "VKD3D_LOG_FILE",       "VKD3D_SHADER_CACHE_PATH",    "VKD3D_SHADER_DEBUG",
-    "VKD3D_SHADER_MODEL",    "VKD3D_SWAPCHAIN_IMAGES", "VKD3D_SWAPCHAIN_LATENCY_FRAMES",
-    "VKD3D_SWAPCHAIN_PRESENT_MODE"};
-}  // namespace
 
 bool IsBottleEnvironmentEntry(std::string_view name, std::string_view value) {
   if (std::find(std::begin(kBottleEnvironmentNames), std::end(kBottleEnvironmentNames), name) ==
@@ -3390,6 +3765,10 @@ KitCapabilities KitCapabilitiesFromManifest(const std::vector<std::string>& capa
   kit.input_playstation = has(kKitInputPlaystation);
   kit.input_touchpad = has(kKitInputTouchpad);
   kit.input_keyboard_stick = has(kKitInputKeyboardStick);
+  kit.launch_arguments_4096 = has(kKitLaunchArguments4096);
+  kit.large_address_aware = has(kKitLargeAddressAware);
+  kit.nsiproxy_switch = has(kKitNsiproxySwitch);
+  kit.environment_file_budgets = has(kKitEnvironmentFileBudgets);
   kit.registry = bottle_access;
   return kit;
 }
@@ -3425,6 +3804,22 @@ KitCapabilities KitForTitleRuntime(KitCapabilities kit, bool title_runtime_curre
     kit.input_playstation = false;
     kit.input_playstation_needs_update = true;
   }
+  if (!title_runtime_current && kit.launch_arguments_4096) {
+    kit.launch_arguments_4096 = false;
+    kit.launch_arguments_4096_needs_update = true;
+  }
+  if (!title_runtime_current && kit.large_address_aware) {
+    kit.large_address_aware = false;
+    kit.large_address_aware_needs_update = true;
+  }
+  if (!title_runtime_current && kit.nsiproxy_switch) {
+    kit.nsiproxy_switch = false;
+    kit.nsiproxy_switch_needs_update = true;
+  }
+  if (!title_runtime_current && kit.environment_file_budgets) {
+    kit.environment_file_budgets = false;
+    kit.environment_file_budgets_needs_update = true;
+  }
   return kit;
 }
 
@@ -3442,8 +3837,9 @@ bool BuildSettingsLaunchPlan(const SettingsLaunchInput& input, SettingsLaunchPla
   }
   SettingsLaunchPlan out;
   out.app_id = input.recipe->app_id;
-  out.recipe_id = input.recipe->id;
-  out.recipe_version = std::to_string(input.recipe->version);
+  // The title holds the id in 64 bytes: a longer community recipe id goes as its alias.
+  out.recipe_id = InstalledRecipeId(input.recipe->id);
+  out.recipe_version = RecipeVersionTag(*input.recipe);
   EffectiveSettings settings;
   SettingsError error;
   if (!BuildEffectiveSettings(*input.recipe, input.preset, input.record.overrides, input.kit, &settings, &error))
@@ -3529,12 +3925,16 @@ bool ApplySettingsFiles(const SettingsLaunchPlan& plan, const std::string& insta
 
 namespace playden::runtime {
 
-CommunityRecipe BuildCommunityRecipe(const GameRecipe& recipe, const EffectiveSettings& settings) {
+CommunityRecipe BuildCommunityRecipe(const GameRecipe& recipe, const EffectiveSettings& settings, const GameRef& game,
+                                     std::string game_name, std::string made_on) {
   CommunityRecipe out;
   auto& shared = out.recipe;
-  shared.id = "community-" + std::to_string(recipe.app_id);
+  out.game = game;
+  out.game_name = std::move(game_name);
+  if (made_on != game.store) out.made_on = std::move(made_on);
+  // The author picks the slug (and the title): the export leaves both empty.
+  shared.id = CommunityRecipeIdFor(game, {});
   shared.version = 1;
-  shared.app_id = recipe.app_id;
   shared.name = recipe.name;
   if (settings.launch) {
     shared.launch_entries = {*settings.launch};
@@ -3550,10 +3950,11 @@ CommunityRecipe BuildCommunityRecipe(const GameRecipe& recipe, const EffectiveSe
   shared.graphics = settings.graphics;
   // What the files showed, without the graphics value: that has its own field.
   shared.detected = recipe.detected.substr(0, recipe.detected.find(" graphics="));
-  // The recipe fields above carry the program, arguments and overrides; the rest are defaults.
+  // The recipe fields above carry the program, arguments and overrides; the rest are defaults. Extra arguments is the
+  // player's own row, which no community recipe carries.
   static const std::set<std::string> fields = {"launch_option", "program", "program_folder", "program_arguments",
-                                               "arguments", "architecture", "dll_overrides", "library_overrides",
-                                               "graphics", "start_check", "logging"};
+                                               "arguments", "extra_arguments", "architecture", "dll_overrides",
+                                               "library_overrides", "graphics", "start_check", "logging"};
   for (const auto& definition : SettingsCatalogue()) {
     const auto& row = settings.values.at(definition.id);
     if (fields.count(definition.id) || !row.available || row.source == ValueSource::kPlayden ||
@@ -3571,26 +3972,77 @@ CommunityRecipe BuildCommunityRecipe(const GameRecipe& recipe, const EffectiveSe
   return out;
 }
 
+bool IsProgramRow(std::string_view id) {
+  return id == "launch_option" || id == "program" || id == "program_folder" || id == "program_arguments" ||
+         id == "architecture" || id == "arguments" || id == "dll_overrides";
+}
+
+CommunityRecipe BuildSettingsOnlyRecipe(const CommunityRecipe& base, const EffectiveSettings& before,
+                                        const EffectiveSettings& after, const GameRef& game, std::string game_name,
+                                        std::string made_on) {
+  CommunityRecipe out;
+  out.format_version = kCommunitySettingsOnlyFormat;
+  out.game = game;
+  out.game_name = std::move(game_name);
+  if (made_on != game.store) out.made_on = std::move(made_on);
+  auto& shared = out.recipe;
+  shared.id = CommunityRecipeIdFor(game, {});
+  shared.version = 1;
+  shared.name = base.recipe.name;
+  shared.architecture.clear();
+  shared.runtime.clear();
+  shared.prefix.clear();
+  // Graphics is a field of its own: the base's, or the player's when they changed it.
+  shared.graphics = after.graphics != before.graphics ? after.graphics : base.recipe.graphics;
+  shared.defaults = base.recipe.defaults;
+  shared.requirements = base.recipe.requirements;
+  // Rows that are local or written elsewhere: the program rows stay the base's, graphics has its field, and Extra
+  // arguments is the player's own row, which no community recipe carries.
+  static const std::set<std::string> skipped = {"graphics", "extra_arguments", "start_check", "logging"};
+  for (const auto& definition : SettingsCatalogue()) {
+    if (IsProgramRow(definition.id) || skipped.count(definition.id)) continue;
+    const auto found_after = after.values.find(definition.id);
+    const auto found_before = before.values.find(definition.id);
+    if (found_after == after.values.end() || !found_after->second.available) continue;
+    if (found_before != before.values.end() && ChosenValue(found_before->second) == ChosenValue(found_after->second))
+      continue;
+    shared.defaults[definition.id] = ChosenValue(found_after->second);
+  }
+  out.status = "untested";
+  return out;
+}
+
 std::string SerializeCommunityRecipe(const CommunityRecipe& community) {
   const auto quoted = [](const std::string& text) { return "\"" + json::escape(text) + "\""; };
   const auto& recipe = community.recipe;
+  const bool settings_only = IsSettingsOnlyRecipe(community);
   // One field per line, so a change to a shared recipe reads well in a pull request.
   std::string text = "{\n  \"recipe_id\": " + quoted(recipe.id) + ",\n  \"recipe_version\": " +
-                     std::to_string(recipe.version) + ",\n  \"app_id\": " + std::to_string(recipe.app_id) +
-                     ",\n  \"name\": " + quoted(recipe.name) + ",\n  \"launch_entries\": [";
-  for (std::size_t index = 0; index < recipe.launch_entries.size(); ++index) {
+                     std::to_string(recipe.version) + ",\n  \"game\": {\"store\": " + quoted(community.game.store) +
+                     ", \"key\": " + quoted(community.game.key) + ", \"name\": " + quoted(community.game_name) + "}" +
+                     (community.made_on.empty() ? std::string() : ",\n  \"made_on\": " + quoted(community.made_on)) +
+                     ",\n  \"name\": " + quoted(recipe.name);
+  if (settings_only) {
+    // Only what Playden doesn't fill in from its own recipe for the copy.
+    if (!recipe.graphics.empty()) text += ",\n  \"graphics\": " + quoted(recipe.graphics);
+    text += ",\n  \"defaults\": {";
+  } else {
+    text += ",\n  \"launch_entries\": [";
+  }
+  for (std::size_t index = 0; !settings_only && index < recipe.launch_entries.size(); ++index) {
     const auto& entry = recipe.launch_entries[index];
     text += std::string(index ? "," : "") + "\n    {\"id\": " + quoted(entry.id) + ", \"label\": " + quoted(entry.label) +
             ", \"executable\": " + quoted(entry.executable) + ", \"working_directory\": " +
             quoted(entry.working_directory) + ", \"arguments\": " + quoted(entry.arguments) +
             (entry.in_install_root ? ", \"in_install_root\": true" : "") + "}";
   }
-  text += "\n  ],\n  \"arguments\": " + quoted(recipe.arguments) + ",\n  \"resolution_arguments\": " +
-          quoted(recipe.resolution_arguments) + ",\n  \"dll_overrides\": " + quoted(recipe.dll_overrides) +
-          ",\n  \"architecture\": " + quoted(recipe.architecture) + ",\n  \"runtime\": " + quoted(recipe.runtime) +
-          ",\n  \"prefix\": " + quoted(recipe.prefix) + ",\n  \"graphics\": " + quoted(recipe.graphics) +
-          (recipe.detected.empty() ? std::string() : ",\n  \"detected\": " + quoted(recipe.detected)) +
-          ",\n  \"defaults\": {";
+  if (!settings_only)
+    text += "\n  ],\n  \"arguments\": " + quoted(recipe.arguments) + ",\n  \"resolution_arguments\": " +
+            quoted(recipe.resolution_arguments) + ",\n  \"dll_overrides\": " + quoted(recipe.dll_overrides) +
+            ",\n  \"architecture\": " + quoted(recipe.architecture) + ",\n  \"runtime\": " + quoted(recipe.runtime) +
+            ",\n  \"prefix\": " + quoted(recipe.prefix) + ",\n  \"graphics\": " + quoted(recipe.graphics) +
+            (recipe.detected.empty() ? std::string() : ",\n  \"detected\": " + quoted(recipe.detected)) +
+            ",\n  \"defaults\": {";
   bool first = true;
   for (const auto& [id, value] : recipe.defaults) {
     text += std::string(first ? "" : ",") + "\n    " + quoted(id) + ": " + quoted(value);
@@ -3612,7 +4064,7 @@ std::string SerializeCommunityRecipe(const CommunityRecipe& community) {
     }
     text += "}";
   }
-  if (!recipe.registry.empty()) {
+  if (!settings_only && !recipe.registry.empty()) {
     // Grouped by key as ParseGameRecipe reads it; data holds the quoted string.
     std::map<std::string, std::vector<const RegistryValue*>> keys;
     for (const auto& value : recipe.registry) keys[value.key].push_back(&value);
@@ -3628,43 +4080,85 @@ std::string SerializeCommunityRecipe(const CommunityRecipe& community) {
     }
     text += "\n  }";
   }
-  if (!recipe.ini.empty()) text += ",\n  \"ini\": " + SerializeIniValues(recipe.ini, "\n    ", "\n  ");
-  text += ",\n  \"steam_appid\": " + std::to_string(recipe.app_id) + ",\n  \"executable\": " +
-          quoted(community.executable) + ",\n  \"community\": {\n    \"format_version\": 1,\n    \"min_kit\": " +
-          quoted(community.min_kit) + ",\n    \"tested_firmware\": " + quoted(community.tested_firmware) +
+  if (!settings_only && !recipe.ini.empty()) text += ",\n  \"ini\": " + SerializeIniValues(recipe.ini, "\n    ", "\n  ");
+  if (!settings_only) text += ",\n  \"executable\": " + quoted(community.executable);
+  text += ",\n  \"community\": {\n    \"format_version\": " + std::string(settings_only ? "2" : "1") +
+          ",\n    \"title\": " +
+          quoted(community.title) + ",\n    \"tested_kit\": " + quoted(community.tested_kit) +
+          // min_kit is a requirement someone sets by hand; an empty one is left out.
+          (community.min_kit.empty() ? std::string() : ",\n    \"min_kit\": " + quoted(community.min_kit)) +
+          ",\n    \"tested_firmware\": " + quoted(community.tested_firmware) +
           ",\n    \"tested_date\": " + quoted(community.tested_date) + ",\n    \"status\": " +
           quoted(community.status) + ",\n    \"notes\": " + quoted(community.notes) + ",\n    \"author\": " +
-          quoted(community.author);
+          quoted(community.author) + ",\n    \"contributors\": [";
+  for (std::size_t index = 0; index < community.contributors.size(); ++index)
+    text += std::string(index ? ", " : "") + quoted(community.contributors[index]);
+  text += "]";
   if (!community.base_repository.empty())
     text += ",\n    \"base\": {\"repository\": " + quoted(community.base_repository) + ", \"path\": " +
             quoted(community.base_path) + ", \"revision\": " + quoted(community.base_revision) + "}";
   return text + "\n  }\n}\n";
 }
 
-bool ParseCommunityRecipe(std::string_view text, CommunityRecipe* community, std::string* reason) {
+bool ParseCommunityRecipe(std::string_view text, CommunityRecipe* community, std::string* reason, int newest_format) {
   const auto fail = [&](std::string why) {
     if (reason) *reason = std::move(why);
     return false;
   };
   CommunityRecipe out;
-  if (!ParseGameRecipe(text, &out.recipe, reason)) return false;
-  if (!out.recipe.steam_api_copies.empty()) return fail("a community recipe can't carry steam_api_copies");
-  if (!out.recipe.game_files.empty()) return fail("a community recipe can't carry game_files");
+  // The version first: a file this build can't read is refused for that alone, whatever else it holds.
   const auto root = json::parse(text);
-  std::uint64_t appid = 0;
-  if (!ExactUnsigned(root->get("steam_appid"), std::numeric_limits<std::uint32_t>::max(), &appid, false) ||
-      appid != out.recipe.app_id)
-    return fail("steam_appid must match app_id");
-  if (!StringField(*root, "executable", &out.executable)) return fail("community recipe needs executable");
+  if (!root || !root->object()) return fail("recipe is not a JSON object");
   const auto* meta = root->get("community");
   std::uint64_t format = 0;
-  if (!meta || !meta->object() || !ExactUnsigned(meta->get("format_version"), 1000, &format) || format != 1)
-    return fail("community recipe needs community.format_version 1");
-  if (!StringField(*meta, "min_kit", &out.min_kit, false) ||
+  if (!meta || !meta->object() || !ExactUnsigned(meta->get("format_version"), 1000, &format) || format < 1 ||
+      format > static_cast<std::uint64_t>(newest_format))
+    return fail(newest_format == 1 ? "community recipe needs community.format_version 1"
+                                   : "community recipe needs community.format_version 1 to " + std::to_string(newest_format));
+  out.format_version = static_cast<int>(format);
+  const bool settings_only = out.format_version == kCommunitySettingsOnlyFormat;
+  if (!ParseRecipeFile(text, &out.recipe, reason, settings_only)) return false;
+  if (!out.recipe.steam_api_copies.empty()) return fail("a community recipe can't carry steam_api_copies");
+  if (!out.recipe.game_files.empty()) return fail("a community recipe can't carry game_files");
+  // ParseGameRecipe read the game object's shape; app_id and steam_appid are refused there.
+  const auto* game = root->get("game");
+  if (!game || !game->object()) return fail("community recipe needs \"game\": {\"store\", \"key\", \"name\"}");
+  for (const auto& [key, value] : *game->object())
+    if (key != "store" && key != "key" && key != "name") return fail("game." + key + " is not a game field (store, key, name)");
+  if (!StringField(*game, "store", &out.game.store) || !IsRecipeStore(out.game.store))
+    return fail("game.store must be steam, epic, gog or imported");
+  if (!StringField(*game, "key", &out.game.key) || !IsStoreKey(out.game.store, out.game.key))
+    return fail("game.key is not a key of store " + out.game.store);
+  if (!StringField(*game, "name", &out.game_name)) return fail("game.name must be a string");
+  if (const auto* made_on = root->get("made_on")) {
+    if (!made_on->string() || !IsRecipeStore(*made_on->string()))
+      return fail("made_on must be steam, epic, gog or imported");
+    out.made_on = *made_on->string();
+  }
+  // The program it is for, in format 1; a settings-only recipe has none: it is for its game alone.
+  if (settings_only) {
+    if (root->get("executable"))
+      return fail("a settings-only recipe (community.format_version 2) can't carry executable: Playden takes the "
+                  "program from its own recipe for the copy");
+  } else if (!StringField(*root, "executable", &out.executable)) {
+    return fail("community recipe needs executable");
+  }
+  if (out.recipe.id != CommunityRecipeIdFor(out.game, {}) && !CommunityRecipeSlug(out.recipe.id, out.game))
+    return fail("recipe_id must be community-<store>-<key>-<slug> for the game object's store and key, at most 128 "
+                "bytes, with a slug of 1-32 lowercase letters, digits and single hyphens");
+  if (!StringField(*meta, "title", &out.title, false) || !StringField(*meta, "tested_kit", &out.tested_kit, false) ||
+      !StringField(*meta, "min_kit", &out.min_kit, false) ||
       !StringField(*meta, "tested_firmware", &out.tested_firmware, false) ||
       !StringField(*meta, "tested_date", &out.tested_date, false) || !StringField(*meta, "status", &out.status) ||
       !StringField(*meta, "notes", &out.notes, false) || !StringField(*meta, "author", &out.author, false))
     return fail("community metadata has a field of the wrong type");
+  if (const auto* contributors = meta->get("contributors")) {
+    if (!contributors->array()) return fail("contributors must be a list of names");
+    for (const auto& name : *contributors->array()) {
+      if (!name.string()) return fail("contributors must be a list of names");
+      out.contributors.push_back(*name.string());
+    }
+  }
   if (out.status != "works" && out.status != "playable" && out.status != "broken" && out.status != "untested")
     return fail("status must be works, playable, broken or untested");
   if (const auto* base = meta->get("base")) {
@@ -3672,12 +4166,21 @@ bool ParseCommunityRecipe(std::string_view text, CommunityRecipe* community, std
         !StringField(*base, "path", &out.base_path) || !StringField(*base, "revision", &out.base_revision, false))
       return fail("base needs repository and path");
   }
+  if (settings_only) {
+    *community = std::move(out);
+    return true;
+  }
   for (const auto& entry : out.recipe.launch_entries)
     if (entry.executable == out.executable) {
       *community = std::move(out);
       return true;
     }
   return fail("executable must be one of the launch entries");
+}
+
+void BindCommunityRecipe(CommunityRecipe* community, const GameId& game, std::uint32_t runtime_number) {
+  community->recipe.app_id = runtime_number;
+  community->recipe.game = game;
 }
 
 bool CommunityPresetSupported(const CommunityPreset& community, const KitCapabilities& kit) {

@@ -214,7 +214,12 @@ add_library(playden_ps4_game_settings STATIC
     "${PLAYDEN_ROOT}/src/runtime/burn_bundle.cpp"
     "${PLAYDEN_ROOT}/src/runtime/redist_install.cpp"
     "${PLAYDEN_ROOT}/src/runtime/steam_stub.cpp"
-    "${PLAYDEN_ROOT}/src/steam/backend/game_path.cpp")
+    "${PLAYDEN_ROOT}/src/steam/backend/game_path.cpp"
+    "${PLAYDEN_ROOT}/src/library/game_ref.cpp"
+    "${PLAYDEN_ROOT}/third_party/utf8proc/utf8proc.c")
+# game_ref.cpp (recipe game names) folds text with utf8proc, as the PS5 build's playden_library does.
+target_include_directories(playden_ps4_game_settings PRIVATE "${PLAYDEN_ROOT}/third_party/utf8proc")
+target_compile_definitions(playden_ps4_game_settings PRIVATE UTF8PROC_STATIC)
 target_include_directories(playden_ps4_game_settings PUBLIC
     "${PLAYDEN_ROOT}/src" "${PLAYDEN_ROOT}/third_party" "${PLAYDEN_ROOT}/third_party/stb"
     "${CMAKE_CURRENT_SOURCE_DIR}" "${PS4_NETWORK_PREFIX}/include")

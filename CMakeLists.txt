@@ -21,33 +21,22 @@ if(PLAYDEN_PRERELEASE MATCHES "^nightly\\.")
     set(PLAYDEN_BUILD_NIGHTLY_BASE "${PLAYDEN_NIGHTLY_BASE}")
 endif()
 
-# The commit the build is made from, for Settings › About. Configure runs again whenever HEAD moves.
-set(PLAYDEN_BUILD_COMMIT "")
+# The commit the build is made from and whether it had local changes, for Settings › About and what Playden shares
+# (BuildVersionText). Checked again on every build, not only at configure: files can change without a new commit.
 find_package(Git QUIET)
-if(GIT_FOUND)
-    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short=10 HEAD WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-        OUTPUT_VARIABLE PLAYDEN_BUILD_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE playden_git_result)
-    if(NOT playden_git_result EQUAL 0 OR NOT PLAYDEN_BUILD_COMMIT MATCHES "^[0-9a-f]+$")
-        set(PLAYDEN_BUILD_COMMIT "")
-    endif()
-    # HEAD names the branch; the branch's ref (loose or packed) and HEAD's reflog change with each commit.
-    execute_process(COMMAND "${GIT_EXECUTABLE}" symbolic-ref -q HEAD WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-        OUTPUT_VARIABLE playden_head_ref OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    set(playden_git_paths HEAD logs/HEAD packed-refs)
-    if(playden_head_ref)
-        list(APPEND playden_git_paths "${playden_head_ref}")
-    endif()
-    foreach(playden_git_path IN LISTS playden_git_paths)
-        execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --path-format=absolute --git-path "${playden_git_path}"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" OUTPUT_VARIABLE playden_git_file OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-        if(playden_git_file AND EXISTS "${playden_git_file}")
-            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${playden_git_file}")
-        endif()
-    endforeach()
-endif()
+set(PLAYDEN_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
+set(playden_build_commit_command "${CMAKE_COMMAND}" "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}" "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+    "-DOUTPUT=${PLAYDEN_GENERATED_DIR}/playden_build_commit.h" -P "${CMAKE_SOURCE_DIR}/cmake/WriteBuildCommit.cmake")
+execute_process(COMMAND ${playden_build_commit_command})
+add_custom_target(playden_build_commit COMMAND ${playden_build_commit_command}
+    BYPRODUCTS "${PLAYDEN_GENERATED_DIR}/playden_build_commit.h" VERBATIM)
 
 option(PLAYDEN_UI_SIMULATION "Package selected PS5 UI with developer simulation fixtures" OFF)
 option(PLAYDEN_PLATFORM_PS5 "Build a PS5 native title" OFF)
+# Local testing only: read other community recipe endpoints from dev-endpoints.json in the user
+# data folder (plain http and an auth header allowed for them). Never on in a release package.
+option(PLAYDEN_DEV_ENDPOINTS "Compile in the dev-endpoints.json override for community recipes" OFF)
+option(PLAYDEN_DEV_BUILD "A local build for testing: every experimental feature on by default; never a release" OFF)
 set(PLAYDEN_PS5_TITLE_ID "" CACHE STRING "Explicit PS5 title id (required for PS5 packaging)")
 
 file(READ "${CMAKE_SOURCE_DIR}/dependencies.lock.json" playden_dependency_lock)
@@ -59,3 +48,4 @@ include(cmake/Web.cmake)
 include(cmake/ProsperoRuntime.cmake)
 include(cmake/SelfUpdate.cmake)
 include(cmake/HomebrewUI.cmake)
+include(cmake/CommunityRecipes.cmake)

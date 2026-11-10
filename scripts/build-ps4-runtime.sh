@@ -90,8 +90,8 @@ MESA_COMMIT="$(sed -n 's/^mesa_commit=//p' "$RELEASE_MANIFEST")"
 [[ -n "$MESA_COMMIT" ]] || die "release manifest has no mesa_commit"
 STEAMWORKS_DIR="$ROOT/runtime/steamworks"
 for spec in \
-    'steam_api.dll cae4372bceda997d6c73cebc1c14eb27d39b74a7999d8f28384bdfd8d746a79c' \
-    'steam_api64.dll 70d9826a402d3a78b0c07e9f7ea7c6832468a1113013f31ea570fccaa5445ea9' \
+    'steam_api.dll d778ba3007cc46b7587f23698493c6734752213e34eaec2d5e59a036da11df44' \
+    'steam_api64.dll ca4698c8d8db8270735c3570922748300abd10dc9d16c2f3a95a6a564be144d2' \
     'steam.dll f813075716892ab19ee9b0c06000c328bd5f15e713692384a30ddbcfc9065e57'; do
     read -r dll expected <<<"$spec"
     [[ -f "$STEAMWORKS_DIR/$dll" ]] || die "Steamworks emulator file missing: $STEAMWORKS_DIR/$dll"
@@ -267,7 +267,7 @@ cp "$ROOT/scripts/network-deps/.deps/ps4/cacert.pem" "$STAGE/assets/cacert.pem"
 cp "$STEAMWORKS_DIR/steam_api.dll" "$STEAMWORKS_DIR/steam_api64.dll" \
     "$STEAMWORKS_DIR/steam.dll" "$STEAMWORKS_DIR/LICENSE" "$STEAMWORKS_DIR/README.md" \
     "$STAGE/runtime/steamworks/"
-printf 'title=PLDN10001\nversion=%s\norbis_win_root_commit=%s\nprospero_win_abi4_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_commit=%s\nmesa_libvulkan_sha256=%s\ndxvk=2.6.2-x32+x64\nprefix_template_stamp=%s\nsteamworks_emulator=gbe_fork-release-2026_09_27\n' \
+printf 'title=PLDN10001\nversion=%s\norbis_win_root_commit=%s\nprospero_win_abi4_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_commit=%s\nmesa_libvulkan_sha256=%s\ndxvk=2.6.2-x32+x64\nprefix_template_stamp=%s\nsteamworks_emulator=gbe_fork-ca45922c\n' \
     "$PKG_VERSION" "$manifest_root_commit" "$PW_SOURCE_COMMIT" "$manifest_diff" "${WINE_VERSION#wine-}" \
     "$MESA_COMMIT" "$MESA_SHA256" "$TEMPLATE_STAMP" >"$STAGE/runtime-manifest.txt"
 cmp -s "$ORBIS_WIN_STAGE/sce_module/libvulkan.prx" "$STAGE/sce_module/libvulkan.prx" || die "packaged Mesa PRX mismatch"

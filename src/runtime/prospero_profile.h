@@ -38,10 +38,12 @@ struct ProsperoProfile {
 };
 
 constexpr std::size_t kProsperoMaxProfileBytes = 8192;
+constexpr std::size_t kProsperoMaxLongProfileBytes = 16384;  // a title with launch-arguments-4096
 constexpr std::size_t kProsperoMaxIdBytes = 64;
 constexpr std::size_t kProsperoMaxNameBytes = 96;
 constexpr std::size_t kProsperoMaxPathBytes = 259;
 constexpr std::size_t kProsperoMaxArgumentBytes = 512;
+constexpr std::size_t kProsperoMaxLongArgumentBytes = 4096;  // a title with launch-arguments-4096
 constexpr std::size_t kProsperoMaxCatalogEntries = 16;
 constexpr std::size_t kProsperoMaxDllOverrideBytes = 256;
 constexpr std::size_t kProsperoMaxArgumentWords = 32;
@@ -87,11 +89,27 @@ struct ProsperoProfileFeatures {
   bool input_touchpad = false;       // [input] mouse = touchpad (kit capability input-touchpad)
   bool input_keyboard_stick = false; // [input] keyboard_stick (kit capability input-keyboard-stick)
   bool runtime_version = false;      // [runtime] version = 1|2 (kit capability profile-version-2)
+  bool long_arguments = false;       // arguments up to 4096 bytes, a profile up to 16384 (launch-arguments-4096)
 };
 // A [debug] env variable the runtime takes: PW_, DXVK_, MESA_, GALLIUM_, ZINK_, RADV_ or VK_ names, without the ones
 // the title sets itself or the performance overlay owns.
 bool IsProsperoDebugEnvEntry(std::string_view name, std::string_view value);
 inline constexpr std::size_t kProsperoMaxDebugEnvEntries = 5;
+
+// vkd3d-proton's own variables, which neither profile section takes: Environment variables passes them through the
+// bottle's HKEY_CURRENT_USER\Environment (IsBottleEnvironmentEntry, game_settings.h).
+inline constexpr const char* kBottleEnvironmentNames[] = {
+    "VKD3D_CONFIG",          "VKD3D_DEBUG",          "VKD3D_DISABLE_EXTENSIONS",   "VKD3D_FEATURE_LEVEL",
+    "VKD3D_FRAME_RATE",      "VKD3D_LOG_FILE",       "VKD3D_SHADER_CACHE_PATH",    "VKD3D_SHADER_DEBUG",
+    "VKD3D_SHADER_MODEL",    "VKD3D_SWAPCHAIN_IMAGES", "VKD3D_SWAPCHAIN_LATENCY_FRAMES",
+    "VKD3D_SWAPCHAIN_PRESENT_MODE"};
+
+// The exact variables Playden itself sets or documents: its rows (CPU cores: WINE_CPU_TOPOLOGY, Frame limit:
+// DXVK_FRAME_RATE), what a generated recipe writes (MESA_EXTENSION_MAX_YEAR), the runtime switch it documents
+// (PW_MEDIA_DISABLE) and vkd3d-proton's (kBottleEnvironmentNames). The profile and Environment variables still take
+// the broader families above for a player's own values; a community recipe may set only these, less the variables that
+// take a path (VKD3D_LOG_FILE, VKD3D_SHADER_CACHE_PATH).
+bool IsPlaydenEnvironmentVariable(std::string_view name);
 bool CheckProsperoProfile(std::string_view text, std::string* reason, ProsperoProfileFeatures features = {});
 
 std::string ProsperoProfileId(std::uint32_t app_id);

@@ -1871,7 +1871,12 @@ void live_storage_section_and_installed_games() {
     std::vector<std::string> library;
     for (const auto& row : model.view().rows) if (row.section == "Library") library.push_back(row.key);
     check(library == std::vector<std::string>{"settings-import", "settings-title-store", "settings-cloud-saves"},
-          "Library starts with Import games, then the store name and Cloud saves rows");
+          "Library starts with Import games, then its toggles");
+    std::vector<std::string> community;
+    for (const auto& row : model.view().rows) if (row.section == "Community") community.push_back(row.key);
+    check(community == std::vector<std::string>{"settings-ask-after-games", "settings-recipe-votes", "settings-share-as", "settings-account-link",
+                                                "settings-sharing-reset"},
+          "Community holds the feedback toggle, the Playden account and Reset sharing ID");
     check(find_row(model, "settings-storage")->action == "storage-picker", "Games storage opens the drive picker");
     std::vector<std::string> order;
     for (const auto& row : model.view().rows) if (row.section == "Storage") order.push_back(row.key);
@@ -1899,9 +1904,9 @@ void live_storage_section_and_installed_games() {
     std::vector<std::string> sections;
     for (const auto& row : model.view().rows)
         if (sections.empty() || sections.back() != row.section) sections.push_back(row.section);
-    check(sections == std::vector<std::string>{"Account", "Library", "Storage", "Downloads", "Display", "Updates", "Web access",
-                                                  "About", "Quit Playden"},
-          "the rail order is Account, Library, Storage, Downloads, Display, Updates, Web access, About, Quit");
+    check(sections == std::vector<std::string>{"Account", "Library", "Community", "Storage", "Downloads", "Display", "Updates",
+                                                  "Web access", "About", "Quit Playden"},
+          "the rail order is Account, Library, Community, Storage, Downloads, Display, Updates, Web access, About, Quit");
     // Web access: on by default; the address and its QR once the server reports them; the reason when it can't open.
     check(find_row(model, "settings-web-access")->selected && model.ExportPreferences().web_access, "web access is on by default");
     check(!find_row(model, "settings-web-address"), "no address before the server reports one");

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <optional>
@@ -136,6 +137,32 @@ std::vector<std::uint32_t> Sorted(std::vector<std::uint32_t> values) {
   return values;
 }
 
+// False when an action set this setup doesn't name may still be there: the emulator would still report a Steam Input
+// controller.
+bool RemoveStaleActionSets(const fs::path& controller, const std::vector<std::pair<std::string, std::string>>& sets) {
+  std::error_code error;
+  const auto folder = fs::symlink_status(controller, error);
+  if (error) return error == std::errc::no_such_file_or_directory;
+  if (!fs::is_directory(folder)) return true;
+  std::vector<fs::path> stale;
+  for (fs::directory_iterator it(controller, error), last; !error && it != last; it.increment(error)) {
+    const auto name = it->path().filename().string();
+    if (name.size() <= 4 || Lower(name.substr(name.size() - 4)) != ".txt") continue;
+    std::error_code entry_error;
+    const auto status = it->symlink_status(entry_error);
+    if (entry_error) return false;
+    if (!fs::is_regular_file(status)) continue;
+    const auto set = name.substr(0, name.size() - 4);
+    if (std::none_of(sets.begin(), sets.end(), [&](const auto& kept) { return kept.first == set; }))
+      stale.push_back(it->path());
+  }
+  if (error) return false;
+  for (const auto& path : stale)
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) return false;
+  ::rmdir(controller.c_str());  // only when empty
+  return true;
+}
+
 bool WriteSettings(const fs::path& folder, const SteamworksIdentity& identity, const std::string& original) {
   const auto settings = folder / "steam_settings";
   if (!EnsureFolder(settings)) return false;
@@ -146,6 +173,10 @@ bool WriteSettings(const fs::path& folder, const SteamworksIdentity& identity, c
   if (!WriteAtomic(settings / "steam_appid.txt", app)) return false;
   if (identity.depots.empty()) ::unlink((settings / "depots.txt").c_str());
   else if (!WriteAtomic(settings / "depots.txt", Join(Sorted(identity.depots), "\n") + "\n")) return false;
+  // Other apps the account owns: the emulator's BIsSubscribedApp answers yes for them, and they stay out of the
+  // DLC list and the installed depots.
+  if (identity.owned_apps.empty()) ::unlink((settings / "owned_app_ids.txt").c_str());
+  else if (!WriteAtomic(settings / "owned_app_ids.txt", Join(Sorted(identity.owned_apps), "\n") + "\n")) return false;
   std::string account = identity.account_name;
   account.erase(std::remove_if(account.begin(), account.end(), [](char c) {
     return static_cast<unsigned char>(c) < 0x20 || c == '=' || c == '[' || c == ']';
@@ -164,6 +195,15 @@ bool WriteSettings(const fs::path& folder, const SteamworksIdentity& identity, c
   if (!WriteAtomic(settings / "configs.user.ini", user) || !WriteAtomic(settings / "configs.app.ini", apps) ||
       !WriteAtomic(settings / "configs.main.ini", main) || !WriteAtomic(settings / "supported_languages.txt", kLanguages))
     return false;
+  const auto controller = settings / "controller";
+  // Action sets an earlier setup wrote and this one doesn't: a game set up with a map now left out (Euro Truck
+  // Simulator 2) gets its controller back only once the emulator has no action set left.
+  if (!RemoveStaleActionSets(controller, identity.steam_input_sets)) return false;
+  if (!identity.steam_input_sets.empty()) {
+    if (!EnsureFolder(controller)) return false;
+    for (const auto& [name, text] : identity.steam_input_sets)
+      if (!WriteAtomic(controller / (name + ".txt"), text)) return false;
+  }
   const auto interfaces = SteamInterfaces(original);
   if (interfaces.empty()) return true;  // keep a hand-supplied file, if any
   std::string text;
@@ -224,8 +264,14 @@ fs::path OriginalFor(const fs::path& root, const std::vector<std::string>& found
 }  // namespace
 
 std::vector<std::string> RetiredSteamApiSha256() {
-  return {"4cc9dfcab8b4df0db507fa91d0acec6e58693fd4edd78dc80d39bda8072d08ed",   // 2026-10-07, 32-bit
-          "513430ac8b869b0eed258d9e5feba5176a35446b3b61a63d01ab1d87683cdd1b"};  // 2026-10-07, 64-bit
+  return {"4635ee7b204af05b2e6fb2b05c5b884080218e18f3954e95f84d40e51a0e4ae7",   // owned_app_ids test build (7100368e), 32-bit
+          "a87257fa603f14f172e14c995b55b1c7f69e0fefda0754cc66a3b76a15d1db63",   // owned_app_ids test build (7100368e), 64-bit
+          "4007fdef3062f8fa194c64d2286ab4e3d72ca1be189657a3b1a4da8f04f33bbb",   // Steam Input callbacks (509fcb90), 32-bit
+          "3c46a4b109a1bd03a2d0255d1cc0e6e72608d4f67d621227701af4d8ad3d5ba9",   // Steam Input callbacks (509fcb90), 64-bit
+          "4cc9dfcab8b4df0db507fa91d0acec6e58693fd4edd78dc80d39bda8072d08ed",   // 2026-10-07, 32-bit
+          "513430ac8b869b0eed258d9e5feba5176a35446b3b61a63d01ab1d87683cdd1b",   // 2026-10-07, 64-bit
+          "cae4372bceda997d6c73cebc1c14eb27d39b74a7999d8f28384bdfd8d746a79c",   // release-2026_09_27, 32-bit
+          "70d9826a402d3a78b0c07e9f7ea7c6832468a1113013f31ea570fccaa5445ea9"};  // release-2026_09_27, 64-bit
 }
 
 std::vector<std::string> FindSteamApi(const std::string& install_root) {
@@ -462,28 +508,33 @@ SteamworksResult RestoreSteamworks(const std::string& install_root, const std::v
 }
 
 std::string SerializeSteamworksFacts(const std::vector<std::uint32_t>& depots, const std::vector<std::uint32_t>& owned_dlc,
-                                     const std::string& language, const std::vector<std::uint32_t>& excluded_dlc) {
+                                     const std::string& language, const std::vector<std::uint32_t>& excluded_dlc,
+                                     const std::vector<std::uint32_t>& owned_apps, std::uint64_t owned_apps_account) {
   std::string text = "depots=" + Join(Sorted(depots), ",") + "\ndlc=" + Join(Sorted(owned_dlc), ",") + "\n";
   // The language the depots were installed for. Older files have no line and read as English,
   // which is what they were installed in.
   if (!language.empty() && language != std::string(steam::kDefaultContentLanguage))
     text += "language=" + language + "\n";
   if (!excluded_dlc.empty()) text += "nodlc=" + Join(Sorted(excluded_dlc), ",") + "\n";
+  if (!owned_apps.empty())
+    text += "apps=" + Join(Sorted(owned_apps), ",") + "\napps_account=" + std::to_string(owned_apps_account) + "\n";
   return text;
 }
 
 bool WriteSteamworksFacts(const std::string& install_root, const std::vector<std::uint32_t>& depots,
                           const std::vector<std::uint32_t>& owned_dlc, const std::string& language,
-                          const std::vector<std::uint32_t>& excluded_dlc) {
+                          const std::vector<std::uint32_t>& excluded_dlc,
+                          const std::vector<std::uint32_t>& owned_apps, std::uint64_t owned_apps_account) {
   return WriteAtomic(fs::path(install_root) / kSteamworksFactsFile,
-                     SerializeSteamworksFacts(depots, owned_dlc, language, excluded_dlc));
+                     SerializeSteamworksFacts(depots, owned_dlc, language, excluded_dlc, owned_apps, owned_apps_account));
 }
 
 bool ReadSteamworksFacts(const std::string& install_root, SteamworksIdentity* identity) {
   const auto text = ReadFile(fs::path(install_root) / kSteamworksFactsFile, 64 * 1024);
   if (!text) return false;
-  std::vector<std::uint32_t> depots, dlc, excluded;
+  std::vector<std::uint32_t> depots, dlc, excluded, apps;
   std::string language;
+  std::uint64_t apps_account = 0;
   std::size_t start = 0;
   while (start < text->size()) {
     auto end = text->find('\n', start);
@@ -499,9 +550,20 @@ bool ReadSteamworksFacts(const std::string& install_root, SteamworksIdentity* id
       if (steam::IsContentLanguage(value)) language = value;
       continue;
     }
+    if (line.compare(0, equals, "apps_account") == 0) {
+      const auto value = line.substr(equals + 1);
+      if (value.empty() || value.size() > 20 || !std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return false;
+      errno = 0;
+      const auto parsed = std::strtoull(value.c_str(), nullptr, 10);
+      if (errno == ERANGE) return false;
+      apps_account = parsed;
+      continue;
+    }
     auto* target = line.compare(0, equals, "depots") == 0 ? &depots
                    : line.compare(0, equals, "dlc") == 0  ? &dlc
                    : line.compare(0, equals, "nodlc") == 0 ? &excluded
+                   : line.compare(0, equals, "apps") == 0  ? &apps
                                                             : nullptr;
     if (!target) continue;
     std::size_t at = equals + 1;
@@ -521,6 +583,8 @@ bool ReadSteamworksFacts(const std::string& install_root, SteamworksIdentity* id
   identity->depots = std::move(depots);
   identity->owned_dlc = std::move(dlc);
   identity->excluded_dlc = std::move(excluded);
+  identity->owned_apps = std::move(apps);
+  identity->owned_apps_account = apps_account;
   if (!language.empty()) identity->language = language;
   return true;
 }

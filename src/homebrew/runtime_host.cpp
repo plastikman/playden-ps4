@@ -3,13 +3,18 @@
 // SPDX-License-Identifier: MIT
 #include "homebrew/runtime_host.hpp"
 
+#include "homebrew/gog_icon.hpp"
 #include "pw_app_profile.h"
 #include "platform/usb_mount.h"
 #include "installs/install_record.h"
 
 #include "platform/random_id.h"
 #include "platform/storage.h"
+#include "runtime/artifact_hash.h"
+#include "runtime/community_rules.h"
+#include "runtime/kit_version.h"
 #include "runtime/private_directories.h"
+#include "runtime/recipe_choice.h"
 #include "runtime/prospero_profile.h"
 #include "runtime/settings_publication_journal.h"
 #include "runtime/dotnet_heap.h"
@@ -21,6 +26,7 @@
 #include "runtime/redist_install.h"
 #include "runtime/settings_publication_owner.h"
 #include "runtime/session_storage.h"
+#include "runtime/steam_input.h"
 #include "runtime/steam_stub.h"
 #include "runtime/steamworks.h"
 #include "runtime/self_heal.h"
@@ -69,9 +75,11 @@ class UnavailablePackageInstaller final : public rt::PackageInstaller {
 
 constexpr int kMaxPreparationSteps = 64;
 // A pending launch is polled at this interval, and Handoff trusts a preflight
-// the worker made at most this long ago.
+// the worker made at most this long ago: the handoff can come several seconds after
+// the check (a Play that first updated the runtime, a game on a slow drive), and an
+// older check made Play fail as "native launch capability is unavailable".
 constexpr auto kLaunchPollInterval = std::chrono::seconds(2);
-constexpr std::int64_t kPreflightFreshMs = 5000;
+constexpr std::int64_t kPreflightFreshMs = 30000;
 // The console's process list could not show whether the title runs (the reason is in
 // runtime.log). Closing the game cannot help when no game runs; a restart usually does.
 constexpr char kActivityUnknown[] =
@@ -96,14 +104,6 @@ GameId GameOf(const GameId& game, std::uint32_t runtime_number) {
 GameId GameOf(const rt::RuntimeInstall& record) { return GameOf(record.game, record.runtime_number); }
 // The game a request names.
 GameId GameOf(const RuntimePrepareRequest& request) { return GameOf(request.game, request.runtime_number); }
-// Whether a recipe is the record's game's: the same game (Steam: the app ID) and runtime number.
-// A record copy that doesn't carry its game (read back from a journal) relies on the number, which
-// the repository keeps to one game.
-bool RecipeFits(const rt::GameRecipe& recipe, const rt::RuntimeInstall& record) {
-  if (recipe.app_id != record.runtime_number) return false;
-  return record.game == GameId{} || rt::RecipeGame(recipe) == record.game;
-}
-
 // Why the kit cannot run a recipe Playden ships (its requirements), for the player; empty when it
 // can. The kit's own recipe is skipped: the kit's packager checked its template against it.
 std::string KitLacksForRecipe(const rt::GameRecipe& recipe, const rt::VerifiedKitView& kit) {
@@ -112,6 +112,21 @@ std::string KitLacksForRecipe(const rt::GameRecipe& recipe, const rt::VerifiedKi
   return unmet.empty() ? std::string()
                        : "The installed runtime kit lacks what this game needs (" + unmet + "); install a newer runtime kit.";
 }
+
+// Whether a record names a community recipe the installer may resolve (FilesystemPackageInstaller::AcceptRecipes)
+// whether or not the recipe's object is still cached, so a game whose recipe left the cache stays inspectable and
+// removable. Only the id's shape counts: an id of at most 64 bytes or the alias of a longer one (InstalledRecipeId). A
+// record may name another game's recipe its settings no longer name (a choice changed since), and that record must
+// still inspect and switch. The game check is where a plan or a publication is built: only from a loaded, hash-checked
+// object whose game is the game's own or one its settings name, bound to the game (RuntimeHost::CommunityOf,
+// SelectRecipeFor, CommunityRecipeAllowed).
+bool CommunityRecipeNamesGame(const rt::RuntimeInstall& record) {
+  return rt::IsInstalledCommunityRecipeId(record.recipe_id) && rt::IsCommunityRevisionPrefix(record.recipe_version);
+}
+
+// Private runtime state files, one per game or install.
+std::string GeneratedRecipeFile(const std::string& recipe_id) { return "recipe-" + recipe_id + ".json"; }
+std::string RecipeRegistryFile(const std::string& install_id) { return "recipe-registry-" + install_id + ".json"; }
 
 // Staged, its registration submitted, and only waiting for ShadowMountPlus, which
 // registers titles once no title runs: the game is ready to play from Home. A
@@ -329,8 +344,21 @@ struct RuntimeHost::Composition {
   std::unique_ptr<rt::RuntimeInstallService> service;
   std::filesystem::path request_directory;
   std::map<std::string, std::string> admission;  // install id -> last admission diagnostic
+  // The recipes Playden ships and the ones it generated (never community recipes).
   std::vector<rt::GameRecipe> recipes;
+  // Community recipes loaded from the cache this session, by full revision; their recipe.revision is
+  // set. Pointers into the map stay valid (RecipeForPrepare hands them out).
+  std::map<std::string, std::unique_ptr<rt::CommunityRecipe>> community;
+  // Those bound to an installed game (BindCommunityRecipe), by full revision and runtime number. Pointers stay valid.
+  std::map<std::pair<std::string, std::uint32_t>, std::unique_ptr<rt::CommunityRecipe>> bound_community;
+  // The community revisions whose registry values are in a bottle (RecipeRegistryStep), by install id,
+  // for RuntimeSnapshot::community_references.
+  std::map<std::string, std::string> registry_revisions;
+  // The installer above when it is the filesystem one (a kit was admitted), for RebindRecipe.
+  rt::FilesystemPackageInstaller* filesystem_installer = nullptr;
   std::vector<rt::SettingsPreset> presets;
+  // The player's presets found gone while resolving a record, so each is logged once.
+  std::set<std::string> gone_presets;
   std::string settings_data_reason;
   std::unique_ptr<rt::StorageLaunchSessionJournal> launch_journal;
   std::unique_ptr<rt::FilesystemReconcileSessionSource> sessions;
@@ -849,22 +877,50 @@ std::string RuntimeHost::SteamworksStep(const GameFiles& files, bool steam_accou
     if (!facts)
       Log("steamworks app=" + std::to_string(record.runtime_number) + " no download facts: no DLC or depots listed");
     // DLC the account owns that the download didn't record. They stay in the facts, so a start before the
-    // next license read still has them.
-    if (config_.owned_dlc) {
-      const auto listed = [](const std::vector<std::uint32_t>& ids, std::uint32_t id) {
-        return std::find(ids.begin(), ids.end(), id) != ids.end();
-      };
-      std::vector<std::uint32_t> added;
-      // DLC turned off at install stays out: the game would look for files that aren't there.
+    // next license read (or offline) still has them.
+    const auto listed = [](const std::vector<std::uint32_t>& ids, std::uint32_t id) {
+      return std::find(ids.begin(), ids.end(), id) != ids.end();
+    };
+    std::vector<std::uint32_t> added_dlc;
+    // DLC turned off at install stays out: the game would look for files that aren't there.
+    if (config_.owned_dlc)
       for (const auto dlc : config_.owned_dlc(identity.steam_id, steam_app.app_id))
-        if (dlc != steam_app.app_id && !listed(identity.owned_dlc, dlc) && !listed(added, dlc) && !listed(identity.excluded_dlc, dlc))
-          added.push_back(dlc);
-      if (!added.empty()) {
-        identity.owned_dlc.insert(identity.owned_dlc.end(), added.begin(), added.end());
-        const bool kept = !facts || other_store ||
-                          rt::WriteSteamworksFacts(root.string(), identity.depots, identity.owned_dlc, identity.language, identity.excluded_dlc);
-        Log("steamworks app=" + std::to_string(record.runtime_number) + " owned dlc added=" + std::to_string(added.size()) +
-            " total=" + std::to_string(identity.owned_dlc.size()) + (kept ? "" : " facts=write-failed"));
+        if (dlc != steam_app.app_id && !listed(identity.owned_dlc, dlc) && !listed(added_dlc, dlc) &&
+            !listed(identity.excluded_dlc, dlc))
+          added_dlc.push_back(dlc);
+    identity.owned_dlc.insert(identity.owned_dlc.end(), added_dlc.begin(), added_dlc.end());
+    // The Source SDK Base apps the account owns: a license read of this account gives the whole list, which
+    // replaces the saved one (an app it no longer grants goes). Without one, the saved list stands for the
+    // account that saved it; another account gets none, and the saved list is kept for its own account.
+    auto saved_apps = identity.owned_apps;
+    std::sort(saved_apps.begin(), saved_apps.end());
+    const auto saved_account = identity.owned_apps_account;
+    bool apps_changed = false;
+    // No account (0) has no license read either.
+    const auto read = config_.owned_sdk_apps && identity.steam_id ? config_.owned_sdk_apps(identity.steam_id) : std::nullopt;
+    if (read) {
+      identity.owned_apps.clear();
+      for (const auto app : *read)
+        if (app != steam_app.app_id && !listed(identity.owned_apps, app)) identity.owned_apps.push_back(app);
+      std::sort(identity.owned_apps.begin(), identity.owned_apps.end());
+      identity.owned_apps_account = identity.owned_apps.empty() ? 0 : identity.steam_id;
+      apps_changed = saved_apps != identity.owned_apps || saved_account != identity.owned_apps_account;
+    } else if (identity.owned_apps_account != identity.steam_id) {
+      identity.owned_apps.clear();
+    }
+    if (!added_dlc.empty() || apps_changed) {
+      const bool kept = !facts || other_store ||
+                        rt::WriteSteamworksFacts(root.string(), identity.depots, identity.owned_dlc, identity.language,
+                                                 identity.excluded_dlc, apps_changed ? identity.owned_apps : saved_apps,
+                                                 apps_changed ? identity.owned_apps_account : saved_account);
+      const std::string failed = kept ? "" : " facts=write-failed";
+      if (!added_dlc.empty())
+        Log("steamworks app=" + std::to_string(record.runtime_number) + " owned dlc added=" + std::to_string(added_dlc.size()) +
+            " total=" + std::to_string(identity.owned_dlc.size()) + failed);
+      if (apps_changed) {
+        std::string ids;
+        for (const auto app : identity.owned_apps) ids += (ids.empty() ? "" : ",") + std::to_string(app);
+        Log("steamworks app=" + std::to_string(record.runtime_number) + " owned sdk apps=" + (ids.empty() ? "-" : ids) + failed);
       }
     }
     const auto emulator = config_.steamworks_dir.empty() ? config_.runtime_dir + "/steamworks" : config_.steamworks_dir;
@@ -872,6 +928,25 @@ std::string RuntimeHost::SteamworksStep(const GameFiles& files, bool steam_accou
     // the game's lack of one, so a later app ID in Game settings still reaches the emulator.
     identity.write_game_appid_file = !other_store;
     identity.steam_api_copies = *files.steam_api_copies;
+    // Game settings › Steam Input: Automatic leaves out a map that loses a stick or trigger, Steam Input keeps it,
+    // Game's own gives none. No sets also takes away the files an earlier start wrote.
+    const auto steam_input = files.settings.values.at("steam_input").value;
+    std::vector<std::string> lost_actions;
+    if (steam_input != "off")
+      for (auto& set : rt::SteamInputActionSets(root.string(), &lost_actions, steam_input == "on"))
+        identity.steam_input_sets.emplace_back(set.name, set.text);
+    if (steam_input == "off") {
+      Log("steamworks app=" + std::to_string(record.runtime_number) + " steam input off: settings");
+    } else if (!identity.steam_input_sets.empty()) {
+      Log("steamworks app=" + std::to_string(record.runtime_number) +
+          " steam input action sets=" + std::to_string(identity.steam_input_sets.size()) +
+          (lost_actions.empty() ? std::string() : " lost=" + std::to_string(lost_actions.size()) + " kept=settings"));
+    } else if (!lost_actions.empty()) {
+      std::string lost;
+      for (std::size_t i = 0; i < lost_actions.size() && i < 4; ++i) lost += (i ? "," : "") + lost_actions[i];
+      Log("steamworks app=" + std::to_string(record.runtime_number) + " steam input map left out: lost=" +
+          std::to_string(lost_actions.size()) + " " + lost + (lost_actions.size() > 4 ? ",..." : ""));
+    }
     result = rt::EmulateSteamworks(root.string(), emulator, identity);
   } else {
     result = rt::RestoreSteamworks(root.string(), rt::RetiredSteamApiSha256(), *files.steam_api_copies);
@@ -1159,15 +1234,57 @@ void RuntimeHost::MfcStep(const GameFiles& files) {
 }
 
 // Generic step: registry values the recipe carries (docs/community-recipes.md), written the way an install
-// script's are.
-std::string RuntimeHost::RecipeRegistryStep(const GameFiles& files) {
-  const auto& registry = files.recipe->registry;
-  if (registry.empty()) return {};
+// script's are. What was written is tracked per install (runtime::RecipeRegistryState in the private runtime
+// state), so another recipe (a switch, or Playden's own after a community recipe) first removes the values the
+// earlier one wrote that it doesn't set; the game's own values are never touched, and a value the recipe owns is
+// written again even when the game changed it. Each run reconciles the bottle with the file, so an interrupted
+// switch finishes on the next preparation.
+std::string RuntimeHost::RecipeRegistryStep(Composition& c, const GameFiles& files) {
+  const auto file = RecipeRegistryFile(files.record.install_id);
+  std::optional<rt::RecipeRegistryState> previous;
+  if (const auto bytes = c.storage.Read(file, 64 * 1024); bytes.ok()) {
+    rt::RecipeRegistryState tracked;
+    std::string reason;
+    if (rt::ParseRecipeRegistryState(std::string(bytes.value().begin(), bytes.value().end()), &tracked, &reason))
+      previous = std::move(tracked);
+    else
+      Log("recipe registry state unreadable install=" + files.record.install_id + " " + reason);
+  }
+  rt::RecipeRegistryState next;
+  const auto values = rt::RecipeRegistryTransition(previous ? &*previous : nullptr, *files.recipe, &next);
+  if (values.empty() && !previous) return {};
+  // Tracked first, with everything the bottle may hold once the values are in: an interruption leaves a
+  // superset tracked, never a bottle holding values the file doesn't list.
+  if (!values.empty()) {
+    const auto interim = rt::SerializeRecipeRegistryState(rt::RecipeRegistryInterim(previous ? &*previous : nullptr, next));
+    const auto noted = c.storage.WriteAtomicPrivate(file, Bytes(interim.begin(), interim.end()));
+    if (!noted.ok()) {
+      Log("recipe registry state write failed install=" + files.record.install_id + " " + noted.message());
+      return "The recipe's registry values could not be recorded: " + noted.message() + ".";
+    }
+  }
   std::string reason;
-  const bool ok = rt::ApplyBottleRegistryValues(registry, files.prefix, config_.unix_time(), "user.reg", &reason);
-  Log("recipe registry app=" + std::to_string(files.record.runtime_number) + " values=" + std::to_string(registry.size()) +
-      (ok ? std::string() : " failed=" + reason));
+  const bool ok = values.empty() || rt::ApplyBottleRegistryValues(values, files.prefix, config_.unix_time(), "user.reg", &reason);
+  std::size_t removed = 0;
+  for (const auto& value : values) removed += value.data.empty();
+  Log("recipe registry app=" + std::to_string(files.record.runtime_number) + " recipe=" + files.recipe->id +
+      " values=" + std::to_string(values.size() - removed) + " removed=" + std::to_string(removed) +
+      (previous ? " after=" + previous->recipe_id : std::string()) + (ok ? std::string() : " failed=" + reason));
   if (!ok) return "The recipe's registry values could not be applied: " + reason + ".";
+  // The final file (just the recipe's own values) is written once the values are in.
+  if (next.values.empty()) {
+    c.storage.Remove(file);
+    c.registry_revisions.erase(files.record.install_id);
+    return {};
+  }
+  const auto text = rt::SerializeRecipeRegistryState(next);
+  const auto written = c.storage.WriteAtomicPrivate(file, Bytes(text.begin(), text.end()));
+  if (!written.ok()) {
+    Log("recipe registry state write failed install=" + files.record.install_id + " " + written.message());
+    return "The recipe's registry values could not be recorded: " + written.message() + ".";
+  }
+  if (next.revision.empty()) c.registry_revisions.erase(files.record.install_id);
+  else c.registry_revisions[files.record.install_id] = next.revision;
   return {};
 }
 
@@ -1220,8 +1337,7 @@ std::string RuntimeHost::DotnetHeapStep(const GameFiles& files) {
 std::string RuntimeHost::ApplyPreparationSteps(Composition& c, const rt::RuntimeInstall& record, bool steam_account_known) {
   MediaStep(c, record);
   GameFiles files{record};
-  for (const auto& candidate : c.recipes)
-    if (RecipeFits(candidate, record) && candidate.id == record.recipe_id) files.recipe = &candidate;
+  files.recipe = RecipeOf(c, record);
   if (!files.recipe) return {};  // publication reports the missing recipe
   files.ini = &files.recipe->ini;
   files.steam_api_copies = &files.recipe->steam_api_copies;
@@ -1235,10 +1351,8 @@ std::string RuntimeHost::ApplyPreparationSteps(Composition& c, const rt::Runtime
         files.game_files_recipe = &candidate;
       }
   files.saved = config_.settings_record ? config_.settings_record(GameOf(record)) : std::nullopt;
-  const rt::SettingsPreset* preset = nullptr;
-  if (files.saved)
-    for (const auto& candidate : c.presets)
-      if (candidate.id == files.saved->preset_id) preset = &candidate;
+  const auto resolved = files.saved ? RecordPreset(c, &*files.saved) : std::nullopt;
+  const rt::SettingsPreset* preset = resolved ? &*resolved : nullptr;
   rt::SettingsError error;
   static const std::map<std::string, std::string> none;
   const auto kit = TitleKit(c, record);
@@ -1270,7 +1384,7 @@ std::string RuntimeHost::ApplyPreparationSteps(Composition& c, const rt::Runtime
   MfcStep(files);
   // After the redistributables (install scripts, MFC): one that writes an older runtime key doesn't stay.
   VcRuntimeStep(files);
-  if (auto refused = RecipeRegistryStep(files); !refused.empty()) return refused;
+  if (auto refused = RecipeRegistryStep(c, files); !refused.empty()) return refused;
   if (auto refused = RecipeIniStep(files); !refused.empty()) return refused;
   if (auto refused = RecipeFilesStep(files); !refused.empty()) return refused;
   return DotnetHeapStep(files);
@@ -1550,11 +1664,13 @@ static bool ArtifactsBound(const auto& kit_artifacts, const rt::RuntimeInstall& 
 }
 
 void RuntimeHost::PublishInstalls(const Composition& composition, const std::string& only) {
-  std::map<std::string, std::tuple<bool, bool, bool>> checked;  // title_current, runtime_current, setup_other_kit
+  // title_current, runtime_current, setup_other_kit, title_icon_current, title_icon_file
+  std::map<std::string, std::tuple<bool, bool, bool, bool, std::string>> checked;
   if (!only.empty()) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& view : snapshot_.installs)
-      checked[view.install_id] = {view.title_current, view.runtime_current, view.setup_other_kit};
+      checked[view.install_id] = {view.title_current, view.runtime_current, view.setup_other_kit, view.title_icon_current,
+                                  view.title_icon_file};
   }
   std::vector<RuntimeInstallView> installs;
   for (const auto& record : composition.repository.Snapshot()) {
@@ -1574,11 +1690,15 @@ void RuntimeHost::PublishInstalls(const Composition& composition, const std::str
       view.failure_code = record.last_failure->code;
     }
     if (const auto kept = checked.find(record.install_id); !only.empty() && record.install_id != only && kept != checked.end()) {
-      std::tie(view.title_current, view.runtime_current, view.setup_other_kit) = kept->second;
+      std::tie(view.title_current, view.runtime_current, view.setup_other_kit, view.title_icon_current,
+               view.title_icon_file) = kept->second;
     } else if (record.state == rt::PreparationState::kReady && composition.kit) {
       const bool files_current = composition.installer->TitleCurrent(record);
       view.title_current = files_current && composition.installer->TitleMetadataCurrent(record) && TitleNameCurrent(record) &&
                            TitleVariableRefreshCurrent(composition, record);
+      const auto icon_file = GameIconFile(record);
+      if (!icon_file.empty()) view.title_icon_file = record.install_path + "/" + icon_file;
+      view.title_icon_current = TitleIconCurrent(composition, record, icon_file);
       view.runtime_current = files_current && ArtifactsBound(composition.kit->view.artifacts, record);
     } else if (composition.kit && SetupRestarts(record) && !view.moving) {
       view.setup_other_kit = composition.installer->SetupFromOtherKit(record);
@@ -1591,6 +1711,8 @@ void RuntimeHost::PublishInstalls(const Composition& composition, const std::str
     view.launch_path = record.launch_path;
     view.launch_working_directory = record.launch_working_directory;
     view.launch_in_install_root = record.launch_in_install_root;
+    view.recipe_id = record.recipe_id;
+    view.recipe_version = record.recipe_version;
     std::error_code error;
     for (std::filesystem::directory_iterator it(SaveBackupRoot(record.install_id), error), end; !error && it != end;
          it.increment(error)) {
@@ -1607,6 +1729,7 @@ void RuntimeHost::PublishInstalls(const Composition& composition, const std::str
     s.installs_known = known;
   });
   PublishPrepared(&composition);
+  PublishCommunityReferences(composition);
 }
 
 bool RuntimeHost::TitleRuntimeCurrent(const Composition& c, const rt::RuntimeInstall& record) const {
@@ -1633,11 +1756,23 @@ static std::string WorkingFolder(const std::string& working, std::string program
   return slash == std::string::npos ? std::string() : program.substr(0, slash);
 }
 
-// next starts as the install record: it comes back naming the program and folder the settings choose,
-// checked on disk; the recipe stays the one the game was prepared with. Empty, or why not (for the player).
+std::optional<rt::SettingsPreset> RuntimeHost::RecordPreset(Composition& c, rt::GameSettingsRecord* record) {
+  std::vector<rt::MyPreset> mine;
+  if (record && rt::IsMyPresetId(record->preset_id) && config_.my_presets) mine = config_.my_presets();
+  const auto wanted = record ? record->preset_id : std::string();
+  bool gone = false;
+  auto preset = rt::ResolveRecordPreset(c.presets, mine, record, &gone);
+  if (gone && c.gone_presets.insert(wanted).second)
+    Log("settings preset " + wanted + " is gone: the game plays as Playden default with its own changes");
+  return preset;
+}
+
+// next starts as the install record: it comes back naming the program and folder the settings (and, in a recipe
+// switch, the new recipe) choose, checked on disk. The caller sets the recipe the record names. Empty, or why not
+// (for the player).
 std::string RuntimeHost::FollowChosenLaunch(const rt::GameRecipe& recipe, const rt::SettingsPreset* preset,
                                             const rt::KitCapabilities& kit, const rt::GameSettingsRecord& saved,
-                                            rt::RuntimeInstall* next) {
+                                            rt::RuntimeInstall* next, bool recipe_switch) {
   const auto record = *next;
   rt::EffectiveSettings desired;
   rt::SettingsError ignored;
@@ -1654,7 +1789,8 @@ std::string RuntimeHost::FollowChosenLaunch(const rt::GameRecipe& recipe, const 
       const auto root = HostPath(record.install_path).string();
       const auto architecture = rt::GameProgramArchitecture(root, launch.executable);
       if (architecture.empty())
-        return "The program " + launch.executable + " chosen in Game settings is missing or not a Windows program.";
+        return "The program " + launch.executable + (recipe_switch ? " the recipe starts" : " chosen in Game settings") +
+               " is missing or not a Windows program.";
       if (const auto refusal = rt::GameProgramRefusal(root, launch.executable, kit, rt::RecipeChoicesFrom(saved).try_anyway);
           !refusal.empty())
         return refusal;
@@ -1678,10 +1814,11 @@ std::string RuntimeHost::FollowChosenLaunch(const rt::GameRecipe& recipe, const 
       next->launch_path = launch.executable;
       next->launch_working_directory = launch.working_directory == "." ? std::string() : launch.working_directory;
       next->launch_in_install_root = launch.in_install_root && next->launch_working_directory.empty();
-      // The recipe stays the one the game was prepared with: its graphics and engine arguments
-      // came from the first program's files, and only a preparation sees Steam's launch options.
+      // Without a recipe switch, the recipe stays the one the game was prepared with: its graphics and
+      // engine arguments came from the first program's files, and only a preparation sees Steam's
+      // launch options.
       Log("program switch app=" + std::to_string(record.runtime_number) + " from=" + record.launch_entry_id + ":" +
-          record.launch_path + " to=" + next->launch_entry_id + ":" + next->launch_path + " recipe kept=" + record.recipe_id);
+          record.launch_path + " to=" + next->launch_entry_id + ":" + next->launch_path + " recipe=" + recipe.id);
     }
   }
   return {};
@@ -1708,17 +1845,15 @@ rt::PackageActionResult RuntimeHost::DrivePublication(Composition& c, const rt::
   }
   if (!c.kit) return failed("kit-unavailable", "No verified runtime kit is installed.");
 
-  const rt::GameRecipe* recipe = nullptr;
-  for (const auto& candidate : c.recipes)
-    if (RecipeFits(candidate, record) && candidate.id == record.recipe_id) recipe = &candidate;
+  const rt::GameRecipe* recipe = RecipeOf(c, record);
   if (!recipe) return failed("recipe-unavailable", "Playden no longer knows how to start this game; prepare it again.");
   rt::SettingsLaunchInput input;
   input.recipe = recipe;
   input.record = config_.settings_record
                      ? config_.settings_record(GameOf(record)).value_or(rt::GameSettingsRecord{})
                                          : rt::GameSettingsRecord{};
-  for (const auto& preset : c.presets)
-    if (preset.id == input.record.preset_id) input.preset = &preset;
+  const auto resolved = RecordPreset(c, &input.record);
+  input.preset = resolved ? &*resolved : nullptr;
   input.kit = TitleKit(c, record);
   input.target = {record.default_profile_id, record.install_path, UsbSearchRoot(c, record)};
   input.runtime_dir = config_.runtime_dir;
@@ -2030,11 +2165,16 @@ std::string RuntimeHost::RepublishSettings(Composition& c, const rt::RuntimeInst
   if (code) code->clear();
   if (prepare_again) *prepare_again = false;
   if (upgrade_deferred) upgrade_deferred->clear();
-  // A recipe this kit cannot run is refused before the game's files or bottle change.
-  if (c.kit)
-    for (const auto& candidate : c.recipes)
-      if (RecipeFits(candidate, record) && candidate.id == record.recipe_id)
-        if (const auto lacks = KitLacksForRecipe(candidate, c.kit->view); !lacks.empty()) return lacks;
+  // A recipe this kit cannot run is refused before the game's files or bottle change: a shipped
+  // recipe's requirements, a community recipe's requirements and min_kit (for the title's runtime).
+  if (c.kit) {
+    if (const auto* community = CommunityOf(c, record)) {
+      if (const auto lacks = rt::CommunityRecipeFits(*community, c.kit->view, TitleKitVersion(c, &record)); !lacks.empty())
+        return lacks;
+    } else if (const auto* recipe = RecipeOf(c, record)) {
+      if (const auto lacks = KitLacksForRecipe(*recipe, c.kit->view); !lacks.empty()) return lacks;
+    }
+  }
   // Only the unowned upgrade of a game that did not move, with no newer settings: the game
   // played under its owned publication, which stays when the upgrade fails. A forced publication
   // (another runtime) reports its refusal instead.
@@ -2119,22 +2259,64 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   // once a copy on another drive would make the title refuse.
   const bool unowned_upgrade = !moved && (NeedsUnownedPublication(c, record) || NeedsDrivePublication(c, record));
   if (unowned_upgrade) Log("settings update app=" + std::to_string(record.runtime_number) + " publishes the game folder unowned");
-  // "Steam features" only swaps the game's own files, so it follows the saved value at once.
-  if (!force && setup_program.empty() && !restoring && saved.revision <= record.settings_revision && !moved &&
-      !unowned_upgrade)
-    return ApplyPreparationSteps(c, record, steam_account_known);
+  // The recipe the title plays under (applied), and the one the player wants now. They differ after
+  // the player chose a community recipe, another revision of it, or Playden's own recipe again: the
+  // switch is this publication, built from the new recipe, and the record names it only once the
+  // publication commits. A wanted recipe the kit (or the title's older runtime) can't run, or whose
+  // object the cache lost, never replaces the applied one: the game keeps playing as before and the
+  // sheet shows why (RuntimeSnapshot::recipe_fallbacks). Decided on every call, so a choice that fell
+  // back once is switched to by the next Play, Apply settings or Update once its object is cached or
+  // the kit fits, whatever the settings revision.
+  const bool applied_is_community = rt::IsInstalledCommunityRecipeId(record.recipe_id);
+  const rt::GameRecipe* applied = RecipeOf(c, record);
+  const rt::GameRecipe* recipe = applied;
+  rt::RecipeSelection selection;
+  bool switching = false;
+  std::string switch_failure;
+  if (c.kit) {
+    selection = SelectRecipeFor(c, GameOf(record), record.runtime_number, &record, saved);
+    if (selection.community) {
+      switching = rt::InstalledRecipeId(selection.recipe->id) != record.recipe_id ||
+                  rt::RecipeVersionTag(*selection.recipe) != record.recipe_version;
+      if (switching) recipe = selection.recipe;
+    } else if (applied_is_community && saved.community_recipe.id.empty()) {
+      // Back to Playden's own recipe: the shipped one, else the one generated when the game was prepared.
+      if (selection.recipe) { switching = true; recipe = selection.recipe; }
+      else switch_failure = "Playden has no recipe of its own for this game, so it keeps the community recipe.";
+    }
+    Publish([&](RuntimeSnapshot& s) {
+      if (selection.fallback_reason.empty()) s.recipe_fallbacks.erase(record.runtime_number);
+      else s.recipe_fallbacks[record.runtime_number] = selection.fallback_reason;
+      if (!switch_failure.empty()) s.recipe_switch_failures[record.runtime_number] = "The switch didn't finish: " + switch_failure;
+    });
+  }
+  // A refusal while switching is the switch not finishing: the game plays on with its applied recipe.
+  const auto refuse = [&](std::string message) {
+    if (switching)
+      Publish([&](RuntimeSnapshot& s) { s.recipe_switch_failures[record.runtime_number] = "The switch didn't finish: " + message; });
+    return message;
+  };
+  // The presets file can disappear, become unreadable, or be restored without changing the
+  // game's revision. Compare the resulting profile even at the same revision in that case.
+  const bool refresh_player_preset = rt::IsMyPresetId(saved.preset_id) && saved.revision == record.settings_revision;
+  // "Steam features" only swaps the game's own files, so it follows the saved value at once. So do the
+  // steps a recipe switch that committed did not get to (its registry values): once they are in, and
+  // the wanted recipe is the applied one, the switch is finished.
+  if (!force && !refresh_player_preset && !switching && setup_program.empty() && !restoring && saved.revision <= record.settings_revision && !moved && !unowned_upgrade) {
+    const auto steps = ApplyPreparationSteps(c, record, steam_account_known);
+    if (steps.empty() && selection.fallback_reason.empty() && switch_failure.empty())
+      Publish([&](RuntimeSnapshot& s) { s.recipe_switch_failures.erase(record.runtime_number); });
+    return steps;
+  }
   if (!c.kit) return "No verified runtime kit is installed.";
   if (saved.revision < record.settings_revision)
     return again("The game's saved settings are older than its PS5 title's; prepare it again.");
-  const rt::GameRecipe* recipe = nullptr;
-  for (const auto& candidate : c.recipes)
-    if (RecipeFits(candidate, record) && candidate.id == record.recipe_id &&
-        std::to_string(candidate.version) == record.recipe_version)
-      recipe = &candidate;
-  if (!recipe) return again("Playden no longer knows how to start this game; prepare it again.");
-  const rt::SettingsPreset* preset = nullptr;
-  for (const auto& candidate : c.presets)
-    if (candidate.id == saved.preset_id) preset = &candidate;
+  if (!recipe) return refuse(again("Playden no longer knows how to start this game; prepare it again."));
+  if (switching)
+    Log("recipe switch app=" + std::to_string(record.runtime_number) + " from=" + record.recipe_id + ":" + record.recipe_version +
+        " to=" + recipe->id + ":" + rt::RecipeVersionTag(*recipe));
+  const auto resolved = RecordPreset(c, &saved);
+  const rt::SettingsPreset* preset = resolved ? &*resolved : nullptr;
   // The run's buttons are the Mouse preset's (runtime/input/mouse.input): the recipe's and the settings preset's
   // bindings stay out of it, and the recipe's locks don't keep its program or controls.
   std::optional<rt::GameRecipe> run_recipe;
@@ -2166,15 +2348,23 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   // the install record names the new program when this publication commits (Reconcile), so a
   // crash in between resumes with it. Callers run this only while the game is stopped.
   auto next = record;
-  if (const auto refused = FollowChosenLaunch(*recipe, preset, kit, saved, &next); !refused.empty()) return refused;
+  if (const auto refused = FollowChosenLaunch(*recipe, preset, kit, saved, &next, switching); !refused.empty())
+    return refuse(refused);
+  // The publication carries the recipe it is built from; the record takes it at the commit (Reconcile,
+  // like the program above).
+  next.recipe_id = rt::InstalledRecipeId(recipe->id);
+  next.recipe_version = rt::RecipeVersionTag(*recipe);
   // An unowned folder is published as it is, so one made over FTP (root's, 0755) is opened up
   // before dxvk.conf is written into it, as preparation does.
   if (kit.game_root_unowned) {
     const auto working = WorkingFolder(next.launch_working_directory, next.launch_path, next.launch_in_install_root);
-    if (const auto unwritable = EnsureWritable(next.install_path, working); !unwritable.empty()) return unwritable;
+    if (const auto unwritable = EnsureWritable(next.install_path, working); !unwritable.empty()) return refuse(unwritable);
   }
-  // SteamStub unpacking and the Steam emulator follow the program that starts now.
-  if (const auto steamworks = ApplyPreparationSteps(c, next, steam_account_known); !steamworks.empty()) return steamworks;
+  // SteamStub unpacking and the Steam emulator follow the program that starts now. A recipe switch
+  // runs the steps after its publication commits instead, so a publication that fails leaves the
+  // bottle as the applied recipe had it.
+  if (!switching)
+    if (const auto steamworks = ApplyPreparationSteps(c, next, steam_account_known); !steamworks.empty()) return steamworks;
   rt::SettingsLaunchInput input;
   input.recipe = recipe;
   input.record = saved;
@@ -2200,15 +2390,16 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   std::string reason;
   if (!rt::BuildSettingsLaunchPlan(input, &plan, &reason)) {
     Log("settings update plan refused app=" + std::to_string(record.runtime_number) + ": " + reason);
-    return again("The settings could not be applied: " + reason);
+    return refuse(again("The settings could not be applied: " + reason));
   }
-  if (plan.app_id != record.runtime_number || plan.recipe_id != record.recipe_id || plan.recipe_version != record.recipe_version ||
+  if (plan.app_id != record.runtime_number || plan.recipe_id != next.recipe_id || plan.recipe_version != next.recipe_version ||
       plan.launch_entry_id != next.launch_entry_id || plan.profile_id != record.default_profile_id)
-    return again("The settings no longer match this game's PS5 title; prepare it again.");
+    return refuse(again("The settings no longer match this game's PS5 title; prepare it again."));
   // A forced publication runs only when the new runtime changes what the settings write (120 Hz output), so a
   // respin that changes nothing there keeps its publication, registration and bottle as they are.
-  // So is a program's run, or the return from one, that publishes what the title already has.
-  if (force || !setup_program.empty() || restoring) {
+  // So is a program's run, or the return from one, that publishes what the title already has. A recipe
+  // switch always publishes: its descriptor names the new recipe.
+  if ((force || refresh_player_preset || !setup_program.empty() || restoring) && !switching) {
     // POSIX reads, as elsewhere here: the PS5 libc++ has no locale support for file streams.
     const auto read = [](const std::filesystem::path& path) {
       std::string bytes;
@@ -2224,15 +2415,17 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
     const auto config = HostPath(record.install_path) / WorkingFolder(next.launch_working_directory, next.launch_path,
                                                                                  next.launch_in_install_root) /
                         "dxvk.conf";
-    if (read(profile) == plan.profile_bytes && read(config) == plan.dxvk_config)
-      return restoring ? MarkSetupProgram(c, record.install_id, {}) : std::string{};
+    if (read(profile) == plan.profile_bytes && read(config) == plan.dxvk_config) {
+      if (restoring) return MarkSetupProgram(c, record.install_id, {});
+      return refresh_player_preset ? ApplyPreparationSteps(c, record, steam_account_known) : std::string{};
+    }
   }
   // Recorded before the program's profile is published, so a publication cut off part way still gets the saved
   // settings back.
   if (!setup_program.empty())
     if (const auto marked = MarkSetupProgram(c, record.install_id, setup_program); !marked.empty()) return marked;
   const auto transaction = config_.uuid();
-  if (!transaction) return "No secure random source for the settings update.";
+  if (!transaction) return refuse("No secure random source for the settings update.");
   std::vector<std::filesystem::path> restored_folders;
   if (record.moved_from.empty())
     restored_folders = RestorePublishedFolder(HostPath(record.install_path),
@@ -2254,10 +2447,10 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
     // A later try would not know these were made for it.
     for (auto folder = restored_folders.rbegin(); folder != restored_folders.rend(); ++folder) rmdir(folder->c_str());
     if (code) *code = requested.code;
-    return "The settings could not be applied: " + requested.message;
+    return refuse("The settings could not be applied: " + requested.message);
   }
   const auto armed = c.records.Find(record.install_id);
-  if (!armed) return "The game's install record is missing.";
+  if (!armed) return refuse("The game's install record is missing.");
   const auto resumed = c.owner->ResumeRequested(*armed, c.request_directory, config_.host_namespace_prefix);
   Log("settings update resume app=" + std::to_string(record.runtime_number) + " state=" +
       std::to_string(static_cast<int>(resumed.state)) + " code=" + resumed.code + " message=" + resumed.message);
@@ -2282,10 +2475,21 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   // A failed update keeps its journal, so Play waits until Resume on the PS5 title finishes it.
   if (resumed.state != rt::PackageActionState::kComplete) {
     if (code) *code = resumed.code;
-    return "The settings could not be applied: " + resumed.message;
+    return refuse("The settings could not be applied: " + resumed.message);
   }
   if (published) *published = true;
   RemoveFinishedRequests(c);
+  if (switching) {
+    // The record names the new recipe now: the owner markers follow it, then the bottle and the game's
+    // files get what the new recipe asks for (its registry values, the earlier recipe's removed). A
+    // failure here leaves the switch unfinished; the next Play or Apply settings runs both again.
+    const auto current = c.records.Find(record.install_id);
+    if (!current) return refuse("The game's install record is missing.");
+    if (const auto rebound = RebindRecipeMarkers(c, *current); !rebound.empty()) return refuse(rebound);
+    if (const auto steps = ApplyPreparationSteps(c, *current, steam_account_known); !steps.empty()) return refuse(steps);
+    Publish([&](RuntimeSnapshot& s) { s.recipe_switch_failures.erase(record.runtime_number); });
+    PublishInstalls(c, record.install_id);
+  }
   if (const auto current = c.records.Find(record.install_id)) OpenGameFolders(c, *current);
   if (moved) FinishGamesMove(c);
   if (restoring) return MarkSetupProgram(c, record.install_id, {});
@@ -2741,8 +2945,9 @@ rt::LaunchEvidence RuntimeHost::Evidence(Composition& c, const rt::RuntimeInstal
   return evidence;
 }
 
-void RuntimeHost::PublishLaunch(Composition& c, const rt::LaunchSnapshot& launch) {
+void RuntimeHost::PublishLaunch(Composition& c, const rt::LaunchSnapshot& launch, std::optional<std::int64_t> played_seconds) {
   RuntimeLaunchView view;
+  view.played_seconds = played_seconds;
   view.install_id = launch.install_id;
   view.state = launch.state;
   view.code = launch.code;
@@ -2754,6 +2959,9 @@ void RuntimeHost::PublishLaunch(Composition& c, const rt::LaunchSnapshot& launch
     view.title_id = record->title_id;
   }
   Publish([&](RuntimeSnapshot& s) {
+    // The ended session's play time stays with it until another session starts.
+    if (!view.played_seconds && s.launch && s.launch->install_id == view.install_id && s.launch->state == view.state)
+      view.played_seconds = s.launch->played_seconds;
     s.handoff_ready = launch.state == rt::LaunchState::kReadyToHandoff;
     if (launch.state == rt::LaunchState::kIdle && launch.install_id.empty()) s.launch.reset();
     else s.launch = view;
@@ -2822,9 +3030,13 @@ void RuntimeHost::RunPlay(Composition& c, std::uint32_t app_id, const std::strin
           Log("play moved app=" + std::to_string(app_id) + " " + (settings.empty() ? "republished" : settings));
         }
       } else if (idle) {
-        RefreshGeneratedRecipeDefaults(c, *record);
-        const auto current = c.records.Find(record->install_id);
-        settings = current ? RepublishSettings(c, *current) : std::string("The game's install record is missing.");
+        // A recipe switch that committed but stopped before its markers followed finishes first.
+        settings = RebindRecipeMarkers(c, *record);
+        if (settings.empty()) {
+          RefreshGeneratedRecipeDefaults(c, *record);
+          const auto current = c.records.Find(record->install_id);
+          settings = current ? RepublishSettings(c, *current) : std::string("The game's install record is missing.");
+        }
       }
       // Saves the game wrote and FTP edits made since, once nothing of the bottle is held and
       // only when Play goes ahead: a refused Play changes no modes.
@@ -2861,8 +3073,10 @@ bool RuntimeHost::PollLaunch(Composition& c) {
     PublishLaunch(c, snapshot);
     return true;
   }
+  std::int64_t handoff_ms = 0;
   const bool pending = c.launch_journal && [&] {
     const auto loaded = c.launch_journal->LoadPending();
+    if (loaded.ok && loaded.session) handoff_ms = loaded.session->handoff_ms;
     return loaded.ok && loaded.session.has_value();
   }();
   if (pending && snapshot.state == rt::LaunchState::kFailed) {
@@ -2875,6 +3089,11 @@ bool RuntimeHost::PollLaunch(Composition& c) {
     }
   }
   if (pending && (snapshot.state == rt::LaunchState::kExited || snapshot.state == rt::LaunchState::kFailed)) {
+    // How long it played, for the feedback prompt: from the handoff to now (the end was seen now). A
+    // launch that failed counts too: a game that doesn't start is what "Did it start?" asks about.
+    std::optional<std::int64_t> played_seconds;
+    if (handoff_ms > 0)
+      if (const auto now = config_.now_ms(); now >= handoff_ms) played_seconds = (now - handoff_ms) / 1000;
     const auto finished = c.launch->Finish();
     // The saves the game just wrote are Wine's (0600): opened to FTP again.
     if (finished.accepted && c.kit && rt::KitCapabilitiesFromManifest(c.kit->capabilities, true).bottle_profile_shared)
@@ -2884,7 +3103,8 @@ bool RuntimeHost::PollLaunch(Composition& c) {
     Log("play finished install=" + snapshot.install_id + " session=" + snapshot.session_id + " state=" +
         std::to_string(static_cast<int>(snapshot.state)) + " code=" + snapshot.code + " exit=" +
         (snapshot.exit_code ? std::to_string(*snapshot.exit_code) : std::string("unknown")) +
-        " cleared=" + std::to_string(finished.accepted) + " " + finished.code);
+        " cleared=" + std::to_string(finished.accepted) + " " + finished.code +
+        (played_seconds ? " played_s=" + std::to_string(*played_seconds) : std::string()));
     // A program's run ended (one closed from the PS5 menu is seen only now, after a restart): the game's own
     // settings go back at once, so its Home tile starts the game again.
     if (finished.accepted)
@@ -2893,7 +3113,7 @@ bool RuntimeHost::PollLaunch(Composition& c) {
         const auto refused = RepublishSettings(c, *record, nullptr, false);
         if (!refused.empty()) Log("setup program app=" + std::to_string(record->runtime_number) + " kept: " + refused);
       }
-    PublishLaunch(c, snapshot);
+    PublishLaunch(c, snapshot, played_seconds);
     return !finished.accepted;
   }
   PublishLaunch(c, snapshot);
@@ -2979,6 +3199,20 @@ bool RuntimeHost::TitleNameCurrent(const rt::RuntimeInstall& record) const {
   return installed && *installed == wanted;
 }
 
+// The source recorded with a title's icon (PackageInstaller::TitleIconSource): the game's icon file, by name.
+static std::string IconSourceOf(const std::string& icon_file) { return icon_file.empty() ? std::string() : "file:" + icon_file; }
+
+std::string RuntimeHost::GameIconFile(const rt::RuntimeInstall& record) const {
+  if (record.install_path.empty()) return {};
+  return GogIconFile(HostPath(record.install_path).string(), record.launch_path);
+}
+
+bool RuntimeHost::TitleIconCurrent(const Composition& c, const rt::RuntimeInstall& record,
+                                   const std::string& icon_file) const {
+  const auto recorded = c.installer->TitleIconSource(record);
+  return recorded && *recorded == IconSourceOf(icon_file);
+}
+
 rt::PackageActionResult RuntimeHost::WriteTitleMetadata(Composition& c, const rt::RuntimeInstall& record,
                                                        const std::string& title_name) {
   const auto failed = [](std::string message) {
@@ -3029,20 +3263,26 @@ rt::PackageActionResult RuntimeHost::WriteTitleMetadata(Composition& c, const rt
     std::replace(launch.begin(), launch.end(), '\\', '/');
     program = HostPath(record.install_path) / launch;
   }
-  const auto icon = config_.title_icon ? config_.title_icon(GameOf(record), program) : std::nullopt;
+  // The game's own icon file, the same one its library poster shows (PublishInstalls).
+  const auto icon_file = GameIconFile(record);
+  const auto icon = config_.title_icon ? config_.title_icon(GameOf(record), program,
+                                                            icon_file.empty() ? std::filesystem::path()
+                                                                              : HostPath(record.install_path) / icon_file)
+                                       : std::nullopt;
   Log("title metadata app=" + std::to_string(record.runtime_number) + " name=" + name + " icon=" +
-      (icon ? std::to_string(icon->size()) + "B" : std::string("kit")) + " vrr=" + (variable_refresh ? "1" : "0"));
-  return c.installer->WriteTitleMetadata(record, param, icon);
+      (icon ? std::to_string(icon->size()) + "B" : std::string("kit")) + (icon_file.empty() ? "" : " icon-file=" + icon_file) +
+      " vrr=" + (variable_refresh ? "1" : "0"));
+  return c.installer->WriteTitleMetadata(record, param, icon, IconSourceOf(icon_file));
 }
 
-namespace {
-// Generated recipes live in the private runtime state, one file per game.
-std::string GeneratedRecipeFile(const std::string& recipe_id) { return "recipe-" + recipe_id + ".json"; }
-}  // namespace
+const rt::GameRecipe* RuntimeHost::ShippedRecipeFor(const Composition& c, const GameId& game,
+                                                   std::uint32_t runtime_number) const {
+  for (const auto& candidate : c.recipes)
+    if (rt::RecipeGame(candidate) == game && candidate.app_id == runtime_number && !rt::IsGeneratedRecipeId(candidate.id))
+      return &candidate;
+  return nullptr;
+}
 
-// The recipe a game is prepared with: Playden's shipped one, otherwise one generated
-// from Steam's launch options and saved so recovery and later settings changes use the
-// same launch entries. Returns null with the reason for the player.
 std::string RuntimeHost::RefreshChangedFiles(Composition& c, const RuntimePrepareRequest& request,
                                              const rt::RuntimeInstall& record) {
   const auto app = std::to_string(record.runtime_number);
@@ -3060,6 +3300,15 @@ std::string RuntimeHost::RefreshChangedFiles(Composition& c, const RuntimePrepar
       Log("files changed app=" + app + " recipe " + record.recipe_id + "/" + record.recipe_version + " became " + recipe->id +
           "/" + std::to_string(recipe->version));
       return std::string("This game's setup changed with its update.") + kRecreateHint;
+    }
+  } else if (const auto* community = CommunityOf(c, record);
+             community && rt::IsSettingsOnlyRecipe(*community) && !ShippedRecipeFor(c, GameOf(record), record.runtime_number)) {
+    // A settings-only recipe starts the program of Playden's generated recipe, which is made again from the new files
+    // as for a game that runs it; the recipe is bound to it again when the settings are published below.
+    std::string reason;
+    if (!GenerateRecipeForPrepare(c, request, &reason, false)) {
+      Log("files changed app=" + app + " generated recipe for the settings-only recipe refused: " + reason);
+      return reason;
     }
   }
   // Settings older than the title's can't be published over it (a forced publication skips them silently).
@@ -3082,12 +3331,257 @@ std::string RuntimeHost::RefreshChangedFiles(Composition& c, const RuntimePrepar
   return {};
 }
 
+const rt::GameRecipe* RuntimeHost::GeneratedRecipeFor(const Composition& c, const GameId& game,
+                                                     std::uint32_t runtime_number) const {
+  for (const auto& candidate : c.recipes)
+    if (rt::RecipeGame(candidate) == game && candidate.app_id == runtime_number && rt::IsGeneratedRecipeId(candidate.id))
+      return &candidate;
+  return nullptr;
+}
+
+std::optional<rt::KitVersion> RuntimeHost::TitleKitVersion(const Composition& c, const rt::RuntimeInstall* record) const {
+  if (!c.kit) return std::nullopt;
+  // A Ready title keeps the runtime it was made with until Update: its owner marker names that runtime,
+  // so a recipe it already runs (its min_kit was met then) is not refused after a kit swap. A title not
+  // made yet gets this kit's.
+  if (record && record->state == rt::PreparationState::kReady && !TitleRuntimeCurrent(c, *record)) {
+    const auto revision = c.filesystem_installer ? c.filesystem_installer->TitleRuntimeRevision(*record) : std::nullopt;
+    return revision ? rt::KitVersionFromArtifactRevision(*revision) : std::nullopt;
+  }
+  return rt::KitVersionFromArtifactRevision(c.kit->view.runtime.artifact_revision);
+}
+
+RuntimeHost::CommunityLoad RuntimeHost::LoadCommunityRecipe(Composition& c, std::string_view key) {
+  CommunityLoad load;
+  const bool full = rt::IsCommunityRevision(key);
+  if (!full && !rt::IsCommunityRevisionPrefix(key)) {
+    load.state = rt::CommunityObjectState::kUnreadable;
+    load.reason = "not a recipe revision";
+    return load;
+  }
+  for (const auto& [revision, recipe] : c.community)
+    if (full ? revision == key : rt::RevisionHasTag(revision, key)) {
+      load.recipe = recipe.get();
+      load.state = rt::CommunityObjectState::kLoaded;
+      return load;
+    }
+  if (!config_.community_recipe_bytes) {
+    load.reason = "no recipes cache";
+    return load;
+  }
+  const auto bytes = config_.community_recipe_bytes(key);
+  if (!bytes) {
+    load.reason = "not in the recipes cache";
+    return load;  // kMissing
+  }
+  load.state = rt::CommunityObjectState::kUnreadable;
+  // The revision is the file's hash: a file that doesn't hash to its name is not the recipe.
+  const auto digest = rt::HashArtifactBytes(*bytes);
+  if (!digest || (full ? *digest != key : !rt::RevisionHasTag(*digest, key))) {
+    load.reason = "the cached file does not match its revision";
+    Log("community recipe refused revision=" + std::string(key) + " " + load.reason);
+    return load;
+  }
+  auto community = std::make_unique<rt::CommunityRecipe>();
+  std::string reason;
+  if (!rt::ParseCommunityRecipe(*bytes, community.get(), &reason)) {
+    load.reason = reason;
+    Log("community recipe refused revision=" + std::string(key) + " " + reason);
+    return load;
+  }
+  // The strict rules again on the console: a file that passed review but not this build's rules is not offered.
+  if (const auto refusals = rt::CommunityRecipeRefusals(*community); !refusals.empty()) {
+    load.reason = refusals.front();
+    for (const auto& refusal : refusals) Log("community recipe refused revision=" + std::string(key) + " " + refusal);
+    return load;
+  }
+  community->recipe.revision = *digest;
+  Log("community recipe loaded id=" + community->recipe.id + " revision=" + *digest + " title=" + community->title);
+  load.recipe = c.community.emplace(*digest, std::move(community)).first->second.get();
+  load.state = rt::CommunityObjectState::kLoaded;
+  return load;
+}
+
+const rt::CommunityRecipe* RuntimeHost::BoundCommunityRecipe(Composition& c, const rt::CommunityRecipe& loaded,
+                                                             const GameId& game, std::uint32_t runtime_number,
+                                                             const std::string& install_path,
+                                                             const rt::GameSettingsRecord& saved) {
+  auto fresh = std::make_unique<rt::CommunityRecipe>(loaded);
+  rt::BindCommunityRecipe(fresh.get(), game, runtime_number);
+  // Another game's recipe as it applies to this copy: the program it selects with this copy's architecture, or, when
+  // this copy hasn't it, the game's own program (Playden's choice).
+  const auto own_ref = MatchingRefOf(game, runtime_number, saved);
+  if (rt::IsSettingsOnlyRecipe(loaded)) {
+    // A settings-only recipe, for any game: the program and its fields are Playden's own for this copy.
+    const auto* own = ShippedRecipeFor(c, game, runtime_number);
+    if (!own) own = GeneratedRecipeFor(c, game, runtime_number);
+    const auto root = install_path.empty() ? std::string() : HostPath(install_path).string();
+    const auto missing = rt::FillSettingsOnlyRecipe(&fresh->recipe, own ? *own : rt::GameRecipe{}, [&](const std::string& program) {
+      // Without the copy's folder (none given), its program is taken as Playden's recipe says; preparation binds again.
+      return root.empty() ? (own ? own->architecture : std::string()) : rt::GameProgramArchitecture(root, program);
+    });
+    if (fresh->recipe.launch_entries.empty())
+      Log("community recipe app=" + std::to_string(runtime_number) + " id=" + loaded.recipe.id +
+          " is settings-only and Playden has no program for this copy");
+    else if (!missing.empty())
+      Log("community recipe app=" + std::to_string(runtime_number) + " id=" + loaded.recipe.id + " program " + missing +
+          " not in this copy: Playden's program is used");
+  } else if (!install_path.empty() && (!own_ref || loaded.game != *own_ref)) {
+    const auto* own = ShippedRecipeFor(c, game, runtime_number);
+    if (!own) own = GeneratedRecipeFor(c, game, runtime_number);
+    const auto root = HostPath(install_path).string();
+    const auto architecture = fresh->recipe.architecture;
+    const auto missing = rt::UseOwnProgram(&fresh->recipe, own ? *own : rt::GameRecipe{}, [&](const std::string& program) {
+      return rt::GameProgramArchitecture(root, program);
+    });
+    if (!missing.empty())
+      Log("community recipe app=" + std::to_string(runtime_number) + " id=" + loaded.recipe.id + " program " + missing +
+          " not in this copy: Playden's program is used");
+    else if (fresh->recipe.architecture != architecture)
+      Log("community recipe app=" + std::to_string(runtime_number) + " id=" + loaded.recipe.id + " program " +
+          rt::SelectedProgram(fresh->recipe) + " is " + fresh->recipe.architecture + " in this copy, not " + architecture);
+  }
+  // Kept for the session, so pointers stay valid; updated in place when the copy or Playden's own recipe changed.
+  auto& bound = c.bound_community[{loaded.recipe.revision, runtime_number}];
+  if (!bound) bound = std::move(fresh);
+  else if (rt::SerializeGameRecipe(bound->recipe) != rt::SerializeGameRecipe(fresh->recipe) ||
+           bound->recipe.generated_launch != fresh->recipe.generated_launch)
+    *bound = std::move(*fresh);
+  return bound.get();
+}
+
+std::optional<GameRef> RuntimeHost::MatchingRefOf(const GameId& game, std::uint32_t runtime_number,
+                                                  const rt::GameSettingsRecord& saved) const {
+  // Another store's game: the Steam app ID its Steamworks emulator was given at its last preparation (its own
+  // steam_appid.txt wins), else the one in Game settings, as the game's page shows it.
+  std::uint32_t steam_app = saved.steam_app_id;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto found = snapshot_.steamworks_apps.find(runtime_number);
+        found != snapshot_.steamworks_apps.end() && found->second.app_id &&
+        found->second.source == SteamworksAppView::Source::kGameFile)
+      steam_app = found->second.app_id;
+  }
+  return MatchingGameRef(game, steam_app);
+}
+
+bool RuntimeHost::CommunityRecipeAllowed(const GameId& game, std::uint32_t runtime_number, const rt::GameSettingsRecord& saved,
+                                         const GameRef& recipe_game, bool linked) const {
+  if (!recipe_game.valid()) return false;
+  if (const auto own = MatchingRefOf(game, runtime_number, saved); own && recipe_game == *own) return true;
+  if (saved.community_recipe.game.valid() && recipe_game == saved.community_recipe.game) return true;
+  return linked && saved.linked_game.valid() && recipe_game == saved.linked_game;
+}
+
+const rt::CommunityRecipe* RuntimeHost::CommunityOf(Composition& c, const rt::RuntimeInstall& record) {
+  if (!rt::IsInstalledCommunityRecipeId(record.recipe_id)) return nullptr;
+  // The record holds the revision's first 32 hex: the object found by it names the full id, which the record holds
+  // as its alias when it is longer than 64 bytes (RecipeMatchesInstall compares InstalledRecipeId).
+  const auto load = LoadCommunityRecipe(c, record.recipe_version);
+  if (!load.recipe) return nullptr;
+  // Binding makes any recipe this game's, so its own game is checked first: the game's own GameRef, or the game its
+  // choice or its link records (a choice changed since the record was written). A record naming another game's recipe
+  // that nothing authorizes resolves to nothing, so no plan or publication is built from it.
+  const auto saved = config_.settings_record ? config_.settings_record(GameOf(record)) : std::nullopt;
+  const auto settings = saved.value_or(rt::GameSettingsRecord{});
+  if (!CommunityRecipeAllowed(GameOf(record), record.runtime_number, settings, load.recipe->game, true)) {
+    Log("community recipe app=" + std::to_string(record.runtime_number) + " id=" + load.recipe->recipe.id + " is for " +
+        ToText(load.recipe->game) + ", which neither the game nor its settings name: refused");
+    return nullptr;
+  }
+  // What the title plays under: bound to the record's game whatever its GameRef is now (a changed Steam app ID).
+  const auto* bound = BoundCommunityRecipe(c, *load.recipe, GameOf(record), record.runtime_number, record.install_path,
+                                           settings);
+  return rt::RecipeMatchesInstall(bound->recipe, record) ? bound : nullptr;
+}
+
+const rt::GameRecipe* RuntimeHost::RecipeOf(Composition& c, const rt::RuntimeInstall& record) {
+  if (rt::IsInstalledCommunityRecipeId(record.recipe_id)) {
+    const auto* community = CommunityOf(c, record);
+    return community ? &community->recipe : nullptr;
+  }
+  for (const auto& candidate : c.recipes)
+    if (rt::RecipeMatchesInstall(candidate, record)) return &candidate;
+  return nullptr;
+}
+
+rt::RecipeSelection RuntimeHost::SelectRecipeFor(Composition& c, const GameId& game, std::uint32_t runtime_number,
+                                                 const rt::RuntimeInstall* record, const rt::GameSettingsRecord& saved,
+                                                 const std::string& install_path) {
+  rt::RecipeCandidates candidates;
+  candidates.shipped = ShippedRecipeFor(c, game, runtime_number);
+  candidates.generated = GeneratedRecipeFor(c, game, runtime_number);
+  if (c.kit) {
+    candidates.kit = &c.kit->view;
+    candidates.kit_version = rt::KitVersionFromArtifactRevision(c.kit->view.runtime.artifact_revision);
+    candidates.title_kit_version = TitleKitVersion(c, record);
+  }
+  if (!saved.community_recipe.id.empty()) {
+    candidates.wanted = &saved.community_recipe;
+    const auto load = LoadCommunityRecipe(c, saved.community_recipe.revision);
+    candidates.community_state = load.state;
+    // The object must be a recipe for this game's GameRef, or for the other game the choice names (chosen from a
+    // search); anything else reads as unreadable.
+    if (load.recipe && CommunityRecipeAllowed(game, runtime_number, saved, load.recipe->game, false))
+      candidates.community = BoundCommunityRecipe(c, *load.recipe, game, runtime_number,
+                                                  record ? record->install_path : install_path, saved);
+    else if (load.recipe)
+      candidates.community_state = rt::CommunityObjectState::kUnreadable;
+  }
+  auto selection = rt::SelectRecipe(candidates);
+  if (candidates.wanted)
+    Log("recipe selection app=" + std::to_string(runtime_number) + " wanted=" + candidates.wanted->id + "@" +
+        candidates.wanted->revision.substr(0, rt::kCommunityRevisionPrefixBytes) +
+        (candidates.wanted->game.valid() ? " for=" + ToText(candidates.wanted->game) : std::string()) +
+        (selection.community ? std::string(" selected") : " fallback: " + selection.fallback_reason));
+  return selection;
+}
+
+// The recipe a game is prepared with (runtime::SelectRecipe): the community recipe the player
+// chose when its object is cached and fits the kit, else Playden's shipped one, otherwise one
+// generated from Steam's launch options and saved so recovery and later settings changes use
+// the same launch entries. Returns null with the reason for the player.
 const rt::GameRecipe* RuntimeHost::RecipeForPrepare(Composition& c, const RuntimePrepareRequest& request,
                                                     std::string* reason) {
-  for (const auto& candidate : c.recipes)
-    if (rt::RecipeGame(candidate) == GameOf(request) && candidate.app_id == request.runtime_number &&
-        !rt::IsGeneratedRecipeId(candidate.id))
-      return &candidate;
+  const auto saved = config_.settings_record ? config_.settings_record(GameOf(request)) : std::nullopt;
+  // Another game's recipe may need Playden's own program, and a settings-only recipe always does
+  // (BoundCommunityRecipe): it is generated first when the game has none yet.
+  const auto needs_own = [&] {
+    if (!saved || saved->community_recipe.id.empty()) return false;
+    if (saved->community_recipe.game.valid()) return true;
+    const auto load = LoadCommunityRecipe(c, saved->community_recipe.revision);
+    return load.recipe && rt::IsSettingsOnlyRecipe(*load.recipe);
+  };
+  if (needs_own() && !ShippedRecipeFor(c, GameOf(request), request.runtime_number) &&
+      !GeneratedRecipeFor(c, GameOf(request), request.runtime_number)) {
+    std::string ignored;
+    GenerateRecipeForPrepare(c, request, &ignored, true);
+  }
+  const auto selection = SelectRecipeFor(c, GameOf(request), request.runtime_number, nullptr,
+                                         saved.value_or(rt::GameSettingsRecord{}), request.install_path);
+  Publish([&](RuntimeSnapshot& s) {
+    if (selection.fallback_reason.empty()) s.recipe_fallbacks.erase(request.runtime_number);
+    else s.recipe_fallbacks[request.runtime_number] = selection.fallback_reason;
+  });
+  if (selection.community) {
+    // Playden's own recipe is kept beside it, so the player can switch back without Steam: generated
+    // now when the game has no shipped one and none was generated yet (a refusal changes nothing).
+    if (!ShippedRecipeFor(c, GameOf(request), request.runtime_number) &&
+        !GeneratedRecipeFor(c, GameOf(request), request.runtime_number)) {
+      std::string ignored;
+      GenerateRecipeForPrepare(c, request, &ignored, true);
+      Log("generated fallback app=" + std::to_string(request.runtime_number) + " " +
+          (GeneratedRecipeFor(c, GameOf(request), request.runtime_number) ? std::string("saved") : "not made: " + ignored));
+    }
+    return selection.recipe;
+  }
+  if (selection.recipe && !rt::IsGeneratedRecipeId(selection.recipe->id)) return selection.recipe;
+  // The generated recipe is made again at every preparation: Steam's launch options may have changed.
+  return GenerateRecipeForPrepare(c, request, reason, false);
+}
+
+const rt::GameRecipe* RuntimeHost::GenerateRecipeForPrepare(Composition& c, const RuntimePrepareRequest& request,
+                                                            std::string* reason, bool quiet) {
   if (!c.settings_data_reason.empty()) { *reason = c.settings_data_reason; return nullptr; }
   const auto root = config_.host_namespace_prefix.empty()
       ? std::filesystem::path(request.install_path)
@@ -3128,6 +3622,7 @@ const rt::GameRecipe* RuntimeHost::RecipeForPrepare(Composition& c, const Runtim
   }
   if (!steam_choices.empty()) {
     *reason = "Choose the program that starts this game.";
+    if (quiet) return nullptr;  // a fallback waits for nobody
     Log("prepare waits app=" + std::to_string(request.runtime_number) + " steam programs=" +
         std::to_string(steam_choices.size()));
     Publish([&](RuntimeSnapshot& s) {
@@ -3159,7 +3654,9 @@ const rt::GameRecipe* RuntimeHost::RecipeForPrepare(Composition& c, const Runtim
     *reason = request.launch_reason.empty() ? "Steam lists no Windows program this console can start for this game."
                                             : request.launch_reason;
   // A refused game gets the folder's programs and a draft for Game settings to start from; a
-  // prepared one is scanned when its Program picker opens (ScanPrograms).
+  // prepared one is scanned when its Program picker opens (ScanPrograms). A refused fallback
+  // (quiet) changes nothing: the community recipe prepares the game.
+  if (!made && quiet) return nullptr;
   std::vector<rt::GameProgram> programs;
   std::optional<rt::GameRecipe> draft;
   if (!made) {
@@ -3215,7 +3712,7 @@ void RuntimeHost::RefreshGeneratedRecipeDefaults(Composition& c, const rt::Runti
   const auto kit = c.kit ? rt::KitCapabilitiesFromManifest(c.kit->capabilities, true) : rt::KitCapabilities{};
   const auto app = std::to_string(record.runtime_number);
   for (auto& candidate : c.recipes) {
-    if (candidate.id != record.recipe_id || !RecipeFits(candidate, record)) continue;
+    if (candidate.id != record.recipe_id || !rt::RecipeForGame(candidate, record)) continue;
     auto refreshed = candidate;
     if (!rt::RefreshRecipeDefaults(HostPath(record.install_path).string(), kit, &refreshed)) return;
     // Settings older than the title's can't be published over it, and a forced publication skips them without a word:
@@ -3254,23 +3751,67 @@ void RuntimeHost::RefreshGeneratedRecipeDefaults(Composition& c, const rt::Runti
   }
 }
 
+// Every installed game's generated recipe: the one its record names (at the record's version), or the
+// fallback kept beside a community recipe, so a switch back to Playden's own recipe works offline.
 void RuntimeHost::LoadGeneratedRecipes(Composition& c) {
   for (const auto& record : c.repository.Snapshot()) {
-    if (!rt::IsGeneratedRecipeId(record.recipe_id)) continue;
-    const auto bytes = c.storage.Read(GeneratedRecipeFile(record.recipe_id), 256 * 1024);
+    const auto game = GameOf(record);
+    const auto id = playden::GeneratedRecipeId(game);
+    const bool applied = rt::IsGeneratedRecipeId(record.recipe_id);
+    if (applied && record.recipe_id != id) continue;  // not this game's (a record without its game)
+    if (GeneratedRecipeFor(c, game, record.runtime_number)) continue;
+    const auto bytes = c.storage.Read(GeneratedRecipeFile(id), 256 * 1024);
+    if (!bytes.ok() && !applied) continue;  // no fallback was kept
     rt::GameRecipe recipe;
     std::string reason;
     if (!bytes.ok() ||
         !rt::ParseGameRecipe(std::string(bytes.value().begin(), bytes.value().end()), &recipe, &reason) ||
-        recipe.id != record.recipe_id || !RecipeFits(recipe, record) ||
-        std::to_string(recipe.version) != record.recipe_version) {
+        recipe.id != id || !rt::RecipeForGame(recipe, record) ||
+        (applied && !rt::RecipeMatchesInstall(recipe, record))) {
       Log("generated recipe unavailable install=" + record.install_id + " " +
           (bytes.ok() ? reason : bytes.message()));
       continue;
     }
     c.recipes.push_back(std::move(recipe));
   }
+  // The registry values community recipes left in bottles, for the cache's garbage collection.
+  for (const auto& record : c.repository.Snapshot()) {
+    const auto bytes = c.storage.Read(RecipeRegistryFile(record.install_id), 64 * 1024);
+    rt::RecipeRegistryState state;
+    std::string reason;
+    if (bytes.ok() && rt::ParseRecipeRegistryState(std::string(bytes.value().begin(), bytes.value().end()), &state, &reason) &&
+        rt::IsCommunityRevision(state.revision))
+      c.registry_revisions[record.install_id] = state.revision;
+  }
   PublishRecipes(c);
+}
+
+std::string RuntimeHost::RebindRecipeMarkers(Composition& c, const rt::RuntimeInstall& record) {
+  if (!c.filesystem_installer || record.state != rt::PreparationState::kReady) return {};
+  const auto rebound = c.filesystem_installer->RebindRecipe(record);
+  if (rebound.state == rt::PackageActionState::kComplete) return {};
+  // A record the installer can't resolve (a recipe the kit refuses) is for the caller's own checks to report.
+  if (rebound.code == "kit-invalid") return {};
+  Log("recipe rebind app=" + std::to_string(record.runtime_number) + " code=" + rebound.code + " message=" + rebound.message);
+  return "The PS5 title could not take the new recipe: " + rebound.message + ".";
+}
+
+void RuntimeHost::PublishCommunityReferences(const Composition& c) {
+  std::set<std::string> references;
+  for (const auto& record : c.repository.Snapshot()) {
+    if (rt::IsInstalledCommunityRecipeId(record.recipe_id) && rt::IsCommunityRevisionPrefix(record.recipe_version))
+      references.insert(record.recipe_version);
+    // An unfinished settings transaction carries the recipe it publishes.
+    if (record.journal && (record.journal->operation == "settings-request" || record.journal->operation == "settings-publication")) {
+      const auto loaded = rt::LoadSettingsPublicationRequest(c.request_directory, record.journal->operation_id);
+      if (loaded.request && rt::IsInstalledCommunityRecipeId(loaded.request->install.recipe_id) &&
+          rt::IsCommunityRevisionPrefix(loaded.request->install.recipe_version))
+        references.insert(loaded.request->install.recipe_version);
+    }
+  }
+  for (const auto& [install_id, revision] : c.registry_revisions) references.insert(revision);
+  std::vector<std::string> list(references.begin(), references.end());
+  Publish([&](RuntimeSnapshot& s) { s.community_references = std::move(list); });
 }
 
 void RuntimeHost::PublishRecipes(const Composition& c) {
@@ -3409,7 +3950,8 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
       const auto bound = c.repository.Update(record);
       if (!bound.ok()) return "The runtime kit artifacts could not be recorded: " + bound.message();
     }
-    if (!c.installer->TitleMetadataCurrent(record) || !TitleVariableRefreshCurrent(c, record)) {
+    if (!c.installer->TitleMetadataCurrent(record) || !TitleVariableRefreshCurrent(c, record) ||
+        !TitleIconCurrent(c, record, GameIconFile(record))) {
       const auto written = WriteTitleMetadata(c, record, request.title_name);
       if (written.state != rt::PackageActionState::kComplete) return written.message;
     }
@@ -3426,7 +3968,16 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
       if (existing->journal) {
         const auto resumed = DrivePublication(c, *existing);
         PublishInstalls(c);
-        if (resumed.state == rt::PackageActionState::kComplete) return {};
+        if (resumed.state == rt::PackageActionState::kComplete) {
+          // A resumed recipe switch: the markers and the bottle follow the record's new recipe.
+          const auto committed = c.records.Find(existing->install_id);
+          if (!committed) return "The game's install record is missing.";
+          if (const auto rebound = RebindRecipeMarkers(c, *committed); !rebound.empty()) return rebound;
+          if (const auto steps = ApplyPreparationSteps(c, *committed, true); !steps.empty()) return steps;
+          Publish([&](RuntimeSnapshot& s) { s.recipe_switch_failures.erase(request.runtime_number); });
+          PublishInstalls(c, committed->install_id);
+          return {};
+        }
         // An unowned upgrade's request that never reached its publication is dropped: the game
         // keeps its owned publication, and the update goes on below as for any Ready game.
         if (!DropUpgradeRequest(c, existing->install_id, resumed.message)) return resumed.message;
@@ -3434,10 +3985,14 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
         if (!existing) return "The game's install record is missing.";
       }
       bool changed = false;
+      // A recipe switch that committed but stopped before its markers followed: finished here first,
+      // or the title would read as another kit's.
+      if (const auto rebound = RebindRecipeMarkers(c, *existing); !rebound.empty()) return rebound;
       // Older titles carry the kit's generic name and icon: give them the game's.
       const bool metadata_current = c.installer->TitleMetadataCurrent(*existing) &&
                                     (request.title_name.empty() || InstalledTitleName(*existing) == request.title_name) &&
-                                    TitleVariableRefreshCurrent(c, *existing);
+                                    TitleVariableRefreshCurrent(c, *existing) &&
+                                    TitleIconCurrent(c, *existing, GameIconFile(*existing));
       if (!metadata_current) {
         const auto written = WriteTitleMetadata(c, *existing, request.title_name);
         if (written.state != rt::PackageActionState::kComplete) return written.message;
@@ -3549,17 +4104,17 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
     }
     if (existing->install_path != request.install_path)
       return "The game's files moved since preparation started; recovery is not connected yet.";
-    // A generated recipe that could not be read back is made again before a fresh start.
+    // A recipe that could not be read back (a generated one made again, a community recipe no longer
+    // cached) is resolved again before a fresh start; another outcome means a new setup.
     const bool fresh_start = existing->state == rt::PreparationState::kFailed ||
                              existing->state == rt::PreparationState::kUnavailable ||
                              existing->state == rt::PreparationState::kDownloaded;
-    if (fresh_start && rt::IsGeneratedRecipeId(existing->recipe_id) &&
-        std::none_of(c.recipes.begin(), c.recipes.end(),
-                     [&](const rt::GameRecipe& recipe) { return recipe.id == existing->recipe_id; })) {
+    if (fresh_start && !RecipeOf(c, *existing)) {
       std::string reason;
-      const auto* recipe = RecipeForPrepare(c, request, &reason);
+      const auto* recipe = rt::IsGeneratedRecipeId(existing->recipe_id) ? GenerateRecipeForPrepare(c, request, &reason, false)
+                                                                        : RecipeForPrepare(c, request, &reason);
       if (!recipe) return reason;
-      if (recipe->id != existing->recipe_id || std::to_string(recipe->version) != existing->recipe_version)
+      if (rt::InstalledRecipeId(recipe->id) != existing->recipe_id || rt::RecipeVersionTag(*recipe) != existing->recipe_version)
         return "This game's setup changed; remove its PS5 title before preparing it again.";
     }
     // A setup that stopped before a kit swap left its title or bottle made with the earlier kit. Neither
@@ -3598,7 +4153,7 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
     if (!recipe) return reason;
     // Playden ships its recipes (runtime/recipes) and the kit carries a copy of one of them;
     // only that one must agree with the kit, as the kit's shell was packaged for it.
-    if (recipe->id == c.kit->view.recipe.id && std::to_string(recipe->version) != c.kit->view.recipe.version)
+    if (recipe->id == c.kit->view.recipe.id && rt::RecipeVersionTag(*recipe) != c.kit->view.recipe.version)
       return "The installed runtime kit was built for another version of this game's setup.";
     if (const auto lacks = KitLacksForRecipe(*recipe, c.kit->view); !lacks.empty()) return lacks;
     if (recipe->launch_entries.empty()) return "Steam lists no Windows program this console can start for this game.";
@@ -3606,9 +4161,9 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
     // The title is made for the launch option the player chose, so its publication matches.
     rt::LaunchEntry launch = recipe->launch_entries.front();
     if (settings) {
-      const rt::SettingsPreset* preset = nullptr;
-      for (const auto& candidate : c.presets)
-        if (candidate.id == settings->preset_id) preset = &candidate;
+      auto record = *settings;
+      const auto resolved = RecordPreset(c, &record);
+      const rt::SettingsPreset* preset = resolved ? &*resolved : nullptr;
       rt::EffectiveSettings effective;
       rt::SettingsError ignored;
       if (rt::BuildEffectiveSettings(*recipe, preset, settings->overrides, rt::KitCapabilitiesFromManifest(c.kit->capabilities, true),
@@ -3639,8 +4194,8 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
     reserve.game = game;
     reserve.default_profile_id = ProfileId(game);
     reserve.runtime_bundle_id = c.kit->view.runtime.bundle_id;
-    reserve.recipe_id = recipe->id;
-    reserve.recipe_version = std::to_string(recipe->version);
+    reserve.recipe_id = rt::InstalledRecipeId(recipe->id);
+    reserve.recipe_version = rt::RecipeVersionTag(*recipe);
     reserve.settings_revision = settings ? settings->revision : 0;
     reserve.launch_entry_id = launch.id;
     reserve.launch_path = launch.executable;
@@ -4723,6 +5278,9 @@ std::string RuntimeHost::RunRemove(Composition& c, std::uint32_t app, bool delet
       if (!error) RemoveTreeNoFollow(SaveBackupRoot(record.install_id), error);
       ClearWork();
       if (error) return fail("bottle-delete", "The game's saves and settings could not be deleted: " + error.message());
+      // The bottle's recipe registry values went with it.
+      c.storage.Remove(RecipeRegistryFile(record.install_id));
+      c.registry_revisions.erase(record.install_id);
     } else if (present) {
       if (const auto failed = KeepBottle(bottle, record.install_id, GameOf(record), record.runtime_number, game_name,
                                          record.journal->operation_id))
@@ -4745,20 +5303,29 @@ std::string RuntimeHost::RunRemove(Composition& c, std::uint32_t app, bool delet
     if (lstat(kept.c_str(), &kept_info) == 0) RemoveTreeNoFollow(kept, error);
     if (!error) RemoveTreeNoFollow(SaveBackupRoot(record.install_id), error);
     if (error) return fail("bottle-delete", "The game's saves and settings could not be deleted: " + error.message());
+    c.storage.Remove(RecipeRegistryFile(record.install_id));
+    c.registry_revisions.erase(record.install_id);
   }
   const auto erased = c.repository.EraseAfterUnregister(record.install_id, confirmed);
   if (!erased.ok()) return fail("erase", "The removal could not be completed: " + erased.message());
   // The title is gone; a stale entry would only let a later title with its ID start early.
   if (const auto listed = SyncTitleAllowList(c); !listed.empty()) Log("remove allow-list: " + listed);
-  // A generated recipe is made again from Steam's launch options on the next prepare.
-  if (rt::IsGeneratedRecipeId(record.recipe_id)) {
-    c.storage.Remove(GeneratedRecipeFile(record.recipe_id));
+  // The game's generated recipe (applied, or kept beside a community recipe) is made again from
+  // Steam's launch options on the next prepare.
+  {
+    const auto generated_id = playden::GeneratedRecipeId(GameOf(record));
+    c.storage.Remove(GeneratedRecipeFile(generated_id));
+    const auto before = c.recipes.size();
     c.recipes.erase(std::remove_if(c.recipes.begin(), c.recipes.end(),
-                                   [&](const rt::GameRecipe& recipe) { return recipe.id == record.recipe_id; }),
+                                   [&](const rt::GameRecipe& recipe) { return recipe.id == generated_id; }),
                     c.recipes.end());
-    PublishRecipes(c);
+    if (c.recipes.size() != before) PublishRecipes(c);
   }
   c.admission.erase(record.install_id);
+  Publish([&](RuntimeSnapshot& s) {
+    s.recipe_fallbacks.erase(record.runtime_number);
+    s.recipe_switch_failures.erase(record.runtime_number);
+  });
   // A normal uninstall's record is already erased; leftover failures keep their private journal.
   DeleteRetiredTitle(record.title_id, record.journal->operation_id);
   PublishInstalls(c);
@@ -4837,7 +5404,11 @@ std::string RuntimeHost::DeleteKept(Composition& c, std::uint32_t app) {
   std::error_code error;
   RemoveTreeNoFollow(kept, error);  // links are removed, never followed
   if (!error) RemoveTreeNoFollow(SaveBackupRoot(install_id), error);
-  return error ? "The kept saves could not be deleted: " + error.message() : std::string{};
+  if (error) return "The kept saves could not be deleted: " + error.message();
+  // The bottle's recipe registry values went with it.
+  c.storage.Remove(RecipeRegistryFile(install_id));
+  c.registry_revisions.erase(install_id);
+  return {};
 }
 
 void RuntimeHost::Run() {
@@ -4884,7 +5455,11 @@ bool RuntimeHost::RunServices() {
         else Log("recipe " + recipe.id + " refused kit=" + c.kit->view.kit_id + " " + lacks);
       }
       installer->AcceptShippedRecipes(std::move(shipped));
+      // Community recipes resolve by their id's form (CommunityRecipeNamesGame); the object itself, and its game, are
+      // required only where a plan is built from it (RecipeOf).
+      installer->AcceptRecipes(CommunityRecipeNamesGame);
       installer->ShareBottleProfiles(rt::KitCapabilitiesFromManifest(c.kit->capabilities, true).bottle_profile_shared);
+      c.filesystem_installer = installer.get();
       c.installer = std::move(installer);
     } else {
       if (kit_reason.empty()) kit_reason = "No verified runtime kit is installed.";
@@ -4901,11 +5476,8 @@ bool RuntimeHost::RunServices() {
     c.owner->SetLog([this](const std::string& line) { Log(line); });
     c.service = std::make_unique<rt::RuntimeInstallService>(
         c.records, *c.installer, *c.coordinator,
-        [&c](const rt::RuntimeInstall& record) {
-          for (const auto& recipe : c.recipes)
-            if (RecipeFits(recipe, record) && recipe.id == record.recipe_id &&
-                std::to_string(recipe.version) == record.recipe_version)
-              return rt::CompatibilityResult{true, {}};
+        [this, &c](const rt::RuntimeInstall& record) {
+          if (RecipeOf(c, record)) return rt::CompatibilityResult{true, {}};
           return rt::CompatibilityResult{false, "Playden no longer knows how to start this game; prepare it again."};
         },
         [this] { return Stopping(); },
@@ -5022,6 +5594,19 @@ bool RuntimeHost::RunServices() {
         std::lock_guard<std::mutex> lock(mutex_);
         launch_poll_ = true;
       }
+      // A recipe switch cut off between its commit and its markers (RebindRecipeMarkers) finishes
+      // before anything reads the markers: the bottle's modes, the republish passes, the installs view.
+      if (c.kit) {
+        bool changed = false;
+        for (const auto& record : c.repository.Snapshot()) {
+          if (record.state != rt::PreparationState::kReady || !MaintenanceRefusal(c, record).empty()) continue;
+          const bool was_current = c.installer->TitleCurrent(record);
+          if (const auto rebound = RebindRecipeMarkers(c, record); !rebound.empty())
+            Log("startup recipe rebind app=" + std::to_string(record.runtime_number) + " " + rebound);
+          changed = changed || was_current != c.installer->TitleCurrent(record);
+        }
+        if (changed) PublishInstalls(c);
+      }
       // Games started from Home (and Playden's, which close Playden) left Wine's 0600 saves: with
       // bottle-profile-shared they are opened to FTP again once their title is stopped.
       if (c.kit && rt::KitCapabilitiesFromManifest(c.kit->capabilities, true).bottle_profile_shared) {
@@ -5069,11 +5654,13 @@ bool RuntimeHost::RunServices() {
       // now, so a start from the PS5 Home screen uses them too. Busy titles wait for Play.
       if (c.kit)
         for (const auto& record : c.repository.Snapshot()) {
-          // Only newer settings: the Steam account is not known yet, so Steam files wait for Play.
-          // So are they after a program's run (RuntimeInstall::setup_program), whatever their revision.
+          // Newer settings, and player presets whose file may have changed independently: the Steam
+          // account is not known yet, so Steam files wait for Play. Also restore a program's run
+          // (RuntimeInstall::setup_program), whatever its revision.
           const auto saved = config_.settings_record ? config_.settings_record(GameOf(record)) : std::nullopt;
           const bool newer = saved && saved->revision > record.settings_revision;
-          if ((!newer && record.setup_program.empty()) || !record.moved_from.empty() ||
+          const bool player_preset = saved && rt::IsMyPresetId(saved->preset_id);
+          if ((!newer && !player_preset && record.setup_program.empty()) || !record.moved_from.empty() ||
               !MaintenanceRefusal(c, record).empty()) continue;
           bool published = false;
           const auto refused = RepublishSettings(c, record, &published, false);

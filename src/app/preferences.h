@@ -2,9 +2,24 @@
 
 #include "platform/storage.h"
 
+#include <cstddef>
 #include <string>
+#include <string_view>
 
 namespace playden {
+
+// Votes on community recipes: not asked yet (the first prompt asks), on, or off.
+enum class RecipeVotesPreference { kUnset, kOn, kOff };
+
+// The longest name a shared recipe credits (the Playden API's limit), in characters.
+inline constexpr std::size_t kShareNameMaxCharacters = 40;
+// Text a player typed for a shared recipe: at most max_characters characters the Playden API accepts
+// (community::IsSubmissionText: valid UTF-8, no control, zero-width, bidi or unusual space characters).
+bool IsPrintableText(std::string_view text, std::size_t max_characters);
+// A name Playden keeps and sends: empty, or 1-40 such characters.
+inline bool IsShareName(std::string_view name) { return IsPrintableText(name, kShareNameMaxCharacters); }
+
+enum class ShareAs { kNone, kName, kAccount };
 
 struct Preferences {
   bool reduce_motion = false;
@@ -38,6 +53,19 @@ struct Preferences {
   bool hide_launcher_help = false;
   // The runtime kit whose "Update your games" prompt has been shown (its manifest SHA-256): once per kit.
   std::string runtime_prompt_kit;
+  // Community recipes (version 13). Whether Playden asks for and sends votes on the recipes games used.
+  RecipeVotesPreference recipe_votes = RecipeVotesPreference::kUnset;
+  // The first share showed what a share sends; later shares go straight to Send.
+  bool sharing_explained = false;
+  // "Your name" on the Share sheet, remembered for the next share; empty: the recipe has no author ("from the community").
+  std::string share_name;
+  // The first game test report showed what a report sends (version 14).
+  bool reports_explained = false;
+  // How shares and test reports credit the player (version 14): no name, the typed name, or the linked Playden account.
+  ShareAs share_as = ShareAs::kNone;
+  // Whether Playden asks how a game ran after it ends (version 14). Separate from recipe_votes: "Don't ask again"
+  // stops the question, not votes. Older files: asked unless recipe votes were off.
+  bool ask_after_games = true;
 };
 
 enum class PreferencesLoadStatus {

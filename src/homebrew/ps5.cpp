@@ -21,6 +21,7 @@
 #include "runtime/writable_folders.h"
 #include "homebrew/runtime_host.hpp"
 #include "homebrew/program_icon.hpp"
+#include "homebrew/sharing_service.hpp"
 #include "homebrew/title_icon.hpp"
 #include "platform/ps5/title_allow_list.h"
 #include "platform/ps5/console_address.h"
@@ -29,10 +30,16 @@
 #include "runtime/artifact_hash.h"
 #include "runtime/kit_admission.h"
 #include "runtime/kit_trust.h"
+#include "runtime/steamworks.h"
 #include "update/update_service.h"
 #include "web/address.h"
 #include "web/server.h"
 #include "web/service.h"
+#include "community/endpoints.h"
+#include "community/recipe_service.h"
+#include "community/recipe_store.h"
+#include "app/experimental_features.h"
+#include "diagnostics/redaction.h"
 #include "homebrew/input_adapter.hpp"
 #include "homebrew/usb_keyboard.hpp"
 #include "core/input.hpp"
@@ -275,6 +282,24 @@ int main() {
 #else
         playden::homebrew::Simulation simulation({}, {}, playden::homebrew::ModelMode::Live);
 #endif
+        // Experimental features: one name per line in /data/playden/features.txt (open to FTP and the file manager;
+        // user/ is not), read once before anything asks. Nightlies and local dev builds (PLAYDEN_DEV_BUILD) have every
+        // feature on.
+        playden::app::ExperimentalFeatures features =
+            playden::app::DefaultExperimentalFeatures(playden::update::CurrentVersion().nightly() || PLAYDEN_DEV_BUILD);
+#if !PLAYDEN_UI_SIMULATION
+        {
+            std::vector<std::string> unknown;
+            const auto& features_root = paths.runtime_data_root.empty() ? user_root : paths.runtime_data_root;
+            features = playden::app::ReadExperimentalFeatures(
+                features_root + "/" + playden::app::kExperimentalFeaturesFileName, features, &unknown);
+            if (features.community_recipes)
+                playden::app::AppendLogLine(log_root, "launch.log", "experimental feature community-recipes on");
+            for (const auto& name : unknown)
+                playden::app::AppendLogLine(log_root, "launch.log", "experimental feature unknown: " + name.substr(0, 64));
+        }
+        simulation.SetCommunityRecipesEnabled(features.community_recipes);
+#endif
         {
             std::vector<playden::runtime::SettingsPreset> presets;
             std::vector<playden::runtime::GameRecipe> recipes;
@@ -305,6 +330,12 @@ int main() {
         }
         // An empty path disables live writes and surfaces a settings load error.
         simulation.SetGameSettingsFile(settings_file.value_or(std::filesystem::path{}));
+        // The player's own presets live beside the settings file; without that folder there are none to load.
+        if (settings_file) {
+            const auto my_presets = simulation.SetMyPresetsFile(playden::runtime::MyPresetsPath(*settings_file));
+            for (const auto& line : playden::runtime::MyPresetsLoadLog(my_presets))
+                playden::app::AppendLogLine(log_root, "launch.log", line);
+        }
         playden::Storage auth_storage(user_root);
         // One line per Steam CM logon or refusal, with Steam's result code (#51).
         playden::steam::SetCmLog([](const std::string& line) {
@@ -496,6 +527,12 @@ int main() {
         self_update.Check(false);
         // "Export as recipe" writes next to the logs, which are read over FTP already.
         simulation.SetRecipeExportTarget(log_root, playden::ps5::ConsoleFirmwareVersion().value_or(""));
+        // Community recipes, kept by content in the user data (community/recipe_store.h). The runtime
+        // reads the objects games use through a second store on the same folder; the service that
+        // fetches them starts once the runtime is up (after the root grant and the settings storage).
+        const std::string community_root = user_root + "/community-recipes";
+        auto community_objects = std::make_shared<playden::community::RecipeStore>(community_root);
+        auto community_keep = std::make_shared<playden::homebrew::CommunityKeepSet>();
         // Per-game runtime: private bottles and PS5 titles from the admitted kit.
         // Its worker owns OWNER records, native inventory and publication.
         std::unique_ptr<playden::homebrew::RuntimeHost> runtime_host;
@@ -556,7 +593,15 @@ int main() {
                 const auto found = records.find(game);
                 return found == records.end() ? std::nullopt : std::optional<rt::GameSettingsRecord>(found->second);
             };
+            // Read again for each record resolved, as the settings above: the UI saves them while Playden runs.
+            config.my_presets = [file = settings_file]() -> std::vector<rt::MyPreset> {
+                std::vector<rt::MyPreset> presets; std::string reason;
+                if (!file || !rt::ReadMyPresetsFile(rt::MyPresetsPath(*file).string(), &presets, &reason)) return {};
+                return presets;
+            };
             config.log = [](const std::string& line) { playden::app::AppendLogLine(log_root, "runtime.log", line); };
+            // Off (features.txt): only a cache already there is read; its folders are not made.
+            config.community_recipe_bytes = playden::homebrew::CommunityRecipeBytes(community_objects, features.community_recipes);
             config.title_log = [](const std::string& title, const std::string& text) {
                 const auto path = log_root + "/title-" + title + ".log";
                 if (FILE* file = std::fopen(path.c_str(), "wb")) {
@@ -564,8 +609,9 @@ int main() {
                     std::fclose(file);
                 }
             };
-            // The game's PS5 title icon, from its Steam cover; without one, its program's own
-            // icon, then the packaged generic icon. Only a missing generic icon leaves the kit's.
+            // The game's PS5 title icon, from its Steam cover; without one, the game's own icon
+            // file (a GOG copy's .ico), its program's own icon, then the packaged generic icon.
+            // Only a missing generic icon leaves the kit's.
             std::optional<std::string> generic_icon;
             if (FILE* file = std::fopen((paths.assets_root + "/generic-title-icon.png").c_str(), "rb")) {
                 std::string bytes;
@@ -584,8 +630,18 @@ int main() {
                     if (grant->apps.count(dlc)) owned.push_back(dlc);
                 return owned;
             };
+            // The Source SDK Base apps the last license read of this account grants.
+            config.owned_sdk_apps = [&licensed_depots](std::uint64_t steam_id) -> std::optional<std::vector<std::uint32_t>> {
+                const auto grant = licensed_depots.Get(steam_id);
+                if (!grant) return std::nullopt;
+                std::vector<std::uint32_t> owned;
+                for (const auto app : playden::runtime::kSourceSdkBaseApps)
+                    if (grant->apps.count(app)) owned.push_back(app);
+                return owned;
+            };
             config.title_icon = [trust = paths.trust_store, art_cache_dir, generic_icon](
-                                    const playden::GameId& game, const std::filesystem::path& program) -> std::optional<std::string> {
+                                    const playden::GameId& game, const std::filesystem::path& program,
+                                    const std::filesystem::path& icon_file) -> std::optional<std::string> {
                 // A store with no cover for the game (an imported one) gets the generic icon.
                 const auto source = playden::homebrew::CoverUrl(game);
                 std::optional<playden::homebrew::ArtworkImage> cover;
@@ -595,6 +651,17 @@ int main() {
                     cover = backend.Load({1, game, source}, cancel);
                 }
                 if (auto icon = cover ? playden::homebrew::MakeTitleIcon(*cover) : std::nullopt) return icon;
+                // A GOG copy's own icon file, as the library's poster shows it.
+                const auto file = icon_file.empty() ? std::nullopt : playden::homebrew::ReadIconFile(icon_file.string());
+                if (auto icon = file ? playden::homebrew::MakeProgramTitleIcon(*file) : std::nullopt) {
+                    playden::app::AppendLogLine(log_root, "runtime.log", "title icon app=" + playden::ToKey(game) +
+                                                " uses the game's icon file: no cover file=" + icon_file.filename().string() +
+                                                " size=" + std::to_string(file->width) + "x" + std::to_string(file->height));
+                    return icon;
+                }
+                if (!icon_file.empty())
+                    playden::app::AppendLogLine(log_root, "runtime.log", "title icon app=" + playden::ToKey(game) +
+                                                " can't read the game's icon file file=" + icon_file.filename().string());
                 // An imported game, or a Steam game without a cover: the icon inside its program.
                 const auto own = program.empty() ? std::nullopt : playden::homebrew::ReadProgramIcon(program.string());
                 if (auto icon = own ? playden::homebrew::MakeProgramTitleIcon(*own) : std::nullopt) {
@@ -698,6 +765,57 @@ int main() {
             hui::sys::quit();
             return 0;
         }
+        // Community recipes and sharing (features.txt): off, neither service exists, nothing is fetched or sent and
+        // community.log stays untouched; the runtime and the model read the recipes games already use from the cache.
+        // Each HTTP client is declared first: its service uses it until it stops.
+        std::optional<playden::steam::HttpClient> community_http;
+        std::unique_ptr<playden::community::CommunityRecipeService> community;
+        std::optional<playden::steam::HttpClient> sharing_http;
+        std::unique_ptr<playden::homebrew::SharingService> sharing;
+        if (features.community_recipes) {
+            community_http.emplace(paths.trust_store);
+            playden::community::RecipeServiceConfig community_config;
+            community_config.store_root = community_root;
+            {
+                std::string endpoints_line;
+                community_config.endpoints = playden::community::LoadEndpoints(
+                    user_root + "/" + playden::community::kDevEndpointsFileName, &endpoints_line);
+                if (!endpoints_line.empty())
+                    playden::app::AppendLogLine(log_root, "community.log", playden::diagnostics::RedactSecrets(endpoints_line));
+            }
+            community_config.fetch = [client = &*community_http](const playden::steam::HttpRequest& request, const std::atomic<bool>& cancel) {
+                return client->Perform(request, cancel);
+            };
+            // The sharing ID (Phase 5) never reaches a log: every line goes through the redaction.
+            community_config.log = [](const std::string& line) {
+                playden::app::AppendLogLine(log_root, "community.log", playden::diagnostics::RedactSecrets(line));
+            };
+            // Garbage collection after a refresh keeps what games use, once the runtime knows its installs.
+            community_config.referenced = playden::homebrew::CommunityKeepCallback(community_keep);
+            const auto community_endpoints = community_config.endpoints;
+            community = std::make_unique<playden::community::CommunityRecipeService>(std::move(community_config));
+            community->Start();
+            // Sharing recipes and votes: its own worker and HTTP client, the sharing ID and the vote memory in the
+            // same folder. Only that worker reads the sharing ID.
+            sharing_http.emplace(paths.trust_store);
+            playden::homebrew::SharingServiceConfig sharing_config;
+            sharing_config.store_root = community_root;
+            sharing_config.endpoints = community_endpoints;
+            sharing_config.fetch = [client = &*sharing_http](const playden::steam::HttpRequest& request, const std::atomic<bool>& cancel) {
+                return client->Perform(request, cancel);
+            };
+            sharing_config.log = [](const std::string& line) {
+                playden::app::AppendLogLine(log_root, "community.log", playden::diagnostics::RedactSecrets(line));
+            };
+            // A test report's logs: what web access serves, read and redacted the same way.
+            sharing_config.logs = playden::web::LogsPaths{log_root, "/data/homebrew",
+                                                          paths.runtime_data_root.empty() ? std::string() : paths.runtime_data_root + "/kits",
+                                                          "/data/homebrew/" PLAYDEN_PS5_TITLE_ID};
+            sharing = std::make_unique<playden::homebrew::SharingService>(std::move(sharing_config));
+            sharing->Start();
+        }
+        simulation.SetSharingContext(playden::ps5::ConsoleFirmwareVersion().value_or(""),
+                                     playden::update::BuildVersionText());
         auto games_root = playden::ps5::EffectiveGamesRoot(paths);
         if (const auto journal = playden::runtime::LoadLayoutJournal("/data/playden/runtime-state");
             journal && (journal->step == "games-moved" || journal->step == "done"))
@@ -909,6 +1027,10 @@ int main() {
         playden::steam::StoreDetailsService store_details(playden::homebrew::StoreFetch(paths.trust_store));
         services.SetStoreDetails(&store_details);
         services.SetSelfUpdate(&self_update);
+        // Without a runtime here the installed games' recipes are unknown: nothing is collected.
+        if (community) services.SetCommunityRecipes(community.get(), community_keep, /*no_runtime_installs=*/false);
+        else services.SetCommunityRecipeCache(std::make_shared<playden::community::RecipeStore>(community_root));
+        services.SetSharing(sharing.get());
         // A game bought or added to the library elsewhere: Steam pushes the new license list.
         services.SetLicenseChanges([steam_cm] { return playden::steam::CmLicenseChanges(*steam_cm); });
         services.SetShutdownLog([](const std::string& line) { playden::app::AppendLogLine(log_root, "launch.log", line); });
@@ -1137,6 +1259,14 @@ int main() {
         if (copy_runner) copy_runner->SetChanged({});
         playden::app::AppendLogLine(log_root, "launch.log", "shutdown artwork start");
         artwork.Shutdown();
+        if (community) {
+            playden::app::AppendLogLine(log_root, "launch.log", "shutdown community recipes start");
+            community->Shutdown();
+        }
+        if (sharing) {
+            playden::app::AppendLogLine(log_root, "launch.log", "shutdown sharing start");
+            sharing->Shutdown();
+        }
         playden::app::AppendLogLine(log_root, "launch.log", "shutdown self-update start");
         self_update.Shutdown();
         playden::app::AppendLogLine(log_root, "launch.log", "shutdown done");

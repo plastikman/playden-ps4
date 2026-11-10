@@ -189,6 +189,13 @@ bool IsProsperoEnvironmentEntry(std::string_view name, std::string_view value) {
     if (!((c >= 'A' && c <= 'Z') || c == '_' || (i > 0 && c >= '0' && c <= '9'))) return false;
   }
   const auto starts = [&](std::string_view prefix) { return name.size() > prefix.size() && name.substr(0, prefix.size()) == prefix; };
+  // WINE_LARGE_ADDRESS_AWARE and PW_NSIPROXY_DISABLE (0 or 1) and the open-file budgets (up to four digits) only for a
+  // title whose kit has wine-large-address-aware, nsiproxy-switch or environment-file-budgets: BuildEffectiveSettings
+  // checks that.
+  const bool zero_or_one = name == "WINE_LARGE_ADDRESS_AWARE" || name == "PW_NSIPROXY_DISABLE";
+  const bool file_budget = name == "WINE_PS5_PARK_FILES" || name == "WINE_PS5_CACHED_FILES";
+  if (zero_or_one) return value == "0" || value == "1";
+  if (file_budget) return value.size() <= 4 && value.find_first_not_of("0123456789") == std::string_view::npos;
   if (!(starts("DXVK_") || starts("MESA_") || starts("RADV_") || starts("SDL_") || name == "WINE_CPU_TOPOLOGY")) return false;
   if (name == "DXVK_HUD" || name == "SDL_JOYSTICK_RAWINPUT") return false;
   for (const unsigned char c : value)
@@ -212,13 +219,26 @@ bool IsProsperoDebugEnvEntry(std::string_view name, std::string_view value) {
   return true;
 }
 
+bool IsPlaydenEnvironmentVariable(std::string_view name) {
+  static constexpr std::string_view kNames[] = {"WINE_CPU_TOPOLOGY", "DXVK_FRAME_RATE", "MESA_EXTENSION_MAX_YEAR",
+                                                "PW_MEDIA_DISABLE", "WINE_LARGE_ADDRESS_AWARE", "PW_NSIPROXY_DISABLE"};
+  for (const auto known : kNames)
+    if (name == known) return true;
+  // VKD3D_LOG_FILE and VKD3D_SHADER_CACHE_PATH take a path: the player's own Environment row may set them, a shared recipe may not.
+  if (name == "VKD3D_LOG_FILE" || name == "VKD3D_SHADER_CACHE_PATH") return false;
+  for (const char* known : kBottleEnvironmentNames)
+    if (name == known) return true;
+  return false;
+}
+
 bool CheckProsperoProfile(std::string_view text, std::string* reason, ProsperoProfileFeatures features) {
   const auto fail = [&](std::string why) {
     if (reason) *reason = std::move(why);
     return false;
   };
   if (text.empty()) return fail("empty profile");
-  if (text.size() > kProsperoMaxProfileBytes) return fail("profile is larger than 8192 bytes");
+  const auto max_profile = features.long_arguments ? kProsperoMaxLongProfileBytes : kProsperoMaxProfileBytes;
+  if (text.size() > max_profile) return fail("profile is larger than " + std::to_string(max_profile) + " bytes");
   std::vector<std::string> sections;
   std::string section;
   std::set<std::string> seen;
@@ -282,7 +302,8 @@ bool CheckProsperoProfile(std::string_view text, std::string* reason, ProsperoPr
         if (!text_field(kProsperoMaxPathBytes, false) || !IsWindowsPath(value)) return bad("not an absolute Windows path");
         (key == "executable" ? executable : working) = std::string(value);
       } else if (key == "arguments") {
-        if (!text_field(kProsperoMaxArgumentBytes, true) || !SplitProsperoArguments(value, nullptr))
+        if (!text_field(features.long_arguments ? kProsperoMaxLongArgumentBytes : kProsperoMaxArgumentBytes, true) ||
+            !SplitProsperoArguments(value, nullptr))
           return bad("too long, too many words or an unclosed quote");
       } else if (key == "dll_overrides") {
         if (HasControl(value) || !IsProsperoDllOverrides(value)) return bad("not a DLL override list");
@@ -369,9 +390,15 @@ bool CheckProsperoProfile(std::string_view text, std::string* reason, ProsperoPr
         return fail("unknown [input] key " + key);
       }
     } else if (section == "runtime") {
-      // Only the profile's version: the defaults the title applies (prospero-win's [runtime] has more keys).
-      if (key != "version") return fail("unknown [runtime] key " + key);
-      if (value != "1" && value != "2") return bad("not 1 or 2");
+      // The profile's version (the defaults the title applies) and the 32-bit CPU; prospero-win's [runtime] has more
+      // keys.
+      if (key == "cpu") {
+        if (value != "native" && value != "translator") return bad("not native or translator");
+      } else if (key == "version") {
+        if (value != "1" && value != "2") return bad("not 1 or 2");
+      } else {
+        return fail("unknown [runtime] key " + key);
+      }
     } else if (section == "audio") {
       if (key != "volume") return fail("unknown [audio] key " + key);
       if (!IsDigits(value, 3) || std::atol(std::string(value).c_str()) > 100) return bad("not 0-100");

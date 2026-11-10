@@ -1,0 +1,772 @@
+// community_recipe_service_test.cpp - Fetching, checking and keeping community recipes with a fake
+// network. Built twice: as a release build (community_recipe_service_test: the configured endpoints
+// are ignored, GitHub and api.playden.club only, no auth) and with dev endpoints
+// (community_recipe_service_dev_test: a local server over plain http with an auth header that only
+// the recipes server gets).
+// Copyright (c) 2026 Playden contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "community/recipe_service.h"
+
+#include <stdlib.h>
+#include <strings.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <condition_variable>
+#include <future>
+#include <thread>
+#include <cstdio>
+#include <filesystem>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "miniz.h"
+
+using namespace playden;
+using namespace playden::community;
+namespace fs = std::filesystem;
+
+namespace {
+
+int failures = 0;
+#define CHECK(cond)                                                                 \
+  do {                                                                              \
+    if (!(cond)) {                                                                  \
+      std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
+      ++failures;                                                                   \
+    }                                                                               \
+  } while (0)
+
+std::string Slurp(const std::string& path) {
+  std::string text;
+  if (std::FILE* file = std::fopen(path.c_str(), "rb")) {
+    char buffer[4096];
+    std::size_t count = 0;
+    while ((count = std::fread(buffer, 1, sizeof buffer, file)) > 0) text.append(buffer, count);
+    std::fclose(file);
+  }
+  return text;
+}
+
+std::string Replace(std::string text, const std::string& from, const std::string& to) {
+  for (auto at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size()))
+    text.replace(at, from.size(), to);
+  return text;
+}
+
+// ---- zips, built in memory (stored or deflated entries) ----
+
+struct Entry {
+  std::string name;
+  std::string data;
+  bool deflate = false;
+};
+
+void Put16(std::string& out, unsigned value) {
+  out += static_cast<char>(value & 0xff);
+  out += static_cast<char>((value >> 8) & 0xff);
+}
+void Put32(std::string& out, std::uint32_t value) {
+  Put16(out, value & 0xffff);
+  Put16(out, value >> 16);
+}
+
+std::string Zip(const std::vector<Entry>& entries) {
+  std::string out, central;
+  for (const auto& entry : entries) {
+    const auto crc = static_cast<std::uint32_t>(
+        mz_crc32(MZ_CRC32_INIT, reinterpret_cast<const unsigned char*>(entry.data.data()), entry.data.size()));
+    std::string stored = entry.data;
+    unsigned method = 0;
+    if (entry.deflate) {
+      std::size_t size = 0;
+      void* packed = tdefl_compress_mem_to_heap(entry.data.data(), entry.data.size(), &size, TDEFL_DEFAULT_MAX_PROBES);
+      stored.assign(static_cast<const char*>(packed), size);
+      mz_free(packed);
+      method = 8;
+    }
+    const auto offset = static_cast<std::uint32_t>(out.size());
+    Put32(out, 0x04034b50); Put16(out, 20); Put16(out, 0); Put16(out, method); Put16(out, 0); Put16(out, 0x21);
+    Put32(out, crc); Put32(out, stored.size()); Put32(out, entry.data.size());
+    Put16(out, entry.name.size()); Put16(out, 0);
+    out += entry.name;
+    out += stored;
+    Put32(central, 0x02014b50); Put16(central, (3u << 8) | 20); Put16(central, 20);
+    Put16(central, 0); Put16(central, method); Put16(central, 0); Put16(central, 0x21);
+    Put32(central, crc); Put32(central, stored.size()); Put32(central, entry.data.size());
+    Put16(central, entry.name.size()); Put16(central, 0); Put16(central, 0); Put16(central, 0); Put16(central, 0);
+    Put32(central, static_cast<std::uint32_t>(entry.name.back() == '/' ? 040755u : 0100644u) << 16);
+    Put32(central, offset);
+    central += entry.name;
+  }
+  const auto central_offset = static_cast<std::uint32_t>(out.size());
+  out += central;
+  Put32(out, 0x06054b50); Put16(out, 0); Put16(out, 0); Put16(out, entries.size()); Put16(out, entries.size());
+  Put32(out, central.size()); Put32(out, central_offset); Put16(out, 0);
+  return out;
+}
+
+// ---- the fake network ----
+
+struct Route {
+  long status = 200;
+  std::string body;
+  std::vector<std::pair<std::string, std::string>> headers;
+};
+
+struct Network {
+  std::mutex mutex;
+  std::map<std::string, Route> routes;
+  std::vector<steam::HttpRequest> seen;
+  bool offline = false;
+  // Holds a request to `hold` until released (two refreshes at once).
+  std::string hold;
+  bool held = false, release = false;
+  std::condition_variable changed;
+
+  steam::HttpResponse Fetch(const steam::HttpRequest& request, const std::atomic<bool>&) {
+    std::unique_lock<std::mutex> lock(mutex);
+    seen.push_back(request);
+    if (!hold.empty() && request.url == hold) {
+      held = true;
+      changed.notify_all();
+      changed.wait(lock, [&] { return release; });
+    }
+    steam::HttpResponse response;
+    if (offline) {
+      response.error = steam::HttpError::kConnectionFailed;
+      return response;
+    }
+    // As HttpClient: plain http only for a request that asks for it in a dev build.
+    if (request.url.rfind("http://", 0) == 0 && !(request.allow_plain_http && DevEndpointsCompiledIn())) {
+      response.error = steam::HttpError::kInvalidRequest;
+      return response;
+    }
+    const auto found = routes.find(request.url);
+    if (found == routes.end()) {
+      response.status_code = 404;
+      return response;
+    }
+    response.status_code = found->second.status;
+    response.headers = found->second.headers;
+    if (found->second.body.size() > request.max_response_bytes) {
+      response.error = steam::HttpError::kResponseTooLarge;
+      return response;
+    }
+    response.body.assign(found->second.body.begin(), found->second.body.end());
+    return response;
+  }
+  int Count(const std::string& url) {
+    std::lock_guard<std::mutex> lock(mutex);
+    int count = 0;
+    for (const auto& request : seen) count += request.url == url;
+    return count;
+  }
+  void Clear() {
+    std::lock_guard<std::mutex> lock(mutex);
+    seen.clear();
+  }
+};
+
+bool HasHeader(const steam::HttpRequest& request, const char* name) {
+  for (const auto& [key, value] : request.headers)
+    if (strcasecmp(key.c_str(), name) == 0) return true;
+  return false;
+}
+
+// Where things live: GitHub and api.playden.club in a release build, a local server in a dev build.
+struct Site {
+  Endpoints endpoints;
+  std::string latest, assets, summary;
+};
+
+Site MakeSite() {
+  Site site;
+  // What a dev file would configure. A release build ignores it.
+  site.endpoints.releases_latest_url = "http://gitea.test:3000/api/v1/repos/o/r/releases/latest";
+  site.endpoints.recipes_auth_header = "token dev-secret";
+  site.endpoints.api_base_url = "http://api.test:8787";
+  site.endpoints.allow_plain_http = true;
+  if (DevEndpointsCompiledIn()) {
+    site.latest = site.endpoints.releases_latest_url;
+    site.assets = "http://gitea.test:3000/o/r/releases/download/";
+    site.summary = "http://api.test:8787/v1/summary.json";
+  } else {
+    site.latest = kRecipesReleasesLatestUrl;
+    site.assets = "https://github.com/leolobato/playden-ps5-recipes/releases/download/";
+    site.summary = "https://api.playden.club/v1/summary.json";
+  }
+  return site;
+}
+
+struct Recipe {
+  std::string path;  // in the zip
+  std::string id;
+  std::string bytes;
+  std::string listed_revision;  // empty: its own sha256; "-": not in the index
+};
+
+struct Published {
+  std::string tag, index, zip;
+};
+
+// Publishes a release: index.json and recipes.zip behind a redirect to githubusercontent (as
+// GitHub does), the release JSON at the latest URL.
+Published Publish(Network& network, const Site& site, const std::string& tag, const std::vector<Recipe>& recipes,
+                  std::vector<Entry> extra = {}, std::uint64_t zip_size_override = 0) {
+  std::vector<Entry> entries;
+  for (const auto& recipe : recipes) entries.push_back({recipe.path, recipe.bytes, entries.size() % 2 == 0});
+  for (auto& entry : extra) entries.push_back(std::move(entry));
+  const std::string zip = Zip(entries);
+  // Index format 2: the recipes by game, the game named by the path recipes/<store>/<key>/<slug>.json.
+  std::map<std::pair<std::string, std::string>, std::string> games;
+  for (const auto& recipe : recipes) {
+    if (recipe.listed_revision == "-") continue;
+    const auto store_end = recipe.path.find('/', 8);
+    const auto key_end = recipe.path.find('/', store_end + 1);
+    auto& list = games[{recipe.path.substr(8, store_end - 8), recipe.path.substr(store_end + 1, key_end - store_end - 1)}];
+    if (!list.empty()) list += ",";
+    list += R"({"id":")" + recipe.id + R"(","title":"t","status":"works","author":"a","contributors":[],)"
+            R"("tested_kit":"0.12","min_kit":"","tested_firmware":"","tested_date":"","revision":")" +
+            (recipe.listed_revision.empty() ? Sha256Hex(recipe.bytes) : recipe.listed_revision) + R"("})";
+  }
+  std::string games_json;
+  for (const auto& [game, list] : games)
+    games_json += (games_json.empty() ? "" : ",") + (R"({"store":")" + game.first + R"(","key":")" + game.second +
+                                                     R"(","name":"Darkwood","recipes":[)" + list + "]}");
+  const std::string index = R"({"format_version":2,"generated_at":"2026-10-22T00:00:00Z","zip_sha256":")" +
+                            Sha256Hex(zip) + R"(","games":[)" + games_json + "]}";
+  std::lock_guard<std::mutex> lock(network.mutex);
+  for (const auto& [name, bytes] : {std::pair<std::string, const std::string*>{"index.json", &index}, {"recipes.zip", &zip}}) {
+    const std::string url = site.assets + tag + "/" + name;
+    const std::string cdn = "https://objects.githubusercontent.com/" + tag + "/" + name;
+    network.routes[url] = Route{302, {}, {{"Location", cdn}}};
+    network.routes[cdn] = Route{200, *bytes, {}};
+  }
+  const std::uint64_t zip_size = zip_size_override ? zip_size_override : zip.size();
+  network.routes[site.latest] = Route{
+      200,
+      R"({"tag_name":")" + tag + R"(","draft":false,"prerelease":false,"assets":[)"
+      R"({"name":"index.json","size":)" + std::to_string(index.size()) + R"(,"browser_download_url":")" + site.assets +
+          tag + R"(/index.json"},)"
+      R"({"name":"recipes.zip","size":)" + std::to_string(zip_size) + R"(,"browser_download_url":")" + site.assets + tag +
+          R"(/recipes.zip"},)"
+      R"({"name":"other.bin","size":5,"browser_download_url":"https://example.org/other.bin"}]})",
+      {}};
+  return {tag, index, zip};
+}
+
+struct Harness {
+  Network network;
+  Site site = MakeSite();
+  std::atomic<std::int64_t> now{1'000'000};
+  std::vector<std::string> log;
+  std::mutex log_mutex;
+  std::set<std::string> referenced;
+  bool use_referenced = false;
+  std::function<bool(const std::string&)> before_write;
+
+  std::unique_ptr<CommunityRecipeService> Make(const std::string& root) {
+    RecipeServiceConfig config;
+    config.store_root = root;
+    config.endpoints = site.endpoints;
+    config.fetch = [this](const steam::HttpRequest& request, const std::atomic<bool>& cancel) {
+      return network.Fetch(request, cancel);
+    };
+    config.log = [this](const std::string& line) {
+      std::lock_guard<std::mutex> lock(log_mutex);
+      log.push_back(line);
+    };
+    config.now = [this] { return now.load(); };
+    if (use_referenced) config.referenced = [this] { return referenced; };
+    config.before_write = before_write;
+    config.worker_stack_bytes = 512 << 10;
+    return std::make_unique<CommunityRecipeService>(std::move(config));
+  }
+  bool Logged(const std::string& text) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    for (const auto& line : log)
+      if (line.find(text) != std::string::npos) return true;
+    return false;
+  }
+};
+
+const RecipeSummary* Find(const RecipeSnapshot& snapshot, const GameRef& game, const std::string& id) {
+  const auto* list = snapshot.For(game);
+  if (!list) return nullptr;
+  for (const auto& summary : *list)
+    if (summary.id == id) return &summary;
+  return nullptr;
+}
+
+std::string TempRoot(const char* tag) {
+  std::string pattern = std::string("/tmp/playden-") + tag + "-XXXXXX";
+  std::vector<char> buffer(pattern.begin(), pattern.end());
+  buffer.push_back('\0');
+  const char* made = mkdtemp(buffer.data());
+  if (!made) return {};
+  const auto base = fs::canonical(made);
+  fs::create_directory(base / "user");
+  return (base / "user" / "community-recipes").string();
+}
+
+// index.json format 2 alone: games by store and key, ids made from the game, format 1 refused.
+void IndexFormat() {
+  const std::string revision(64, 'a');
+  const auto entry = [&](const std::string& id, char rev = 'a') {
+    return R"({"id":")" + id + R"(","title":"t","status":"works","revision":")" + std::string(64, rev) + R"("})";
+  };
+  const auto index = [&](const std::string& games, int format = 2) {
+    return R"({"format_version":)" + std::to_string(format) + R"(,"zip_sha256":")" + revision + R"(","games":[)" + games + "]}";
+  };
+  std::string error;
+  std::vector<std::string> log;
+  const auto keep = [&](const std::string& line) { log.push_back(line); };
+  const auto parsed = ParseRecipeIndex(
+      index(R"({"store":"steam","key":"274520","name":"Darkwood","recipes":[)" + entry("community-steam-274520-a") + "," +
+            entry("community-steam-274520-b", 'b') + "," + entry("community-steam-27452-c") + "," +
+            R"({"id":"community-steam-274520-made","revision":")" + std::string(64, 'c') + R"(","made_on":"imported"}]},)"
+            R"({"store":"imported","key":"tmnt-mutant-melee","name":"TMNT: Mutant Melee","recipes":[)" +
+            entry("community-imported-tmnt-mutant-melee-arrow-keys", 'd') + "]}," +
+            R"({"store":"local","key":"x","name":"X","recipes":[]},)"
+            R"({"store":"steam","key":"274520\n","name":"X","recipes":[]},)"
+            R"({"store":"steam","key":"274520","name":"Again","recipes":[]},)"
+            R"({"store":"gog","key":"1207658924","name":"Line\u2028break","recipes":[)" + entry("community-gog-1207658924-a", 'e') + "]}"),
+      &error, keep);
+  if (!parsed) std::fprintf(stderr, "index refused: %s\n", error.c_str());
+  CHECK(parsed && parsed->count == 5);
+  if (parsed) {
+    const auto darkwood = GameRef::Steam(274520);
+    CHECK(parsed->games.size() == 3 && parsed->games.at(darkwood).name == "Darkwood");
+    CHECK(parsed->games.at(darkwood).recipes.size() == 3 && parsed->games.at(darkwood).recipes[0].slug == "a" &&
+          parsed->games.at(darkwood).recipes[0].game == darkwood);
+    CHECK(parsed->Find(darkwood, "community-steam-274520-b") && !parsed->Find(darkwood, "community-steam-27452-c"));
+    CHECK(parsed->Find(darkwood, "community-steam-274520-made")->made_on == "imported" &&
+          parsed->Find(darkwood, "community-steam-274520-a")->made_on.empty());
+    const GameRef tmnt{"imported", "tmnt-mutant-melee"};
+    CHECK(parsed->Find(tmnt, "community-imported-tmnt-mutant-melee-arrow-keys") &&
+          parsed->Find(tmnt, "community-imported-tmnt-mutant-melee-arrow-keys")->slug == "arrow-keys");
+    CHECK(!parsed->Find(GameRef{"imported", "tmnt"}, "community-imported-tmnt-mutant-melee-arrow-keys"));
+    // A name that isn't one is left empty; the game and its recipes stay.
+    CHECK(parsed->games.at(GameRef{"gog", "1207658924"}).name.empty() && parsed->games.at(GameRef{"gog", "1207658924"}).recipes.size() == 1);
+  }
+  const auto logged = [&](const char* text) {
+    for (const auto& line : log)
+      if (line.find(text) != std::string::npos) return true;
+    std::fprintf(stderr, "not logged: %s\n", text);
+    return false;
+  };
+  CHECK(logged("index entry under steam/274520 dropped") && logged("index game \"local/x\" dropped") &&
+        logged("index game steam/274520 dropped: listed twice"));
+  // Format 1 (by Steam app ID) was never released: refused whole.
+  CHECK(!ParseRecipeIndex(R"({"format_version":1,"zip_sha256":")" + revision + R"(","apps":{"274520":[]}})", &error) &&
+        error.find("format_version") != std::string::npos);
+  CHECK(!ParseRecipeIndex(index("", 3), &error));
+  CHECK(!ParseRecipeIndex(R"({"format_version":2,"zip_sha256":")" + revision + R"(","apps":{}})", &error) &&
+        error.find("no games") != std::string::npos);
+  CHECK(ParseRecipeIndex(index(""), &error) && ParseRecipeIndex(index(""), &error)->count == 0);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    std::fprintf(stderr, "usage: %s <tests/fixtures/community-recipes>\n", argv[0]);
+    return 2;
+  }
+  const std::string fixtures = argv[1];
+  IndexFormat();
+  const std::string good = Slurp(fixtures + "/recipes/steam/274520/120hz-left-stick-pointer.json");
+  const std::string good_id = "community-steam-274520-120hz-left-stick-pointer";
+  CHECK(!good.empty());
+  const std::string second = Replace(good, good_id, "community-steam-274520-second");
+  const std::string flagged = Slurp(fixtures + "/flagged/publisher-key.json");
+  const std::string hostile = Replace(Slurp(fixtures + "/hostile/wildcard-override.json"), good_id,
+                                      "community-steam-274520-hostile");
+  const std::string other_app = Replace(Replace(good, good_id, "community-steam-10-other"), "274520", "10");
+  const std::string imported = Slurp(fixtures + "/recipes/imported/tmnt-mutant-melee/arrow-keys.json");
+  const GameRef tmnt{"imported", "tmnt-mutant-melee"};
+  // A settings-only recipe (format 2) loads beside format 1 ones; a version this build doesn't read is dropped alone,
+  // as an older build drops a format 2 file.
+  const std::string settings_only = Slurp(fixtures + "/accepted/settings-only.json");
+  const std::string settings_only_id = "community-steam-274520-mouse-preset";
+  const std::string future = Replace(Slurp(fixtures + "/hostile/format-unknown.json"), settings_only_id,
+                                     "community-steam-274520-future");
+  CHECK(!settings_only.empty() && future.find("community-steam-274520-future") != std::string::npos);
+  const std::string root = TempRoot("community-service");
+  CHECK(!root.empty());
+
+  const std::vector<Recipe> release1 = {
+      {"recipes/steam/274520/120hz-left-stick-pointer.json", good_id, good, ""},
+      {"recipes/steam/274520/second.json", "community-steam-274520-second", second, ""},
+      {"recipes/steam/274520/publisher-key.json", "community-steam-274520-publisher-key", flagged, ""},
+      {"recipes/steam/10/other.json", "community-steam-10-other", other_app, ""},
+      // An imported game's, under its name key.
+      {"recipes/imported/tmnt-mutant-melee/arrow-keys.json", "community-imported-tmnt-mutant-melee-arrow-keys", imported, ""},
+      // A Steam game's recipe filed under an imported game whose key is the same digits: its game differs from the path.
+      {"recipes/imported/274520/second.json", "community-imported-274520-second", second, ""},
+      // Not a recipe at all.
+      {"recipes/steam/274520/broken.json", "community-steam-274520-broken", "{not json", ""},
+      // The index lists another revision for it.
+      {"recipes/steam/274520/mismatch.json", "community-steam-274520-mismatch", second, std::string(64, 'b')},
+      // In the zip, not in the index.
+      {"recipes/steam/274520/unlisted.json", "community-steam-274520-unlisted", second, "-"},
+      // The rules refuse it (a wildcard library override).
+      {"recipes/steam/274520/hostile.json", "community-steam-274520-hostile", hostile, ""},
+      // Listed under a path whose id differs from the one inside.
+      {"recipes/steam/274520/wrong-path.json", "community-steam-274520-wrong-path", second, ""},
+      // Larger than 16 KB.
+      {"recipes/steam/274520/huge.json", "community-steam-274520-huge", good + std::string(17 << 10, ' '), ""},
+  };
+  const std::vector<Entry> outside = {
+      {"other/274520/x.json", second},
+      {"recipes/steam/274520/", ""},
+      {"recipes/../x.json", second},
+      {"recipes/steam/274520/sub/x.json", second},
+      {"recipes/steam/0274520/x.json", second},
+      {"recipes/steam/274520/Bad_Slug.json", second},
+      // The old layout (no store), a store Playden doesn't know, a key the store refuses.
+      {"recipes/274520/old.json", second},
+      {"recipes/local/274520/x.json", second},
+      {"recipes/steam/274520\n/x.json", second},
+  };
+
+  Harness h;
+  h.use_referenced = true;
+  const auto r1 = Publish(h.network, h.site, "r20261022.1", release1, outside);
+  {
+    h.network.routes[h.site.summary] = Route{
+        200, R"({"generated_at":"2026-11-07T10:00:00Z","recipes":{")" + good_id + R"(":{")" + Sha256Hex(good) +
+                 R"(":{"up":42,"down":3,"reasons":{"slow":1,"crash":2},"kits":{},"verified":true,"author":"account","author_trusted":true}}},)"
+                 R"("games":{"steam":{"274520":{"status":"works","reports":14}}}})", {}};
+    auto service = h.Make(root);
+    service->Start();
+    service->Wait();
+    const auto snapshot = service->Snapshot();
+    CHECK(snapshot->release_tag == "r20261022.1");
+    CHECK(snapshot->last_error.empty());
+    CHECK(!snapshot->refreshing);
+    CHECK(snapshot->fetched_at == 1'000'000);
+    CHECK(snapshot->votes_generated_at == 1794045600);  // when the API made the totals
+    // The compatibility list comes with the totals.
+    CHECK(snapshot->compat && snapshot->compat->size() == 1 &&
+          snapshot->compat->at(GameRef::Steam(274520)) == (ListedGame{"works", 14}));
+    const auto* list = snapshot->For(GameRef::Steam(274520));
+    CHECK(list && list->size() == 3);
+    const auto* first = Find(*snapshot, GameRef::Steam(274520), good_id);
+    CHECK(first && first->title == "120 Hz, pointer on left stick" && first->author == "TodorPenchev");
+    CHECK(first && first->revision == Sha256Hex(good) && first->status == "works" && first->tested_kit == "0.12");
+    CHECK(first && !first->notes.empty() && !first->flags.empty());
+    CHECK(first && first->votes && first->votes->up == 42 && first->votes->down == 3);
+    CHECK(first && first->votes && first->votes->reasons.size() == 2 && first->votes->reasons[0].first == "crash");
+    CHECK(first && first->votes && first->votes->verified && first->votes->author == "account" && first->votes->author_trusted);
+    CHECK(Find(*snapshot, GameRef::Steam(274520), "community-steam-274520-second") && !Find(*snapshot, GameRef::Steam(274520), "community-steam-274520-second")->votes);
+    CHECK(Find(*snapshot, GameRef::Steam(274520), "community-steam-274520-publisher-key"));
+    CHECK(Find(*snapshot, GameRef::Steam(10), "community-steam-10-other"));
+    CHECK(Find(*snapshot, tmnt, "community-imported-tmnt-mutant-melee-arrow-keys") &&
+          Find(*snapshot, tmnt, "community-imported-tmnt-mutant-melee-arrow-keys")->game == tmnt);
+    CHECK(!snapshot->For(GameRef{"imported", "274520"}));
+    CHECK(snapshot->game_names.count(GameRef::Steam(274520)) && snapshot->game_names.at(GameRef::Steam(274520)) == "Darkwood");
+    for (const char* dropped : {"broken", "mismatch", "unlisted", "hostile", "wrong-path", "huge"})
+      CHECK(!Find(*snapshot, GameRef::Steam(274520), std::string("community-steam-274520-") + dropped));
+    for (const char* logged : {"community-steam-274520-broken dropped: not a recipe", "mismatch.json dropped: does not match", "unlisted.json dropped: not listed",
+                               "community-steam-274520-hostile dropped: refused", "wrong-path dropped", "huge.json dropped",
+                               "other/274520/x.json dropped", "recipes/steam/274520/ dropped", "recipes/../x.json dropped",
+                               "sub/x.json dropped", "0274520/x.json dropped", "Bad_Slug.json dropped",
+                               "recipes/274520/old.json dropped", "recipes/local/274520/x.json dropped",
+                               "community-imported-274520-second dropped: its id differs from its path"})
+      if (!h.Logged(logged)) std::fprintf(stderr, "not logged: %s\n", logged), ++failures;
+    // The recipe itself, by full revision or the 32-hex prefix an installed game's record holds.
+    const auto loaded = service->LoadRecipe(Sha256Hex(good));
+    CHECK(loaded && loaded->recipe.id == good_id && loaded->game == GameRef::Steam(274520) && loaded->recipe.app_id == 0);
+    CHECK(service->LoadRecipe(Sha256Hex(good).substr(0, 32)));
+    CHECK(!service->LoadRecipe(Sha256Hex(hostile)));
+    CHECK(!service->LoadRecipe(std::string(64, 'c')));
+    CHECK(!service->LoadRecipe("not-a-revision"));
+
+    // Credentials: the recipes server's auth header (dev only) never reaches the API or the CDN.
+    std::lock_guard<std::mutex> lock(h.network.mutex);
+    bool api_seen = false, recipes_auth = false;
+    for (const auto& request : h.network.seen) {
+      const bool to_api = request.url == h.site.summary;
+      api_seen |= to_api;
+      const bool to_recipes = request.url.rfind("http://gitea.test:3000/", 0) == 0;
+      if (DevEndpointsCompiledIn() && to_recipes) recipes_auth |= HasHeader(request, "Authorization");
+      if (!to_recipes) CHECK(!HasHeader(request, "Authorization"));
+      if (!DevEndpointsCompiledIn()) CHECK(request.url.rfind("https://", 0) == 0 && !HasHeader(request, "Authorization"));
+      CHECK(request.url.find("example.org") == std::string::npos);  // other assets are never fetched
+    }
+    CHECK(api_seen);
+    CHECK(recipes_auth == DevEndpointsCompiledIn());
+  }
+
+  // Offline: a new start loads the copy on disk; the refresh fails and says so.
+  {
+    h.network.offline = true;
+    auto service = h.Make(root);
+    service->Start();
+    service->Wait();
+    const auto snapshot = service->Snapshot();
+    CHECK(snapshot->release_tag == "r20261022.1" && snapshot->For(GameRef::Steam(274520)) && snapshot->For(GameRef::Steam(274520))->size() == 3);
+    CHECK(!snapshot->last_error.empty());
+    CHECK(Find(*snapshot, GameRef::Steam(274520), good_id) && Find(*snapshot, GameRef::Steam(274520), good_id)->votes);  // votes kept on disk
+    CHECK(service->LoadRecipe(Sha256Hex(good).substr(0, 32)));
+    // Not forced: waits an hour after a failure, and a day after success.
+    h.network.Clear();
+    service->RequestRefresh(false);
+    service->Wait();
+    CHECK(h.network.Count(h.site.latest) == 0);
+    h.network.offline = false;
+  }
+
+  // The same release again: only the release and the votes are fetched.
+  {
+    auto service = h.Make(root);
+    h.network.Clear();
+    service->Start();
+    service->Wait();
+    CHECK(h.network.Count(h.site.latest) == 1);
+    CHECK(h.network.Count(h.site.assets + "r20261022.1/recipes.zip") == 0);
+    CHECK(service->Snapshot()->For(GameRef::Steam(274520))->size() == 3);
+    // Not forced within a day: nothing; a day later: a refresh.
+    h.network.Clear();
+    service->RequestRefresh(false);
+    service->Wait();
+    CHECK(h.network.Count(h.site.latest) == 0);
+    h.now += CommunityRecipeService::kRefreshInterval + 1;
+    service->RequestRefresh(false);
+    service->Wait();
+    CHECK(h.network.Count(h.site.latest) == 1);
+  }
+
+  // Switching releases: r2 changes "second"; r1's objects stay until nothing references them.
+  const std::string second_v2 = Replace(second, "\"status\": \"works\"", "\"status\": \"playable\"");
+  CHECK(second_v2 != second);
+  {
+    h.use_referenced = false;  // no garbage collection after this refresh
+    Publish(h.network, h.site, "r20261023.1",
+            {{"recipes/steam/274520/120hz-left-stick-pointer.json", good_id, good, ""},
+             {"recipes/steam/274520/second.json", "community-steam-274520-second", second_v2, ""}});
+    auto service = h.Make(root);
+    service->Start();
+    service->Wait();
+    auto snapshot = service->Snapshot();
+    CHECK(snapshot->release_tag == "r20261023.1");
+    CHECK(snapshot->For(GameRef::Steam(274520)) && snapshot->For(GameRef::Steam(274520))->size() == 2);
+    CHECK(Find(*snapshot, GameRef::Steam(274520), "community-steam-274520-second")->revision == Sha256Hex(second_v2));
+    CHECK(!snapshot->For(GameRef::Steam(10)));
+    // r1's objects are still there: an installed game pinned to the old revision keeps working.
+    CHECK(service->LoadRecipe(Sha256Hex(second)));
+    CHECK(service->LoadRecipe(Sha256Hex(other_app)));
+    // A game pinned (by prefix) to the old "second", another to "other" (full revision).
+    // publisher-key and the imported game's
+    CHECK(service->CollectGarbage({Sha256Hex(second).substr(0, 32), Sha256Hex(other_app)}) == 2);
+    CHECK(!service->LoadRecipe(Sha256Hex(flagged)) && !service->LoadRecipe(Sha256Hex(imported)));
+    CHECK(service->LoadRecipe(Sha256Hex(second)) && service->LoadRecipe(Sha256Hex(other_app)));
+    CHECK(service->CollectGarbage({}) == 2);
+    CHECK(!service->LoadRecipe(Sha256Hex(second)) && !service->LoadRecipe(Sha256Hex(other_app)));
+    CHECK(service->LoadRecipe(Sha256Hex(good)) && service->LoadRecipe(Sha256Hex(second_v2)));  // current: kept
+  }
+
+  // A refresh stopped before the pointer is replaced: the previous release stays in use, now and
+  // after a restart.
+  const std::string second_v3 = Replace(second, "\"status\": \"works\"", "\"status\": \"broken\"");
+  {
+    Publish(h.network, h.site, "r20261024.1", {{"recipes/steam/274520/second.json", "community-steam-274520-second", second_v3, ""}});
+    h.before_write = [](const std::string& step) { return step != "current"; };
+    auto service = h.Make(root);
+    service->Start();
+    service->Wait();
+    CHECK(service->Snapshot()->release_tag == "r20261023.1");
+    CHECK(!service->Snapshot()->last_error.empty());
+    h.before_write = nullptr;
+  }
+  {
+    h.network.offline = true;
+    auto service = h.Make(root);
+    service->Start();
+    service->Wait();
+    const auto snapshot = service->Snapshot();
+    CHECK(snapshot->release_tag == "r20261023.1" && snapshot->For(GameRef::Steam(274520)) && snapshot->For(GameRef::Steam(274520))->size() == 2);
+    h.network.offline = false;
+  }
+
+  // Two refreshes at once: the second is dropped while the first runs.
+  {
+    auto service = h.Make(root);
+    {
+      std::lock_guard<std::mutex> lock(h.network.mutex);
+      h.network.hold = h.site.latest;
+      h.network.held = h.network.release = false;
+    }
+    h.network.Clear();
+    service->RequestRefresh(true);
+    {
+      std::unique_lock<std::mutex> lock(h.network.mutex);
+      h.network.changed.wait(lock, [&] { return h.network.held; });
+    }
+    CHECK(service->Busy());
+    service->RequestRefresh(true);
+    service->RequestRefresh(false);
+    {
+      std::lock_guard<std::mutex> lock(h.network.mutex);
+      h.network.release = true;
+      h.network.hold.clear();
+      h.network.changed.notify_all();
+    }
+    service->Wait();
+    CHECK(h.network.Count(h.site.latest) == 1);
+    CHECK(service->Snapshot()->release_tag == "r20261024.1");
+    CHECK(h.Logged("refresh already running"));
+  }
+
+  // Refused releases leave the copy in use.
+  auto refused = [&](const char* what, const std::function<void()>& publish) {
+    publish();
+    auto service = h.Make(root);
+    service->Start();
+    service->Wait();
+    const auto snapshot = service->Snapshot();
+    if (snapshot->release_tag != "r20261024.1" || snapshot->last_error.empty())
+      std::fprintf(stderr, "refused release accepted: %s\n", what), ++failures;
+    CHECK(Find(*snapshot, GameRef::Steam(274520), "community-steam-274520-second") &&
+          Find(*snapshot, GameRef::Steam(274520), "community-steam-274520-second")->revision == Sha256Hex(second_v3));
+  };
+  h.network.Clear();
+  refused("zip larger than 2 MB (declared)", [&] {
+    Publish(h.network, h.site, "r-big", {{"recipes/steam/274520/second.json", "community-steam-274520-second", second, ""}}, {},
+            (2 << 20) + 1);
+  });
+  CHECK(h.network.Count(h.site.assets + "r-big/recipes.zip") == 0);  // refused before downloading
+  refused("zip larger than declared", [&] {
+    Publish(h.network, h.site, "r-bigger", {{"recipes/steam/274520/second.json", "community-steam-274520-second", second, ""}}, {}, 10);
+  });
+  refused("zip larger than 2 MB (sent)", [&] {
+    Publish(h.network, h.site, "r-sent",
+                             {{"recipes/steam/274520/second.json", "community-steam-274520-second", second, ""}});
+    h.network.routes["https://objects.githubusercontent.com/r-sent/recipes.zip"].body += std::string(2 << 20, 'x');
+  });
+  refused("too many entries", [&] {
+    std::vector<Entry> many;
+    for (int i = 0; i < 2001; ++i) many.push_back({"recipes/steam/10/n" + std::to_string(i) + ".json", "x"});
+    Publish(h.network, h.site, "r-many", {{"recipes/steam/274520/second.json", "community-steam-274520-second", second, ""}}, many);
+  });
+  refused("zip does not match the index", [&] {
+    Publish(h.network, h.site, "r-hash", {{"recipes/steam/274520/second.json", "community-steam-274520-second", second, ""}});
+    auto& zip = h.network.routes["https://objects.githubusercontent.com/r-hash/recipes.zip"].body;
+    zip[zip.size() / 2] ^= 1;
+  });
+  refused("unsafe tag", [&] {
+    Publish(h.network, h.site, "../escape", {{"recipes/steam/274520/second.json", "community-steam-274520-second", second, ""}});
+  });
+  refused("redirect to another host", [&] {
+    Publish(h.network, h.site, "r-evil", {{"recipes/steam/274520/second.json", "community-steam-274520-second", second, ""}});
+    h.network.routes[h.site.assets + "r-evil/index.json"] = Route{302, {}, {{"Location", "https://evil.example.org/i"}}};
+  });
+  CHECK(h.network.Count("https://evil.example.org/i") == 0);
+  // In a release build the configured (dev) endpoints were never used.
+  if (!DevEndpointsCompiledIn()) CHECK(h.network.Count("http://gitea.test:3000/api/v1/repos/o/r/releases/latest") == 0);
+
+  // Votes are optional: without summary.json the refresh still succeeds.
+  {
+    h.network.routes.erase(h.site.summary);
+    Publish(h.network, h.site, "r20261025.1", {{"recipes/steam/274520/second.json", "community-steam-274520-second", second, ""}});
+    auto service = h.Make(root);
+    service->Start();
+    service->Wait();
+    const auto snapshot = service->Snapshot();
+    CHECK(snapshot->release_tag == "r20261025.1" && snapshot->last_error.empty());
+    CHECK(h.Logged("vote totals unavailable"));
+    CHECK(snapshot->votes_generated_at == 1794045600);  // the stored totals, with their time
+
+  }
+
+  // A refresh writing objects (parked on a latch under the store's write lock) doesn't hold up
+  // LoadRecipe, which the UI thread calls. Then Playden closes mid-write: the writes stop between
+  // files and the pointer stays on the previous release.
+  {
+    const std::string third = Replace(second, "community-steam-274520-second", "community-steam-274520-third");
+    const std::string fourth = Replace(second, "community-steam-274520-second", "community-steam-274520-fourth");
+    Publish(h.network, h.site, "r20261026.1",
+            {{"recipes/steam/274520/third.json", "community-steam-274520-third", third, ""},
+             {"recipes/steam/274520/fourth.json", "community-steam-274520-fourth", fourth, ""}});
+    std::mutex latch_mutex;
+    std::condition_variable latch;
+    bool parked = false, go = false;
+    int objects = 0;
+    h.before_write = [&](const std::string& step) {
+      if (step != "object") return true;
+      std::unique_lock<std::mutex> lock(latch_mutex);
+      if (++objects == 1) {
+        parked = true;
+        latch.notify_all();
+        latch.wait(lock, [&] { return go; });
+      }
+      return true;
+    };
+    auto service = h.Make(root);
+    h.before_write = nullptr;
+    service->Start();
+    {
+      std::unique_lock<std::mutex> lock(latch_mutex);
+      CHECK(latch.wait_for(lock, std::chrono::seconds(10), [&] { return parked; }));
+    }
+    auto loading = std::async(std::launch::async, [&] { return service->LoadRecipe(Sha256Hex(second)).has_value(); });
+    auto by_prefix =
+        std::async(std::launch::async, [&] { return service->LoadRecipe(Sha256Hex(second).substr(0, 32)).has_value(); });
+    CHECK(loading.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    CHECK(by_prefix.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    // Playden closes while the first object is being written.
+    std::thread closing([&] { service->Shutdown(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // Shutdown sets the cancel flag, then joins
+    {
+      std::lock_guard<std::mutex> lock(latch_mutex);
+      go = true;
+      latch.notify_all();
+    }
+    closing.join();
+    CHECK(loading.get() && by_prefix.get());
+    CHECK(objects == 1);  // the second object was never started
+    CHECK(service->Snapshot()->release_tag == "r20261025.1");
+    RecipeStore store{fs::path(root)};
+    std::string ignored;
+    CHECK(store.Prepare(&ignored) && store.ReadCurrent() && store.ReadCurrent()->tag == "r20261025.1");
+    CHECK(!store.ReadObject(Sha256Hex(fourth)));
+  }
+
+  {
+    // One release with a format 1 recipe, a settings-only one (format 2) and one of a version this build doesn't
+    // read: the first two load, the last is dropped alone with its reason, as an older build drops a format 2 file.
+    const std::string formats_root = TempRoot("community-formats");
+    CHECK(!formats_root.empty());
+    Harness formats;
+    Publish(formats.network, formats.site, "r20261108.1",
+            {{"recipes/steam/274520/120hz-left-stick-pointer.json", good_id, good, ""},
+             {"recipes/steam/274520/mouse-preset.json", settings_only_id, settings_only, ""},
+             {"recipes/steam/274520/future.json", "community-steam-274520-future", future, ""}},
+            {});
+    auto service = formats.Make(formats_root);
+    service->Start();
+    service->Wait();
+    const auto snapshot = service->Snapshot();
+    CHECK(snapshot->release_tag == "r20261108.1" && snapshot->last_error.empty());
+    const auto* list = snapshot->For(GameRef::Steam(274520));
+    CHECK(list && list->size() == 2 && Find(*snapshot, GameRef::Steam(274520), good_id));
+    const auto* plain = Find(*snapshot, GameRef::Steam(274520), settings_only_id);
+    CHECK(plain && plain->title == "Mouse preset" && plain->flags.empty());
+    CHECK(!Find(*snapshot, GameRef::Steam(274520), "community-steam-274520-future"));
+    if (!formats.Logged("community-steam-274520-future dropped: not a recipe: community recipe needs community.format_version 1 to 2"))
+      std::fprintf(stderr, "not logged: the unknown version\n"), ++failures;
+    const auto loaded = service->LoadRecipe(Sha256Hex(settings_only));
+    CHECK(loaded && loaded->format_version == 2 && loaded->recipe.launch_entries.empty() && loaded->executable.empty());
+    service->Shutdown();
+    fs::remove_all(fs::path(formats_root).parent_path().parent_path());
+  }
+
+  fs::remove_all(fs::path(root).parent_path().parent_path());
+  if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
+  else std::printf("community recipe service (%s) ok\n", DevEndpointsCompiledIn() ? "dev" : "release");
+  return failures ? 1 : 0;
+}

@@ -2,11 +2,14 @@
 #include "steam_id.h"
 #include "runtime/game_probe.h"
 #include "runtime/install_script.h"
+#include "runtime/kit_version.h"
+#include "runtime/recipe_choice.h"
 #include "runtime/settings_publication.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -83,7 +86,8 @@ int main(int argc, char** argv) {
         "volume",
         "start_check",
         "graphics", "d3d12", "pixel_shader_waves", "frame_latency", "reported_gpu", "reported_vram",
-        "steam_features", "windows_version", "text_scale", "locale", "cpu_topology", "logging",
+        "steam_features", "steam_input", "windows_version", "text_scale", "locale", "cpu_topology", "address_space", "cpu",
+        "network_adapters", "logging",
         "environment", "program_folder", "program_arguments", "arguments", "architecture", "dll_overrides",
         "library_overrides", "registry_dll_overrides"};
     CHECK(ids == expected);
@@ -856,7 +860,8 @@ int main(int argc, char** argv) {
     CHECK(!CheckProsperoProfile(profile.text, &reason));  // a runtime without it refuses [runtime]
     CHECK(CheckProsperoProfile(profile.text, &reason, {.runtime_version = true}));
     CHECK(!CheckProsperoProfile(base + "\n[runtime]\nversion = 3\n", &reason, {.runtime_version = true}));
-    CHECK(!CheckProsperoProfile(base + "\n[runtime]\ncpu = native\n", &reason, {.runtime_version = true}));
+    CHECK(CheckProsperoProfile(base + "\n[runtime]\ncpu = native\n", &reason, {.runtime_version = true}));
+    CHECK(!CheckProsperoProfile(base + "\n[runtime]\ncpu = fast\n", &reason, {.runtime_version = true}));
     // Wave64 is the opt-out: RADV_PS5_PS_WAVE64=1, as before.
     CHECK(render(stray, {{"pixel_shader_waves", "wave64"}}, version_kit) ==
           base + version_2 + "\n[environment]\nRADV_PS5_PS_WAVE64 = 1\n");
@@ -914,6 +919,152 @@ int main(int argc, char** argv) {
     CHECK(BuildEffectiveSettings(hl2, nullptr, {{"cpu_topology", "4"}}, KitCapabilities{}, &settings, &error));
     CHECK(!settings.values.at("cpu_topology").available && !settings.values.at("reported_gpu").available);
     CHECK(!ValidateSettingValue(hl2, "registry_dll_overrides", "not a list", &reason));
+    // Address space: WINE_LARGE_ADDRESS_AWARE in [environment] for a 32-bit program, with a runtime that takes it.
+    {
+      auto lae = every;
+      lae.environment = lae.large_address_aware = lae.environment_file_budgets = lae.launch_arguments_4096 = true;
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"address_space", "4gb"}, {"cpu_topology", "4"}}, lae, &settings,
+                                   &error));
+      CHECK(settings.values.at("address_space").available);
+      CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+      CHECK(profile.text.find("\n[environment]\nWINE_CPU_TOPOLOGY = 4:0,1,2,3\nWINE_LARGE_ADDRESS_AWARE = 1\n") !=
+            std::string::npos);
+      CHECK(CheckProsperoProfile(profile.text, &reason, {.environment_section = true}));
+      // Environment variables may set it itself, and it is written once.
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"address_space", "4gb"}, {"environment", "WINE_LARGE_ADDRESS_AWARE=1"}},
+                                   lae, &settings, &error));
+      CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+      CHECK(profile.text.find("WINE_LARGE_ADDRESS_AWARE") == profile.text.rfind("WINE_LARGE_ADDRESS_AWARE"));
+      // An older runtime has no such row, and refuses the variable from Environment variables too.
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"address_space", "4gb"}}, every, &settings, &error));
+      CHECK(!settings.values.at("address_space").available && settings.values.at("address_space").value == "kit");
+      auto plain = every;
+      plain.environment = true;
+      CHECK(!BuildEffectiveSettings(hl2, nullptr, {{"environment", "WINE_LARGE_ADDRESS_AWARE=1"}}, plain, &settings,
+                                    &error));
+      CHECK(error.setting_id == "environment" && error.message == "WINE_LARGE_ADDRESS_AWARE needs a newer runtime kit");
+      CHECK(!BuildEffectiveSettings(hl2, nullptr, {{"environment", "WINE_PS5_PARK_FILES=96"}}, plain, &settings, &error));
+      // A value that only contains the name sets nothing: an older runtime takes it, and the row still writes its own.
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"environment", "SDL_HINT_X=a WINE_LARGE_ADDRESS_AWARE=1"}}, plain,
+                                   &settings, &error));
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"address_space", "4gb"}, {"environment", "SDL_HINT_X=X_WINE_LARGE_ADDRESS_AWARE=1"}},
+                                   lae, &settings, &error));
+      CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+      CHECK(profile.text.find("\nWINE_LARGE_ADDRESS_AWARE = 1\n") != std::string::npos);
+      CHECK(!BuildEffectiveSettings(hl2, nullptr, {{"environment", "WINE_PS5_PARK_FILES=96; WINE_PS5_CACHED_FILES=8"}},
+                                    KitForTitleRuntime(lae, false), &settings, &error));
+      CHECK(error.message == "WINE_PS5_PARK_FILES needs the game's runtime kit update");
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"environment", "WINE_PS5_PARK_FILES=96; WINE_PS5_CACHED_FILES=8"}},
+                                   lae, &settings, &error));
+      CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+      CHECK(profile.text.find("WINE_PS5_PARK_FILES = 96\nWINE_PS5_CACHED_FILES = 8\n") != std::string::npos);
+      CHECK(!ValidateSettingValue(hl2, "environment", "WINE_LARGE_ADDRESS_AWARE=2", &reason));
+      CHECK(!ValidateSettingValue(hl2, "environment", "WINE_PS5_PARK_FILES=12345", &reason));
+      // A title that waits for its update keeps the choice for then.
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"address_space", "4gb"}}, KitForTitleRuntime(lae, false), &settings,
+                                   &error));
+      CHECK(settings.values.at("address_space").waits_for_update && settings.values.at("address_space").after_update == "4gb");
+      // Only for 32-bit programs.
+      auto pe64 = hl2;
+      pe64.architecture = "pe64";
+      CHECK(BuildEffectiveSettings(pe64, nullptr, {{"address_space", "4gb"}}, lae, &settings, &error));
+      CHECK(!settings.values.at("address_space").available &&
+            settings.values.at("address_space").reason == "Only for 32-bit programs.");
+      // Network adapters Off: PW_NSIPROXY_DISABLE in [environment] for a 64-bit program, with a runtime that takes it.
+      {
+        auto nsi = every;
+        nsi.environment = nsi.nsiproxy_switch = true;
+        CHECK(BuildEffectiveSettings(pe64, nullptr, {{"network_adapters", "off"}}, nsi, &settings, &error));
+        CHECK(settings.values.at("network_adapters").available);
+        CHECK(RenderProsperoProfile(pe64, settings, target, &profile, &reason));
+        CHECK(profile.text.find("\n[environment]\nPW_NSIPROXY_DISABLE = 1\n") != std::string::npos);
+        CHECK(CheckProsperoProfile(profile.text, &reason, {.environment_section = true}));
+        // Runtime default writes nothing.
+        CHECK(BuildEffectiveSettings(pe64, nullptr, {}, nsi, &settings, &error));
+        CHECK(RenderProsperoProfile(pe64, settings, target, &profile, &reason));
+        CHECK(profile.text.find("PW_NSIPROXY_DISABLE") == std::string::npos);
+        // Environment variables may set it itself, and it is written once.
+        CHECK(BuildEffectiveSettings(pe64, nullptr, {{"network_adapters", "off"}, {"environment", "PW_NSIPROXY_DISABLE=1"}},
+                                     nsi, &settings, &error));
+        CHECK(RenderProsperoProfile(pe64, settings, target, &profile, &reason));
+        CHECK(profile.text.find("PW_NSIPROXY_DISABLE") == profile.text.rfind("PW_NSIPROXY_DISABLE"));
+        // An older runtime has no such row, and refuses the variable from Environment variables too.
+        auto older = every;
+        older.environment = true;
+        CHECK(BuildEffectiveSettings(pe64, nullptr, {{"network_adapters", "off"}}, older, &settings, &error));
+        CHECK(!settings.values.at("network_adapters").available && settings.values.at("network_adapters").value == "kit");
+        CHECK(!BuildEffectiveSettings(pe64, nullptr, {{"environment", "PW_NSIPROXY_DISABLE=1"}}, older, &settings, &error));
+        CHECK(error.setting_id == "environment" && error.message == "PW_NSIPROXY_DISABLE needs a newer runtime kit");
+        // A title that waits for its update keeps the choice for then.
+        CHECK(BuildEffectiveSettings(pe64, nullptr, {{"network_adapters", "off"}}, KitForTitleRuntime(nsi, false),
+                                     &settings, &error));
+        CHECK(settings.values.at("network_adapters").waits_for_update &&
+              settings.values.at("network_adapters").after_update == "off");
+        CHECK(!BuildEffectiveSettings(pe64, nullptr, {{"environment", "PW_NSIPROXY_DISABLE=1"}},
+                                      KitForTitleRuntime(nsi, false), &settings, &error));
+        CHECK(error.message == "PW_NSIPROXY_DISABLE needs the game's runtime kit update");
+        // A 32-bit program hosts no nsiproxy anyway: the row stays open (an unprepared game has no architecture yet).
+        CHECK(BuildEffectiveSettings(hl2, nullptr, {{"network_adapters", "off"}}, nsi, &settings, &error));
+        CHECK(settings.values.at("network_adapters").available);
+        // Like CPU cores, it takes its place before the player's variables, which the limit trims.
+        CHECK(BuildEffectiveSettings(pe64, nullptr,
+                                     {{"network_adapters", "off"},
+                                      {"environment", "DXVK_A=1; DXVK_B=1; DXVK_C=1; DXVK_D=1; DXVK_E=1; DXVK_F=1; "
+                                                      "DXVK_G=1; DXVK_H=1"}},
+                                     nsi, &settings, &error));
+        CHECK(RenderProsperoProfile(pe64, settings, target, &profile, &reason));
+        CHECK(profile.text.find("\n[environment]\nPW_NSIPROXY_DISABLE = 1\n") != std::string::npos);
+        CHECK(KitCapabilitiesFromManifest({kKitNsiproxySwitch}, true).nsiproxy_switch);
+      }
+      // 32-bit code: Native writes nothing; Translator writes [runtime] cpu, once, with the version when there is one.
+      auto v2 = every;
+      v2.profile_version_2 = true;
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {}, v2, &settings, &error));
+      CHECK(settings.values.at("cpu").available && settings.values.at("cpu").value == "native");
+      CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+      CHECK(profile.text.find("cpu =") == std::string::npos);
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"cpu", "translator"}}, v2, &settings, &error));
+      CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+      CHECK(profile.text.find("\ncpu = translator\n") != std::string::npos);
+      CHECK(profile.text.find("[runtime]") == profile.text.rfind("[runtime]"));
+      CHECK(CheckProsperoProfile(profile.text, &reason, {.runtime_version = true}));
+      // A generated recipe's default (a Watcom program) is the row's value.
+      auto watcom = hl2;
+      watcom.defaults["cpu"] = "translator";
+      CHECK(BuildEffectiveSettings(watcom, nullptr, {}, v2, &settings, &error));
+      CHECK(settings.values.at("cpu").value == "translator");
+      CHECK(BuildEffectiveSettings(pe64, nullptr, {{"cpu", "translator"}}, v2, &settings, &error));
+      CHECK(!settings.values.at("cpu").available && settings.values.at("cpu").reason == "Only for 32-bit programs.");
+      // A title that waits for its update keeps the choice for then.
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"cpu", "translator"}}, KitForTitleRuntime(v2, false), &settings,
+                                   &error));
+      CHECK(settings.values.at("cpu").waits_for_update && settings.values.at("cpu").after_update == "translator");
+      auto version_1 = v2;
+      version_1.profile_version_2 = false;
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"cpu", "translator"}}, version_1, &settings, &error));
+      CHECK(!settings.values.at("cpu").available);
+      CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+      CHECK(profile.text.find("cpu =") == std::string::npos);
+      // A runtime that takes 4096-byte arguments also takes a profile up to 16384 bytes, with short arguments too.
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {}, lae, &settings, &error) && settings.long_profile);
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {}, every, &settings, &error) && !settings.long_profile);
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {}, KitForTitleRuntime(lae, false), &settings, &error) &&
+            !settings.long_profile);
+      // Arguments past 512 bytes: only for a runtime that takes 4096 (a long mod list on one command line).
+      const std::string mods = "/singleplayer _MODULES_*" + std::string(1500, 'M') + "*_MODULES_";
+      CHECK(ValidateSettingValue(hl2, "extra_arguments", mods, &reason));
+      CHECK(!ValidateSettingValue(hl2, "extra_arguments", std::string(4097, 'a'), &reason));
+      CHECK(!BuildEffectiveSettings(hl2, nullptr, {{"extra_arguments", mods}}, every, &settings, &error));
+      CHECK(error.setting_id == "extra_arguments" && error.message == "arguments past 512 bytes need a newer runtime kit");
+      CHECK(!BuildEffectiveSettings(hl2, nullptr, {{"extra_arguments", mods}}, KitForTitleRuntime(lae, false), &settings,
+                                    &error));
+      CHECK(error.message == "arguments past 512 bytes need the game's runtime kit update");
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"extra_arguments", mods}}, lae, &settings, &error));
+      CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+      CHECK(profile.text.find(mods) != std::string::npos);
+      CHECK(!CheckProsperoProfile(profile.text, &reason, {.environment_section = true}));  // a 512-byte title refuses it
+      CHECK(CheckProsperoProfile(profile.text, &reason, {.environment_section = true, .long_arguments = true}));
+    }
     // The title publication carries at most the two registry values it owns; a longer plan cannot be applied.
     CHECK(BuildEffectiveSettings(hl2, nullptr, {{"windows_version", "win7"}, {"text_scale", "120"},
         {"registry_dll_overrides", "winmm=d"}}, every, &settings, &error));
@@ -1624,10 +1775,10 @@ int main(int argc, char** argv) {
                             R"(["A/steam_api.dll","B/steam_api.dll","C/steam_api.dll","D/steam_api.dll","E/steam_api.dll"])"})
       CHECK(!ParseGameRecipe(with_copies(bad), &parsed, &reason));
     // A community recipe can't place a file in the game folder.
-    CHECK(!ParseGameRecipe(with_copies(R"(["Game/steam_api64.dll"])", "community-1903340-test"), &parsed, &reason));
+    CHECK(!ParseGameRecipe(with_copies(R"(["Game/steam_api64.dll"])", "community-steam-1903340-test"), &parsed, &reason));
     CommunityRecipe community;
     auto shared = with_copies(R"(["Game/steam_api64.dll"])");
-    shared.replace(shared.size() - 1, 1, R"(,"steam_appid":1903340,"executable":"g.exe","community":{"format_version":1,"status":"works"}})");
+    shared.replace(shared.size() - 1, 1, R"(,"executable":"g.exe","community":{"format_version":1,"status":"works"}})");
     CHECK(!ParseCommunityRecipe(shared, &community, &reason) && reason.find("steam_api_copies") != std::string::npos);
   }
   // Project Zomboid runs out of open files watching its folders, so Playden ships a watcher that watches nothing.
@@ -1652,10 +1803,10 @@ int main(int argc, char** argv) {
                             R"([""])", R"([1])", R"(["a.class","A.CLASS"])", R"(["a","b","c","d","e"])"})
       CHECK(!ParseGameRecipe(with_files(bad), &parsed, &reason));
     // A community recipe can't place a file in the game folder.
-    CHECK(!ParseGameRecipe(with_files(R"(["a.class"])", "community-108600-test"), &parsed, &reason));
+    CHECK(!ParseGameRecipe(with_files(R"(["a.class"])", "community-steam-108600-test"), &parsed, &reason));
     CommunityRecipe community;
     auto shared = with_files(R"(["a.class"])");
-    shared.replace(shared.size() - 1, 1, R"(,"steam_appid":108600,"executable":"g.exe","community":{"format_version":1,"status":"works"}})");
+    shared.replace(shared.size() - 1, 1, R"(,"executable":"g.exe","community":{"format_version":1,"status":"works"}})");
     CHECK(!ParseCommunityRecipe(shared, &community, &reason) && reason.find("game_files") != std::string::npos);
   }
   // Batman: Arkham City is Asylum's sibling: BatmanAC.exe starts BmLauncher.exe and exits too while UserEngine.ini has
@@ -1691,6 +1842,117 @@ int main(int argc, char** argv) {
   }
   CHECK(!ParseSettingsPresets(R"({"presets":[{"id":"x","name":"X","settings":{"graphics":"gdi"}}]})", &presets, &reason));
   CHECK(!ParseSettingsPresets(R"({"presets":[{"id":"x","name":"X","settings":{"extra_arguments":"-a"}}]})", &presets, &reason));
+  // The "my-" prefix is the player's own presets'; a built-in one may not take it.
+  {
+    std::vector<SettingsPreset> mine;
+    CHECK(!ParseSettingsPresets(R"({"presets":[{"id":"my-3f9a0c1d2e4b5a69","name":"Mine","settings":{}}]})", &mine, &reason));
+    CHECK(reason.find("my-") != std::string::npos);
+    CHECK(ParseSettingsPresets(R"({"presets":[{"id":"mouse-my-way","name":"Mine","settings":{}}]})", &mine, &reason));
+  }
+  // The rule every preset's settings follow, built-in or the player's.
+  CHECK(ValidatePresetSetting("controller_preset", "mouse", &reason));
+  CHECK(ValidatePresetSetting("resolution", "1280x720", &reason));
+  CHECK(!ValidatePresetSetting("resolution", "huge", &reason));
+  for (const char* refused : {"launch_option", "graphics", "architecture", "start_check", "extra_arguments", "program",
+                              "no_such_setting", "opengl_thread"})
+    CHECK(!ValidatePresetSetting(refused, "x", &reason));
+  CHECK(RetiredSetting("opengl_thread") && !RetiredSetting("refresh"));
+
+  // A player preset made from a game keeps what the player chose for it, by where each value came from.
+  {
+    GameRecipe own;
+    own.id = "steam-4000-own-v1";
+    own.app_id = 4000;
+    own.launch_entries = {{"game", "Game", "game.exe", "", ""}};
+    own.defaults = {{"resolution", "1280x720"}, {"performance_overlay", "on"}, {"window_view", "desktop"},
+                    {"steam_features", "emulate"}};
+    own.locked = {"vsync", "trigger_deadzone"};
+    SettingsPreset preset{"keyboard-on-controller", "Keyboard", "", "", {{"controller_preset", "gamepad"}, {"refresh", "60"}}};
+    const std::map<std::string, std::string> overrides = {
+        {"rumble", "50"},                    // a player change
+        {"performance_overlay", "off"},      // equal to Playden's default, over the recipe's value
+        {"button.cross", "space"},           // a button binding: free text a preset may hold
+        {"extra_arguments", "-windowed"},    // free text a preset may not hold
+        {"graphics", "dxvk"},                // never in a preset
+        {"trigger_deadzone", "10"},          // a locked row, changed anyway
+        {"unlock.trigger_deadzone", "on"},
+        {"vsync", "off"},                    // a locked row: the player's value doesn't apply
+        {"volume", "50"},                    // unavailable: the kit has no volume
+    };
+    const auto tuning = KitCapabilitiesFromManifest({kKitInputRumble, kKitInputTuning, kKitDisplay120Hz}, false);
+    EffectiveSettings settings;
+    SettingsError error;
+    CHECK(BuildEffectiveSettings(own, &preset, overrides, tuning, &settings, &error));
+    // What the rows are, so each case below checks what it says.
+    CHECK(settings.values.at("resolution").source == ValueSource::kRecipe);
+    CHECK(settings.values.at("refresh").source == ValueSource::kPreset && Value(settings, "refresh") == "60" &&
+          settings.values.at("refresh").available);
+    CHECK(settings.values.at("rumble").source == ValueSource::kUser && settings.values.at("rumble").available);
+    CHECK(settings.values.at("trigger_deadzone").locked && settings.values.at("trigger_deadzone").unlocked &&
+          settings.values.at("trigger_deadzone").available && Value(settings, "trigger_deadzone") == "10");
+    CHECK(settings.values.at("vsync").locked && settings.values.at("vsync").source == ValueSource::kPlayden);
+    CHECK(settings.values.at("volume").source == ValueSource::kUser && !settings.values.at("volume").available &&
+          !settings.values.at("volume").waits_for_update);
+    CHECK(settings.values.at("graphics").source == ValueSource::kUser);
+    CHECK(settings.values.at("controller").source == ValueSource::kPreset);  // brought by the controller preset
+
+    auto kept = PresetSettingsFromGame(own, settings, PresetCapture::kSave);
+    const std::map<std::string, std::string> chosen = {
+        {"controller_preset", "gamepad"}, {"refresh", "60"}, {"controller", Value(settings, "controller")},
+        {"rumble", "50"}, {"performance_overlay", "off"}, {"button.cross", "space"}};
+    for (const auto& [id, value] : chosen) CHECK(kept.count(id) && kept.at(id) == value);
+    // Everything else is left out: the recipe's values, Playden's, locked and unavailable rows, what a preset can't set.
+    for (const char* left : {"resolution", "window_view", "steam_features", "extra_arguments", "graphics", "trigger_deadzone",
+                             "unlock.trigger_deadzone", "vsync", "volume", "launch_option", "architecture"})
+      CHECK(!kept.count(left));
+    for (const auto& [id, value] : kept) {
+      CHECK(ValidatePresetSetting(id, value, &reason));
+      const auto source = settings.values.at(id).source;
+      CHECK(source == ValueSource::kUser || source == ValueSource::kPreset);
+    }
+    // Own changes only: the preset's values stay with the preset.
+    kept = PresetSettingsFromGame(own, settings, PresetCapture::kOwnChanges);
+    CHECK(kept == (std::map<std::string, std::string>{
+                      {"rumble", "50"}, {"performance_overlay", "off"}, {"button.cross", "space"}}));
+
+    // Changing the controller layout also changes inputs inherited from the old settings preset.
+    // Update must move those effective inputs, or the old preset's explicit rows win again.
+    SettingsPreset old_inputs{"old-inputs", "Old inputs", "", "",
+                              {{"controller", "xinput"}, {"pointer_stick", "right_stick"}, {"pointer_speed", "1800"}}};
+    CHECK(BuildEffectiveSettings(own, &old_inputs, {{"controller_preset", "mouse"}}, tuning, &settings, &error));
+    CHECK(PresetSettingsFromGame(own, settings, PresetCapture::kOwnChanges) ==
+          (std::map<std::string, std::string>{{"controller_preset", "mouse"}, {"controller", "keyboard"},
+                                            {"pointer_stick", "left_stick"}, {"pointer_speed", "900"}}));
+
+    // A community recipe as the base: its values are someone's choice for the game, and come along. Its locks don't.
+    GameRecipe community = own;
+    community.id = "community-steam-4000-keyboard-play";
+    CHECK(IsCommunityRecipeId(community.id));
+    CHECK(BuildEffectiveSettings(community, nullptr, {{"rumble", "50"}}, tuning, &settings, &error));
+    CHECK(settings.values.at("resolution").source == ValueSource::kRecipe);
+    kept = PresetSettingsFromGame(community, settings, PresetCapture::kSave);
+    CHECK(kept == (std::map<std::string, std::string>{{"resolution", "1280x720"}, {"performance_overlay", "on"},
+                                                      {"window_view", "desktop"}, {"steam_features", "emulate"},
+                                                      {"rumble", "50"}}));
+    CHECK(PresetSettingsFromGame(community, settings, PresetCapture::kOwnChanges) ==
+          (std::map<std::string, std::string>{{"rumble", "50"}}));
+    // The game's own recipe alone: nothing chosen.
+    CHECK(BuildEffectiveSettings(own, nullptr, {}, tuning, &settings, &error));
+    CHECK(PresetSettingsFromGame(own, settings, PresetCapture::kSave).empty());
+
+    // A choice that waits for the kit update is kept as chosen, not as the fallback that applies until then.
+    const auto stale = KitForTitleRuntime(KitCapabilitiesFromManifest({kKitInputPlaystation}, false), false);
+    CHECK(BuildEffectiveSettings(own, nullptr, {{"controller", "playstation"}}, stale, &settings, &error));
+    CHECK(Value(settings, "controller") == "xinput" && settings.values.at("controller").waits_for_update);
+    CHECK(PresetSettingsFromGame(own, settings, PresetCapture::kSave) ==
+          (std::map<std::string, std::string>{{"controller", "playstation"}}));
+    // So is a row that doesn't apply until then.
+    const auto stale_rumble = KitForTitleRuntime(KitCapabilitiesFromManifest({kKitInputRumble}, false), false);
+    CHECK(BuildEffectiveSettings(own, nullptr, {{"rumble", "50"}}, stale_rumble, &settings, &error));
+    CHECK(!settings.values.at("rumble").available && settings.values.at("rumble").waits_for_update);
+    CHECK(PresetSettingsFromGame(own, settings, PresetCapture::kSave) ==
+          (std::map<std::string, std::string>{{"rumble", "50"}}));
+  }
 
   // The per-game record round-trips and drops settings this build does not know.
   GameSettingsRecord record{"mouse-driven", {{"resolution", "1280x720"}, {"extra_arguments", "-a \"b c\"\\"}}, 7};
@@ -2443,15 +2705,16 @@ int main(int argc, char** argv) {
     CHECK(BuildEffectiveSettings(empty, nullptr, {{"program", "Game.exe"}}, KitCapabilities{}, &settings, &error) && settings.launch);
 
     // Export as recipe: the effective settings as a community recipe, read back as a recipe and as one.
+    const auto kHalfLife2 = playden::GameRef::Steam(220);
     CHECK(BuildEffectiveSettings(hl2, nullptr, {{"resolution", "1280x720"}, {"program", "hl2_win64.exe"},
                                  {"architecture", "pe64"}, {"unlock.graphics", "on"}, {"graphics", "opengl"},
                                  {"arguments", "-game hl2 {resolution}"}, {"dll_overrides", "d3d9=n;xinput1_3=n"}},
                                  KitCapabilities{}, &settings, &error));
-    auto community = BuildCommunityRecipe(hl2, settings);
+    auto community = BuildCommunityRecipe(hl2, settings, kHalfLife2, "Half-Life 2");
     {  // What the files showed travels without the graphics value, which has its own field (#67).
       auto detected = hl2;
       detected.detected = "d3d9 graphics=dxvk";
-      CHECK(BuildCommunityRecipe(detected, settings).recipe.detected == "d3d9");
+      CHECK(BuildCommunityRecipe(detected, settings, kHalfLife2, "Half-Life 2").recipe.detected == "d3d9");
     }
     community.min_kit = "kit-h";
     community.tested_date = "2026-10-10";
@@ -2462,7 +2725,9 @@ int main(int argc, char** argv) {
     const auto text = SerializeCommunityRecipe(community);
     GameRecipe as_recipe;
     CHECK(ParseGameRecipe(text, &as_recipe, &reason));
-    CHECK(as_recipe.id == "community-220" && as_recipe.launch_entries.size() == 1 &&
+    // The game object stands for app_id: the recipe reads back unbound, for the game it is applied to.
+    CHECK(as_recipe.app_id == 0 && as_recipe.game == playden::GameId{});
+    CHECK(as_recipe.id == "community-steam-220" && as_recipe.launch_entries.size() == 1 &&
           as_recipe.launch_entries[0].executable == "hl2_win64.exe" && as_recipe.architecture == "pe64" &&
           as_recipe.graphics == "opengl" && as_recipe.arguments == "-game hl2 {resolution}" &&
           as_recipe.resolution_arguments == hl2.resolution_arguments && as_recipe.dll_overrides == "d3d9=n;xinput1_3=n");
@@ -2470,29 +2735,69 @@ int main(int argc, char** argv) {
     CHECK(!as_recipe.defaults.count("controller") && as_recipe.locked.empty());  // xinput is Playden's default too
     CommunityRecipe parsed;
     CHECK(ParseCommunityRecipe(text, &parsed, &reason));
+    CHECK(parsed.game == kHalfLife2 && parsed.game_name == "Half-Life 2" && parsed.made_on.empty());
+    CHECK(text.find("\"game\": {\"store\": \"steam\", \"key\": \"220\", \"name\": \"Half-Life 2\"}") != std::string::npos &&
+          text.find("app_id") == std::string::npos && text.find("steam_appid") == std::string::npos &&
+          text.find("made_on") == std::string::npos);
     CHECK(parsed.executable == "hl2_win64.exe" && parsed.status == "works" && parsed.notes == "Starts \"fine\"." &&
           parsed.base_path == "profiles/hl2.profile" && SerializeCommunityRecipe(parsed) == text);
     // The same game started from the exported recipe gets the same command.
     EffectiveSettings again;
     CHECK(BuildEffectiveSettings(as_recipe, nullptr, {}, KitCapabilities{}, &again, &error));
     CHECK(again.arguments == "-game hl2 -w 1280 -h 720" && again.dll_overrides == settings.dll_overrides);
+    {  // The player's Extra arguments stay theirs: the export has none, so the community rules don't refuse it.
+      EffectiveSettings extra;
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"extra_arguments", "-console"}}, KitCapabilities{}, &extra, &error));
+      CHECK(extra.arguments.find("-console") != std::string::npos);
+      auto exported_extra = BuildCommunityRecipe(hl2, extra, kHalfLife2, "Half-Life 2");
+      CHECK(!exported_extra.recipe.defaults.count("extra_arguments") &&
+            SerializeCommunityRecipe(exported_extra).find("-console") == std::string::npos);
+      exported_extra.recipe.id = CommunityRecipeIdFor(kHalfLife2, "console");
+      for (const auto& refusal : CommunityRecipeRefusals(exported_extra)) CHECK(refusal.find("extra_arguments") == std::string::npos);
+    }
     // A recipe exported from a generated one keeps the Steam emulator, unlocked.
     auto from_generated = generated;
     from_generated.defaults["steam_features"] = "emulate";
     CHECK(BuildEffectiveSettings(from_generated, nullptr, {}, KitCapabilities{}, &settings, &error));
     GameRecipe exported;
-    CHECK(ParseGameRecipe(SerializeCommunityRecipe(BuildCommunityRecipe(from_generated, settings)), &exported, &reason));
+    CHECK(ParseGameRecipe(SerializeCommunityRecipe(BuildCommunityRecipe(from_generated, settings, kHalfLife2, "Half-Life 2")), &exported, &reason));
     CHECK(exported.defaults.at("steam_features") == "emulate" && IsCommunityRecipeId(exported.id));
     CHECK(BuildEffectiveSettings(exported, nullptr, {}, KitCapabilities{}, &again, &error));
     CHECK(again.values.at("steam_features").value == "emulate" && !again.values.at("steam_features").locked);
     CHECK(again.dll_overrides == kDxvkOverrides);  // the DXVK overrides are written out, not added again
+    {  // A row the player didn't change stays out of a share, so an older Playden, which refuses a recipe naming a
+       // setting it doesn't know, still reads it. A new row must not change that (Steam Input came in 0.11).
+      // Rows the recipe sets go with it, and so do the rows its controller preset brings (runtime/input/*.input).
+      const auto only_recipe_rows = [&](const GameRecipe& recipe) {
+        EffectiveSettings untouched;
+        CHECK(BuildEffectiveSettings(recipe, nullptr, {}, KitCapabilities{}, &untouched, &error));
+        auto allowed = recipe.defaults;
+        if (const auto preset = recipe.defaults.find("controller_preset"); preset != recipe.defaults.end())
+          for (const auto& [id, value] : ControllerPresetInputs().at(preset->second)) allowed.emplace(id, value);
+        for (const auto& [id, value] : BuildCommunityRecipe(recipe, untouched, kHalfLife2, "Half-Life 2").recipe.defaults) {
+          const auto own = allowed.find(id);
+          if (own == allowed.end() || own->second != value)
+            std::fprintf(stderr, "untouched row %s=%s is shared\n", id.c_str(), value.c_str());
+          CHECK(own != allowed.end() && own->second == value);
+        }
+      };
+      only_recipe_rows(from_generated);
+      auto with_preset = from_generated;
+      with_preset.defaults["controller_preset"] = "mouse";
+      only_recipe_rows(with_preset);
+      EffectiveSettings chosen;
+      CHECK(BuildEffectiveSettings(from_generated, nullptr, {{"steam_input", "auto"}}, KitCapabilities{}, &chosen, &error));
+      CHECK(!BuildCommunityRecipe(from_generated, chosen, kHalfLife2, "Half-Life 2").recipe.defaults.count("steam_input"));
+      CHECK(BuildEffectiveSettings(from_generated, nullptr, {{"steam_input", "off"}}, KitCapabilities{}, &chosen, &error));
+      CHECK(BuildCommunityRecipe(from_generated, chosen, kHalfLife2, "Half-Life 2").recipe.defaults.at("steam_input") == "off");
+    }
     // Registry values and requirements stay with the game when it is exported.
     auto with_extras = from_generated;
     with_extras.registry = {{"Software\\Wine\\AppDefaults\\a.exe\\Direct3D", "VideoMemorySize", "\"4096\""},
                             {"Software\\Studio\\Game", "Language", "\"en\""}};
     with_extras.requirements = {{"audio", "ps5"}};
     with_extras.ini = {{"BmGame/Config/UserEngine.ini", "Engine.Engine", "Language", "int"}};
-    CHECK(ParseGameRecipe(SerializeCommunityRecipe(BuildCommunityRecipe(with_extras, settings)), &exported, &reason));
+    CHECK(ParseGameRecipe(SerializeCommunityRecipe(BuildCommunityRecipe(with_extras, settings, kHalfLife2, "Half-Life 2")), &exported, &reason));
     CHECK(exported.requirements == with_extras.requirements && exported.registry.size() == 2);
     CHECK(exported.ini == with_extras.ini);
     for (const auto& value : with_extras.registry)
@@ -2502,6 +2807,334 @@ int main(int argc, char** argv) {
     auto broken = text;
     broken.replace(broken.find("\"works\""), 7, "\"great\"");
     CHECK(!ParseCommunityRecipe(broken, &parsed, &reason) && reason.find("status") != std::string::npos);
+
+    // The export leaves the slug, title and contributors for the author: community-<app id>, which reads back
+    // here but the community rules refuse.
+    const auto exported_text = SerializeCommunityRecipe(BuildCommunityRecipe(hl2, settings, kHalfLife2, "Half-Life 2"));
+    CHECK(exported_text.find("\"recipe_id\": \"community-steam-220\"") != std::string::npos &&
+          exported_text.find("\"title\": \"\"") != std::string::npos &&
+          exported_text.find("\"tested_kit\": \"\"") != std::string::npos &&
+          exported_text.find("\"contributors\": []") != std::string::npos &&
+          exported_text.find("min_kit") == std::string::npos);
+    CHECK(ParseCommunityRecipe(exported_text, &parsed, &reason) && parsed.title.empty() && parsed.contributors.empty());
+    // Named by the author: the id with its slug, the title, the kit it was tested on and who helped.
+    auto named = community;
+    named.recipe.id = CommunityRecipeIdFor(kHalfLife2, "opengl-1280");
+    named.title = "OpenGL at 1280×720";
+    named.tested_kit = "0.12-dev.20261022.1";
+    named.min_kit = "0.12";
+    named.author = "Ana";
+    named.contributors = {"Bo", "Cy \"the tester\""};
+    const auto named_text = SerializeCommunityRecipe(named);
+    CHECK(ParseCommunityRecipe(named_text, &parsed, &reason));
+    CHECK(parsed.recipe.id == "community-steam-220-opengl-1280" && parsed.title == "OpenGL at 1280×720" &&
+          parsed.tested_kit == "0.12-dev.20261022.1" && parsed.min_kit == "0.12" && parsed.author == "Ana" &&
+          parsed.contributors == named.contributors && SerializeCommunityRecipe(parsed) == named_text);
+    // A recipe_id for another game, or with a slug the rules refuse, does not read.
+    for (const char* id : {"community-steam-221-opengl-1280", "community-steam-220-OpenGL", "community-steam-220-",
+                           "community-imported-220-opengl-1280", "community-220-opengl-1280", "steam-220-auto",
+                           "community-steam-22-0-opengl-1280"}) {
+      auto other = named_text;
+      other.replace(other.find("community-steam-220-opengl-1280"), std::strlen("community-steam-220-opengl-1280"), id);
+      CHECK(!ParseCommunityRecipe(other, &parsed, &reason) && reason.find("recipe_id") != std::string::npos);
+    }
+    auto listed = named_text;
+    listed.replace(listed.find("[\"Bo\""), 5, "[7");
+    CHECK(!ParseCommunityRecipe(listed, &parsed, &reason) && reason.find("contributors") != std::string::npos);
+
+    // An imported copy shares under its Steam app ID and says it was made on an imported copy; without one, under its
+    // name key. made_on is left out when it is the game's own store.
+    auto imported = SerializeCommunityRecipe(BuildCommunityRecipe(hl2, settings, kHalfLife2, "Half-Life 2", "imported"));
+    CHECK(imported.find("\"made_on\": \"imported\"") != std::string::npos);
+    CHECK(ParseCommunityRecipe(imported, &parsed, &reason) && parsed.made_on == "imported" && parsed.game == kHalfLife2);
+    CHECK(BuildCommunityRecipe(hl2, settings, kHalfLife2, "Half-Life 2", "steam").made_on.empty());
+    const playden::GameRef night_sky{"imported", "night-sky"};
+    const auto own = BuildCommunityRecipe(hl2, settings, night_sky, "Night Sky", "imported");
+    CHECK(own.recipe.id == "community-imported-night-sky" && own.made_on.empty());
+    CHECK(ParseCommunityRecipe(SerializeCommunityRecipe(own), &parsed, &reason) && parsed.game == night_sky);
+    // Bound to the installed game it is applied to: then it is that game's recipe.
+    RuntimeInstall installed;
+    installed.runtime_number = 0xF0000001u;
+    installed.game = playden::GameId::Local("6d1f3a52-0c55-4f3e-9b2a-5d1c7e0a9f11");
+    CHECK(!RecipeForGame(parsed.recipe, installed));
+    BindCommunityRecipe(&parsed, installed.game, installed.runtime_number);
+    CHECK(RecipeForGame(parsed.recipe, installed) && parsed.recipe.app_id == 0xF0000001u);
+  }
+
+  // Community recipes in use: identity by revision, the player's one base (preset or recipe), which
+  // recipe a game runs with, what a switch drops, and the registry values a recipe leaves in the bottle.
+  {
+    const std::string rev_a(64, 'a'), rev_b(64, 'b');
+    GameRecipe a = hl2;
+    a.id = "community-steam-220-fast";
+    a.revision = rev_a;
+    a.locked.clear();
+    a.registry = {{"Software\\Wine\\AppDefaults\\hl2.exe", "Version", "\"win7\""}, {"Software\\Playden\\Test", "A", "\"1\""}};
+    GameRecipe b = a;
+    b.revision = rev_b;
+    b.registry = {{"Software\\Wine\\AppDefaults\\hl2.exe", "Version", "\"win10\""}, {"Software\\Playden\\Test", "B", "\"2\""}};
+    // The tag an install record carries: the whole number for Playden's recipes, 32 hex for a community one.
+    CHECK(RecipeVersionTag(hl2) == "1" && RecipeVersionTag(a) == std::string(32, 'a') && RecipeVersionTag(b) == std::string(32, 'b'));
+    CHECK(IsCommunityRevision(rev_a) && !IsCommunityRevision(std::string(63, 'a')) && !IsCommunityRevision(std::string(64, 'A')));
+    CHECK(IsCommunityRevisionPrefix(std::string(32, 'a')) && !IsCommunityRevisionPrefix(rev_a) && !IsCommunityRevisionPrefix(""));
+    CHECK(RevisionHasTag(rev_a, std::string(32, 'a')) && !RevisionHasTag(rev_a, std::string(32, 'b')) && !RevisionHasTag(rev_a, rev_a));
+    // Two revisions of one community recipe are never confused with each other.
+    RuntimeInstall record;
+    record.runtime_number = 220;
+    record.recipe_id = a.id;
+    record.recipe_version = RecipeVersionTag(a);
+    CHECK(RecipeForGame(a, record) && RecipeMatchesInstall(a, record) && !RecipeMatchesInstall(b, record));
+    record.recipe_version = RecipeVersionTag(b);
+    CHECK(RecipeMatchesInstall(b, record) && !RecipeMatchesInstall(a, record));
+    record.recipe_id = hl2.id;
+    record.recipe_version = "1";
+    CHECK(RecipeMatchesInstall(hl2, record) && !RecipeMatchesInstall(a, record));
+    record.runtime_number = 221;
+    CHECK(!RecipeForGame(hl2, record) && !RecipeMatchesInstall(hl2, record));
+
+    // One base: choosing a recipe clears the preset and the reverse; each is a new revision.
+    GameSettingsRecord choice{"mouse-driven", {{"resolution", "1280x720"}}, 3};
+    ChooseCommunityRecipe(&choice, a.id, rev_a);
+    CHECK(choice.preset_id.empty() && choice.community_recipe.id == a.id && choice.community_recipe.revision == rev_a &&
+          choice.revision == 4 && choice.overrides.size() == 1);
+    GameSettingsRecord reread;
+    CHECK(ParseGameSettingsRecord(SerializeGameSettingsRecord(choice), &reread, &reason) && reread == choice);
+    CHECK(SerializeGameSettingsRecord(choice).find("\"community_recipe\":{\"id\":\"community-steam-220-fast\",\"revision\":\"" + rev_a + "\"}") !=
+          std::string::npos);
+    ChoosePreset(&choice, "mouse-driven");
+    CHECK(choice.preset_id == "mouse-driven" && choice.community_recipe.id.empty() && choice.community_recipe.revision.empty() &&
+          choice.revision == 5);
+    CHECK(SerializeGameSettingsRecord(choice).find("community_recipe") == std::string::npos);
+    choice.shared_recipe = {"sub-1", a.id};
+    CHECK(ParseGameSettingsRecord(SerializeGameSettingsRecord(choice), &reread, &reason) && reread == choice &&
+          reread.shared_recipe.submission_id == "sub-1");
+    // The game a share was made for is kept; an older record without it reads back as unknown.
+    CHECK(!reread.shared_recipe.game.valid() &&
+          SerializeGameSettingsRecord(choice).find("\"game\"") == std::string::npos);
+    choice.shared_recipe = {"sub-1", a.id, playden::GameRef{"imported", "night-sky"}};
+    CHECK(SerializeGameSettingsRecord(choice).find(",\"game\":\"imported/night-sky\"}") != std::string::npos);
+    CHECK(ParseGameSettingsRecord(SerializeGameSettingsRecord(choice), &reread, &reason) && reread == choice &&
+          reread.shared_recipe.game == (playden::GameRef{"imported", "night-sky"}));
+    // Another game's recipe (chosen from a search): the choice names that game, which becomes the linked game. Both are
+    // saved; an older record has neither (the game's own recipe, nothing linked), and Unlink keeps the choice.
+    const playden::GameRef gog{"gog", "1207658924"};
+    const auto gog_id = CommunityRecipeIdFor(gog, "pad");
+    GameSettingsRecord linked;
+    ChooseCommunityRecipe(&linked, gog_id, rev_a, gog);
+    CHECK(linked.community_recipe.game == gog && linked.linked_game == gog && linked.revision == 1);
+    CHECK(SerializeGameSettingsRecord(linked).find("\"community_recipe\":{\"id\":\"" + gog_id + "\",\"revision\":\"" + rev_a +
+                                                   "\",\"game\":\"gog/1207658924\"},\"linked_game\":\"gog/1207658924\"") != std::string::npos);
+    CHECK(ParseGameSettingsRecord(SerializeGameSettingsRecord(linked), &reread, &reason) && reread == linked);
+    ChooseCommunityRecipe(&linked, a.id, rev_a);  // the game's own recipe: the link stays
+    CHECK(!linked.community_recipe.game.valid() && linked.linked_game == gog);
+    linked.linked_game = {};
+    CHECK(SerializeGameSettingsRecord(linked).find("linked_game") == std::string::npos &&
+          SerializeGameSettingsRecord(linked).find("\"game\"") == std::string::npos);
+    CHECK(ParseGameSettingsRecord("{\"community_recipe\":{\"id\":\"" + gog_id + "\",\"revision\":\"" + rev_a +
+                                  "\",\"game\":\"gog/x\"},\"linked_game\":\"nowhere\"}", &reread, &reason) &&
+          reread.community_recipe.id == gog_id && !reread.community_recipe.game.valid() && !reread.linked_game.valid());
+    // A malformed choice is dropped, not the record.
+    CHECK(ParseGameSettingsRecord("{\"community_recipe\":{\"id\":\"community-steam-220-fast\",\"revision\":\"abc\"}}", &reread, &reason) &&
+          reread.community_recipe.id.empty());
+    CHECK(ParseGameSettingsRecord("{\"community_recipe\":{\"id\":\"steam-220-auto\",\"revision\":\"" + rev_a + "\"}}", &reread, &reason) &&
+          reread.community_recipe.id.empty());
+    // A file naming both a preset and a recipe loads as the recipe alone: one base, never stacked.
+    CHECK(ParseGameSettingsRecord("{\"preset\":\"mouse-driven\",\"community_recipe\":{\"id\":\"community-steam-220-fast\",\"revision\":\"" +
+                                      rev_a + "\"}}", &reread, &reason) &&
+          reread.preset_id.empty() && reread.community_recipe.id == "community-steam-220-fast");
+
+    // Precedence: the wanted community recipe when it loaded and fits, else shipped, else generated.
+    CommunityRecipe ca;
+    ca.recipe = a;
+    ca.executable = "hl2.exe";
+    ca.title = "Fast";
+    ca.status = "works";
+    GameRecipe generated = hl2;
+    generated.id = "steam-220-auto";
+    VerifiedKitView kit;
+    kit.template_audio_ps5 = true;
+    RecipeCandidates candidates;
+    candidates.shipped = &hl2;
+    candidates.generated = &generated;
+    candidates.kit = &kit;
+    candidates.kit_version = ParseKitVersion("0.12");
+    candidates.title_kit_version = candidates.kit_version;
+    auto selection = SelectRecipe(candidates);
+    CHECK(selection.recipe == &hl2 && !selection.community && selection.fallback_reason.empty());
+    candidates.shipped = nullptr;
+    CHECK(SelectRecipe(candidates).recipe == &generated);
+    candidates.shipped = &hl2;
+    const CommunityRecipeChoice wanted{a.id, rev_a};
+    candidates.wanted = &wanted;
+    candidates.community = &ca;
+    candidates.community_state = CommunityObjectState::kLoaded;
+    selection = SelectRecipe(candidates);
+    CHECK(selection.recipe == &ca.recipe && selection.community && selection.fallback_reason.empty());
+    // The object missing, unreadable, or another revision: Playden's recipe, with the reason.
+    candidates.community = nullptr;
+    candidates.community_state = CommunityObjectState::kMissing;
+    selection = SelectRecipe(candidates);
+    CHECK(selection.recipe == &hl2 && !selection.community && selection.fallback_reason == kCommunityRecipeRemoved);
+    candidates.community_state = CommunityObjectState::kUnreadable;
+    CHECK(SelectRecipe(candidates).fallback_reason == kCommunityRecipeUnreadable);
+    CommunityRecipe cb = ca;
+    cb.recipe = b;
+    candidates.community = &cb;
+    candidates.community_state = CommunityObjectState::kLoaded;
+    CHECK(SelectRecipe(candidates).fallback_reason == kCommunityRecipeUnreadable);
+    // An id longer than the game's title holds (another store's) is selected: the title gets its alias.
+    auto long_id = ca;
+    long_id.recipe.id = CommunityRecipeIdFor({"imported", std::string(48, 'a')}, "fast");
+    const CommunityRecipeChoice long_wanted{long_id.recipe.id, rev_a};
+    candidates.wanted = &long_wanted;
+    candidates.community = &long_id;
+    selection = SelectRecipe(candidates);
+    CHECK(selection.recipe == &long_id.recipe && selection.community && selection.fallback_reason.empty());
+    CHECK(InstalledRecipeId(long_id.recipe.id) == "community-h-6e9d499dc48358f916810bf5");
+    candidates.wanted = &wanted;
+    // The kit: a min_kit newer than the kit, and one the kit has but the game's title (older runtime) doesn't.
+    candidates.community = &ca;
+    ca.min_kit = "0.13";
+    selection = SelectRecipe(candidates);
+    CHECK(selection.recipe == &hl2 && selection.fallback_reason == "The recipe needs runtime kit version 0.13 or newer.");
+    ca.min_kit = "0.12";
+    CHECK(SelectRecipe(candidates).community);
+    candidates.title_kit_version.reset();
+    selection = SelectRecipe(candidates);
+    CHECK(!selection.community && selection.fallback_reason == std::string("The recipe needs runtime kit version 0.12 or newer.") + kCommunityRecipeNeedsRuntimeUpdate);
+    candidates.title_kit_version = candidates.kit_version;
+    ca.min_kit.clear();
+    ca.recipe.requirements = {{"audio", "ps5"}};
+    kit.template_audio_ps5 = false;
+    CHECK(SelectRecipe(candidates).fallback_reason.find("lacks what this recipe needs") != std::string::npos);
+    kit.template_audio_ps5 = true;
+    candidates.kit = nullptr;
+    CHECK(!SelectRecipe(candidates).community);
+
+    // Dropped overrides: a launch option the new recipe doesn't have, a row it locks.
+    GameRecipe two = a;
+    two.launch_entries.push_back({"editor", "Editor", "hammer.exe", ""});
+    const std::map<std::string, std::string> overrides = {
+        {"launch_option", "editor"}, {"resolution", "1280x720"}, {"graphics", "opengl"}};
+    auto dropped = DroppedOverrides(two, nullptr, hl2, nullptr, overrides, KitCapabilities{});
+    CHECK(dropped.size() == 2);
+    CHECK(dropped[0].setting_id == "graphics" && dropped[0].reason == "Locked by the recipe.");
+    CHECK(dropped[1].setting_id == "launch_option" && dropped[1].value == "editor" &&
+          dropped[1].reason.find("no launch option") != std::string::npos);
+    // Nothing is dropped going the other way, and a value that didn't apply before is no loss.
+    CHECK(DroppedOverrides(hl2, nullptr, two, nullptr, overrides, KitCapabilities{}).empty());
+    CHECK(DroppedOverrides(hl2, nullptr, a, nullptr, {{"launch_option", "nowhere"}}, KitCapabilities{}).empty());
+
+    // Another game's recipe whose program isn't in this copy starts Playden's own: its launch entries and architecture,
+    // none of the recipe's program defaults or locks; the rest stays the recipe's.
+    GameRecipe other = a;
+    other.launch_entries = {{"game", "Game", "GOG/Launcher.exe", ""}};
+    other.architecture = "pe32";
+    other.defaults["launch_option"] = "game";
+    other.locked.insert("launch_option");
+    other.defaults["resolution"] = "1280x720";
+    GameRecipe own = two;
+    own.architecture = "pe64";
+    std::vector<std::string> asked;
+    auto adapted = other;
+    CHECK(UseOwnProgram(&adapted, own, [&](const std::string& program) { asked.push_back(program); return std::string(); }) ==
+          "GOG/Launcher.exe");
+    CHECK(asked == std::vector<std::string>{"GOG/Launcher.exe"} && adapted.launch_entries.size() == 2 &&
+          adapted.launch_entries[1].executable == "hammer.exe" && adapted.architecture == "pe64" &&
+          !adapted.defaults.count("launch_option") && !adapted.locked.count("launch_option") &&
+          adapted.defaults.at("resolution") == "1280x720" && adapted.id == other.id);
+    // With Playden's program the player's launch option still applies; with the recipe's it is dropped, as a switch says.
+    CHECK(DroppedOverrides(two, nullptr, adapted, nullptr, {{"launch_option", "editor"}}, KitCapabilities{}).empty());
+    CHECK(DroppedOverrides(two, nullptr, other, nullptr, {{"launch_option", "editor"}}, KitCapabilities{}).size() == 1);
+    // The program is there (any '\\' made '/'), or Playden has no program either: nothing changes.
+    auto present = other;
+    present.launch_entries[0].executable = "GOG\\Launcher.exe";
+    CHECK(UseOwnProgram(&present, own, [](const std::string& program) {
+            return program == "GOG/Launcher.exe" ? std::string("pe32") : std::string();
+          }).empty() &&
+          present.launch_entries[0].executable == "GOG\\Launcher.exe");
+    auto no_own = other;
+    CHECK(UseOwnProgram(&no_own, GameRecipe{}, [](const std::string&) { return std::string(); }).empty() &&
+          no_own.launch_entries[0].executable == "GOG/Launcher.exe");
+    // The program the recipe selects decides (its launch_option default, else its first entry), not its first entry.
+    auto selects_second = other;
+    selects_second.launch_entries = {{"launcher", "Launcher", "Launcher.exe", ""}, {"game", "Game", "Game.exe", ""}};
+    selects_second.defaults["launch_option"] = "game";
+    auto copy = selects_second;
+    asked.clear();
+    CHECK(UseOwnProgram(&copy, own, [&](const std::string& program) {
+            asked.push_back(program);
+            return program == "Launcher.exe" ? std::string("pe32") : std::string();
+          }) == "Game.exe" &&
+          asked == std::vector<std::string>{"Game.exe"} && copy.launch_entries.size() == own.launch_entries.size() &&
+          copy.launch_entries[0].executable == own.launch_entries[0].executable);
+    copy = selects_second;
+    CHECK(UseOwnProgram(&copy, own, [](const std::string& program) {
+            return program == "Game.exe" ? std::string("pe32") : std::string();
+          }).empty() &&
+          copy.launch_entries.size() == 2 && copy.launch_entries[1].executable == "Game.exe" &&
+          copy.defaults.at("launch_option") == "game");
+    CHECK(SelectedProgram(selects_second) == "Game.exe");
+    selects_second.defaults.erase("launch_option");
+    CHECK(SelectedProgram(selects_second) == "Launcher.exe");
+    // A program the copy has, built for the other architecture: the copy's file decides, defaults and locks included.
+    auto other_arch = other;
+    other_arch.defaults["architecture"] = "pe32";
+    other_arch.locked.insert("architecture");
+    CHECK(UseOwnProgram(&other_arch, own, [](const std::string&) { return std::string("pe64"); }).empty() &&
+          other_arch.architecture == "pe64" && !other_arch.defaults.count("architecture") &&
+          !other_arch.locked.count("architecture") && other_arch.launch_entries.size() == 1 &&
+          other_arch.launch_entries[0].executable == "GOG/Launcher.exe");
+
+    // Registry: A, then B (A's value B doesn't set is removed), then Playden's own (everything removed).
+    RecipeRegistryState after_a, after_b, after_default;
+    auto values = RecipeRegistryTransition(nullptr, a, &after_a);
+    CHECK(values.size() == 2 && values[0].data == "\"win7\"" && after_a.recipe_id == a.id && after_a.revision == rev_a &&
+          after_a.values.size() == 2);
+    values = RecipeRegistryTransition(&after_a, b, &after_b);
+    CHECK(values.size() == 3 && values[0].key == "Software\\Playden\\Test" && values[0].name == "A" && values[0].data.empty() &&
+          values[1].data == "\"win10\"" && values[2].name == "B" && after_b.revision == rev_b && after_b.values.size() == 2);
+    values = RecipeRegistryTransition(&after_b, hl2, &after_default);
+    CHECK(values.size() == 2 && values[0].data.empty() && values[1].data.empty() && after_default.values.empty() &&
+          after_default.recipe_id == hl2.id && after_default.revision.empty());
+    CHECK(RecipeRegistryTransition(&after_b, b, &after_default).size() == 2);  // the same recipe again: nothing removed
+    RecipeRegistryState parsed_state;
+    CHECK(ParseRecipeRegistryState(SerializeRecipeRegistryState(after_b), &parsed_state, &reason) &&
+          parsed_state.recipe_id == after_b.recipe_id && parsed_state.revision == rev_b && parsed_state.values == after_b.values);
+    CHECK(!ParseRecipeRegistryState("{\"recipe_id\":1}", &parsed_state, &reason) && !ParseRecipeRegistryState("[]", &parsed_state, &reason));
+    // Case: Wine folds it, so a value in both recipes is only assigned (a removal plus an assignment would be
+    // refused as a duplicate), whether the value name, the key, or both differ in case.
+    {
+      GameRecipe upper = a, lower = a, keyed = a;
+      upper.registry = {{"Software\\Publisher\\Game", "Quality", "\"1\""}, {"Software\\Publisher\\Game", "Old", "\"1\""}};
+      lower.registry = {{"Software\\Publisher\\Game", "quality", "\"2\""}};
+      keyed.registry = {{"SOFTWARE\\publisher\\GAME", "QUALITY", "\"3\""}};
+      RecipeRegistryState state_upper, state_lower, state_keyed;
+      RecipeRegistryTransition(nullptr, upper, &state_upper);
+      auto moved = RecipeRegistryTransition(&state_upper, lower, &state_lower);
+      CHECK(moved.size() == 2 && moved[0].name == "Old" && moved[0].data.empty() && moved[1].name == "quality" && moved[1].data == "\"2\"");
+      moved = RecipeRegistryTransition(&state_lower, keyed, &state_keyed);
+      CHECK(moved.size() == 1 && moved[0].key == "SOFTWARE\\publisher\\GAME" && moved[0].data == "\"3\"");
+      std::string user_reg = "WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n";
+      CHECK(ApplyRegistryValues(&user_reg, upper.registry, 1760000000, &reason));
+      CHECK(ApplyRegistryValues(&user_reg, moved, 1760000000, &reason));
+    }
+    // Interruption: the interim state lists the old values too, so after the bottle took the new recipe's
+    // values but the final state never got written, a switch to Playden's own removes both recipes' values.
+    {
+      const auto interim = RecipeRegistryInterim(&after_a, after_b);
+      CHECK(interim.recipe_id == after_b.recipe_id && interim.revision == rev_b);
+      for (const auto& value : after_a.values)
+        CHECK(std::find(interim.values.begin(), interim.values.end(), value) != interim.values.end());
+      for (const auto& value : after_b.values)
+        CHECK(std::find(interim.values.begin(), interim.values.end(), value) != interim.values.end());
+      CHECK(interim.values.size() == 3);  // the shared value is listed once
+      RecipeRegistryState back;
+      const auto removed = RecipeRegistryTransition(&interim, hl2, &back);
+      CHECK(removed.size() == 3 && back.values.empty());
+      for (const auto& value : removed) CHECK(value.data.empty());
+      CHECK(RecipeRegistryInterim(nullptr, after_b).values == after_b.values);
+    }
   }
 
   std::puts("game settings tests passed");

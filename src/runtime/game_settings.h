@@ -1,5 +1,6 @@
 #pragma once
 
+#include "library/game_ref.h"
 #include "library/store.h"
 #include "runtime/prospero_profile.h"
 
@@ -83,6 +84,22 @@ struct KitCapabilities {
   // for a title that runs this kit's runtime, like display_120hz.
   bool display_fps_counter = false;
   bool display_fps_counter_needs_update = false;
+  // [application] arguments up to 4096 bytes and profiles up to 16384 (kKitLaunchArguments4096). Counts only for a title
+  // that runs this kit's runtime, like display_120hz.
+  bool launch_arguments_4096 = false;
+  bool launch_arguments_4096_needs_update = false;
+  // [environment] WINE_LARGE_ADDRESS_AWARE = 1 gives a 32-bit program 4 GB (kKitLargeAddressAware). Counts only for a
+  // title that runs this kit's runtime.
+  bool large_address_aware = false;
+  bool large_address_aware_needs_update = false;
+  // [environment] PW_NSIPROXY_DISABLE = 1 keeps a 64-bit game from hosting nsiproxy, so it lists no network adapters
+  // (kKitNsiproxySwitch). Counts only for a title that runs this kit's runtime.
+  bool nsiproxy_switch = false;
+  bool nsiproxy_switch_needs_update = false;
+  // [environment] WINE_PS5_PARK_FILES and WINE_PS5_CACHED_FILES, the open-file budgets (kKitEnvironmentFileBudgets).
+  // Counts only for a title that runs this kit's runtime.
+  bool environment_file_budgets = false;
+  bool environment_file_budgets_needs_update = false;
   bool launcher_mode = false;  // [launcher]: the game starts through a launcher (kKitLauncherMode)
   bool launcher_mode_needs_update = false;  // the kit has it, but the game's title still runs an older runtime
   bool display_framegen_needs_update = false;
@@ -188,6 +205,9 @@ struct GameRecipe {
   std::map<std::string, std::string> defaults;  // setting id -> value
   std::set<std::string> locked;                 // setting ids the player cannot change
   std::string detected;  // generated recipes: what the game's files showed (GameDefaults::summary)
+  // A settings-only community recipe filled from a generated recipe (FillSettingsOnlyRecipe): the generated recipe's
+  // launch rules apply to the fields it took (UsesGeneratedLaunch). Never in a file; not serialized.
+  bool generated_launch = false;
   int defaults_revision = 0;  // generated recipes: the DefaultsRevision of the defaults above
   // Values the bottle's user.reg gets when the game's files are prepared, as a Steam install
   // script's would be (docs/community-recipes.md): strings under HKEY_CURRENT_USER.
@@ -203,7 +223,23 @@ struct GameRecipe {
   std::vector<std::string> game_files;
   // What the kit's template bottle must provide ("audio": "ps5"); see UnmetRecipeRequirements.
   std::map<std::string, std::string> requirements;
+  // A community recipe's identity besides its id: the SHA-256 (64 lowercase hex) of its file as
+  // published, set by whoever loaded it from the cache; never serialized. Empty for the recipes
+  // Playden ships and generates, whose identity is `version`. See RecipeVersionTag.
+  std::string revision;
 };
+
+// What an installed game's record (RuntimeInstall::recipe_version) and its publication carry as the
+// recipe's version: the first kCommunityRevisionPrefixBytes of a community recipe's revision, else
+// the whole number `version` as text. Every match of a recipe to an install compares this.
+inline constexpr std::size_t kCommunityRevisionBytes = 64;
+inline constexpr std::size_t kCommunityRevisionPrefixBytes = 32;
+std::string RecipeVersionTag(const GameRecipe& recipe);
+// 64 lowercase hex characters; a prefix: exactly 32.
+bool IsCommunityRevision(std::string_view text);
+bool IsCommunityRevisionPrefix(std::string_view text);
+// Whether a tag (a record's recipe_version) names this revision: its first 32 characters.
+bool RevisionHasTag(std::string_view revision, std::string_view tag);
 
 struct SettingsPreset {
   std::string id;
@@ -212,6 +248,33 @@ struct SettingsPreset {
   std::string short_hint;
   std::map<std::string, std::string> settings;  // only the settings it changes
 };
+
+// The community recipe the player wants for a game (docs/community-recipes.md): its id and the
+// revision (64 hex) it was chosen at. A newer revision of the same recipe is never applied
+// silently: the choice keeps its revision until the player chooses the updated one. game is the game the recipe is
+// for when it is another game's (found by searching by name, docs/community-recipes.md); invalid for one of the game's
+// own recipes (its GameRef's), as every record before linking. The runtime takes a recipe only for one of the two.
+struct CommunityRecipeChoice {
+  std::string id;
+  std::string revision;
+  GameRef game;
+};
+inline bool operator==(const CommunityRecipeChoice& left, const CommunityRecipeChoice& right) {
+  return left.id == right.id && left.revision == right.revision && left.game == right.game;
+}
+inline bool operator!=(const CommunityRecipeChoice& left, const CommunityRecipeChoice& right) { return !(left == right); }
+// The recipe a game's shared settings were sent as (Phase 5): the submission the service answered
+// with and the recipe id it belongs to, so a later share updates it instead of making a new one. game is the
+// GameRef the share was made for (invalid when unknown: an older record); a share is only updated for the same one.
+struct SharedRecipeRef {
+  std::string submission_id;
+  std::string recipe_id;
+  GameRef game;
+};
+inline bool operator==(const SharedRecipeRef& left, const SharedRecipeRef& right) {
+  return left.submission_id == right.submission_id && left.recipe_id == right.recipe_id && left.game == right.game;
+}
+inline bool operator!=(const SharedRecipeRef& left, const SharedRecipeRef& right) { return !(left == right); }
 
 // What Playden persists per game.
 struct GameSettingsRecord {
@@ -224,13 +287,30 @@ struct GameSettingsRecord {
   // A Steam game whose launch options are all for other branches: the program the player chose at
   // Install. Its option goes first when the game is prepared. Empty: not set. Saved only when set.
   std::string steam_launch;
+  // The game's base is one choice: Playden default (both empty), a preset, or a community recipe.
+  // ChooseCommunityRecipe and ChoosePreset keep them exclusive; a saved file naming both loads as the
+  // community recipe alone. Saved only when set.
+  CommunityRecipeChoice community_recipe;
+  // Set once the game's settings were shared from Playden. Saved only when set.
+  SharedRecipeRef shared_recipe;
+  // Another game whose recipes the chooser lists beside the game's own, and whose newer revisions show as updates:
+  // set when the player chose one of its recipes from a search, cleared by Unlink. Saved only when set.
+  GameRef linked_game;
 };
 
 inline bool operator==(const GameSettingsRecord& left, const GameSettingsRecord& right) {
   return left.preset_id == right.preset_id && left.overrides == right.overrides && left.revision == right.revision &&
-         left.steam_app_id == right.steam_app_id && left.steam_launch == right.steam_launch;
+         left.steam_app_id == right.steam_app_id && left.steam_launch == right.steam_launch &&
+         left.community_recipe == right.community_recipe && left.shared_recipe == right.shared_recipe &&
+         left.linked_game == right.linked_game;
 }
 inline bool operator!=(const GameSettingsRecord& left, const GameSettingsRecord& right) { return !(left == right); }
+
+// The player chooses a community recipe as the game's base: clears the preset. Both bump revision. game: the game the
+// recipe is for when it is another game's (CommunityRecipeChoice::game), which also becomes the linked game.
+void ChooseCommunityRecipe(GameSettingsRecord* record, std::string id, std::string revision, GameRef game = {});
+// The player chooses a preset (empty: Playden default) as the base: clears the community recipe.
+void ChoosePreset(GameSettingsRecord* record, std::string preset_id);
 
 struct EffectiveValue {
   std::string value;  // empty = not written
@@ -277,6 +357,8 @@ struct EffectiveSettings {
   // The profile's [runtime] version: 2 when the game's title applies the driver's defaults (wave32 pixel shaders, so
   // Wave32 needs no variable); 1 (no key written) otherwise, and Wave32 adds pswave32 itself.
   int profile_version = 1;
+  // The game's title takes 4096-byte arguments and a profile up to 16384 bytes (launch-arguments-4096).
+  bool long_profile = false;
   // The title's runtime honors [display] refresh on every graphics path and paces [display] frame_rate itself
   // (KitCapabilities::display_120hz); without it Frame limit is DXVK's maxFrameRate, as before.
   bool display_120hz = false;
@@ -311,6 +393,21 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
                             const std::map<std::string, std::string>& overrides, const KitCapabilities& kit,
                             EffectiveSettings* settings, SettingsError* error);
 
+// What a player preset made from a game keeps (My presets). kSave: what the player chose for the game, either as its
+// base (a preset's values, a community recipe's) or as its own changes. kOwnChanges: its own changes alone, to move
+// into the player preset it uses, including the input rows implied by a user-selected controller preset.
+enum class PresetCapture { kSave, kOwnChanges };
+// The settings a preset made from a game's effective settings holds: each row a preset may set (ValidatePresetSetting)
+// whose value the player chose, as the row shows it (ChosenValue). Chosen means from the player (kUser) or a preset
+// (kPreset, which includes the rows a chosen controller preset brings) and, for kSave on a community recipe (recipe
+// is the one the settings were built from), the recipe's values. The game's own recipe (built-in or detected) and
+// Playden's defaults describe this game, so they are left out, as are rows the recipe locks (also when changed
+// anyway) and rows that don't apply here (unavailable, except one that waits for the kit update). A chosen value
+// equal to Playden's default is kept: it is what makes the row differ from a recipe or preset underneath, like the
+// built-in OpenGL game preset's 60 Hz.
+std::map<std::string, std::string> PresetSettingsFromGame(const GameRecipe& recipe, const EffectiveSettings& settings,
+                                                          PresetCapture capture);
+
 // Why one choice of a row cannot apply with the other effective values (Frame limit 120 and 40 need 120 Hz output,
 // Controller PlayStation a kit with input-playstation), or empty when it can. BuildEffectiveSettings turns such a saved choice into the Playden default, with this reason.
 // On a title that still runs an older runtime, a choice that needs the kit's (Frame limit 120 with 120 Hz output
@@ -323,7 +420,8 @@ bool SettingChoiceWaitsForUpdate(const EffectiveSettings& settings, std::string_
 // The variables Environment variables accepts (IsProsperoEnvironmentEntry, IsProsperoDebugEnvEntry and
 // IsBottleEnvironmentEntry), as the setting's description and a refusal tell the player.
 inline constexpr char kEnvironmentNamesHint[] =
-    "Allowed names start with DXVK_, MESA_, RADV_, SDL_, VK_, VKD3D_, ZINK_, GALLIUM_ or PW_, or are WINE_CPU_TOPOLOGY.";
+    "Allowed names start with DXVK_, MESA_, RADV_, SDL_, VK_, VKD3D_, ZINK_, GALLIUM_ or PW_, or are WINE_CPU_TOPOLOGY, "
+    "WINE_LARGE_ADDRESS_AWARE, WINE_PS5_PARK_FILES or WINE_PS5_CACHED_FILES.";
 
 // Checks one player value for one setting; used by the UI before saving an override.
 bool ValidateSettingValue(const GameRecipe& recipe, std::string_view id, std::string_view value, std::string* reason);
@@ -354,13 +452,25 @@ bool ApplyGameSettings(const GameRecipe& recipe, const EffectiveSettings& settin
 // generated recipes are matched to a game by it, never by app_id alone.
 GameId RecipeGame(const GameRecipe& recipe);
 bool ParseGameRecipe(std::string_view json, GameRecipe* recipe, std::string* reason);
+// Refuses a preset whose id starts with "my-": that prefix is the player's own presets' (my_presets.h).
 bool ParseSettingsPresets(std::string_view json, std::vector<SettingsPreset>* presets, std::string* reason);
+// Rows this build no longer has. Settings data written for an earlier build (presets, recipes, the player's presets)
+// may still name them; they are dropped where read, so the file still loads.
+bool RetiredSetting(std::string_view id);
+// Whether a preset, built-in or the player's, may set id to value: a known setting that makes sense on any game.
+// Never launch_option, graphics, architecture, start_check or free text other than button.*; the value must pass
+// ValidateSettingValue. A retired setting (RetiredSetting) is refused here: callers drop those first.
+bool ValidatePresetSetting(std::string_view id, std::string_view value, std::string* reason);
 bool ParseGameSettingsRecord(std::string_view json, GameSettingsRecord* record, std::string* reason);
 // A Steam app ID as a steam_appid.txt or the "steam_app_id" setting holds it: canonical decimal
 // 1..UINT32_MAX (no sign, no leading zero) once surrounding whitespace is trimmed; nothing otherwise.
 std::optional<std::uint32_t> ParseSteamAppId(std::string_view text);
 // The recipe as JSON that ParseGameRecipe reads back.
 std::string SerializeGameRecipe(const GameRecipe& recipe);
+// Whether a recipe's program, arguments and overrides are a generated recipe's, which BuildEffectiveSettings completes
+// (the DXVK overrides that follow Graphics, Direct3D 12 arguments, Steam launch options that pick another graphics
+// API): a generated recipe, or a settings-only community recipe filled from one.
+bool UsesGeneratedLaunch(const GameRecipe& recipe);
 
 // Games without a shipped recipe get one generated from Steam's Windows launch options.
 // Its id is playden::GeneratedRecipeId(game); it starts the first launch entry with the game's own
@@ -373,11 +483,36 @@ bool IsGeneratedRecipeId(std::string_view id);
 // A generated recipe set up with older defaults for its engine (DefaultsRevision) takes the current ones from its
 // program's files: arguments, graphics and what those imply. Its id, version and programs stay, and what the player
 // changed is kept apart from the recipe, so it still wins. False when nothing changed, also when the program can't be
-// read now (a drive not plugged in): the next Play tries again.
+// read now (a drive not plugged in): the next Play tries again. A 32-bit recipe set up before Watcom programs got
+// Translator takes only that default when its program is one (WatcomProgram).
 bool RefreshRecipeDefaults(const std::string& install_root, const KitCapabilities& kit, GameRecipe* recipe);
-// A community recipe (community-<app id>, docs/community-recipes.md). Like a generated one, it
-// is not a shipped recipe, so it does not force the game's own Steam library.
+// A community recipe (docs/community-recipes.md): community-<store>-<key>-<slug>, or community-<store>-<key> as Export
+// as recipe writes it before the author picks a slug (CommunityRecipeRefusals refuses that form). Only the shape is
+// checked (^community-(steam|epic|gog|imported)-[a-z0-9]+(-[a-z0-9]+)*$, at most 128 bytes): an id is only compared
+// with one made from a game (CommunityRecipeIdFor), never split to find its game. Like a generated one, it is not a
+// shipped recipe, so it does not force the game's own Steam library.
 bool IsCommunityRecipeId(std::string_view id);
+// A slug: lowercase ASCII letters, digits and single hyphens, 1-32 characters, no hyphen first or last.
+inline constexpr std::size_t kCommunitySlugMaxBytes = 32;
+inline constexpr std::size_t kCommunityRecipeIdMaxBytes = 128;
+// The installed-game record and the game's title hold a recipe id in 64 bytes (settings_publication_journal.cpp,
+// prospero-win's pw_title_launch.h). Every Steam game's fits (community-steam-<10 digits>-<32-byte slug> is 59 bytes);
+// a longer one is published as its alias (InstalledRecipeId).
+inline constexpr std::size_t kInstalledRecipeIdMaxBytes = 64;
+// The id a game's record and title hold for a recipe: the id itself when it fits in 64 bytes, else the alias
+// community-h-<the first 24 lowercase hex of the SHA-256 of the full id>. Playden maps an alias back from its own
+// records: the recipe's object (loaded by the record's revision) and the game's settings name the full id.
+std::string InstalledRecipeId(std::string_view id);
+// community-h-<24 lowercase hex>.
+bool IsCommunityRecipeAlias(std::string_view id);
+// What a record may name for a community recipe: an id of at most 64 bytes (IsCommunityRecipeId) or an alias.
+bool IsInstalledCommunityRecipeId(std::string_view id);
+bool IsValidCommunitySlug(std::string_view slug);
+// "community-<store>-<key>-<slug>"; "community-<store>-<key>" for an empty slug (the export's form).
+std::string CommunityRecipeIdFor(const GameRef& game, std::string_view slug);
+// The slug of an id made for game (CommunityRecipeIdFor with a valid slug); nothing for anything else, the export's
+// slugless form included.
+std::optional<std::string> CommunityRecipeSlug(std::string_view id, const GameRef& game);
 // What the player chose in Game settings that changes how the recipe is generated.
 struct RecipeChoices {
   std::string program;      // game-relative .exe to start (entry kProgramEntryId, first); empty: Steam's
@@ -541,15 +676,38 @@ bool ParseProfileSidecar(std::string_view json, CommunityPreset* community, std:
 
 // A game's effective settings in the community recipe format (docs/community-recipes.md):
 // a Playden recipe that ParseGameRecipe reads, plus who tested it where.
+// community.format_version: 1, a recipe with its program (launch_entries and executable), as Playden shares it; 2, a
+// settings-only recipe, whose program and program-shaped fields come from Playden's own recipe for the copy
+// (FillSettingsOnlyRecipe, runtime/recipe_choice.h). This build reads 1 to kNewestCommunityFormat; a file of another
+// version is refused alone, so a release can carry recipes that only newer builds read.
+inline constexpr int kCommunitySettingsOnlyFormat = 2;
+inline constexpr int kNewestCommunityFormat = 2;
+
 struct CommunityRecipe {
-  GameRecipe recipe;  // id community-<app id>; the effective program, arguments, overrides and settings
-  std::string executable;       // identity: the program, relative to the install root
-  std::string min_kit;          // the runtime kit it was tested with
+  // id community-<store>-<key>-<slug>; the effective program, arguments, overrides and settings. app_id and game are
+  // not in the file: they name the installed game it is applied to (BindCommunityRecipe), 0 and none until then.
+  // A settings-only recipe has no launch entries, architecture or program fields until it is filled.
+  GameRecipe recipe;
+  int format_version = 1;       // community.format_version
+  GameRef game;                 // the game it is for ("game": {"store", "key", "name"})
+  std::string game_name;        // that game's name as the sharer's store or folder showed it (IsGameName)
+  // The store of the copy it was made with, when not game.store ("imported" for an imported copy shared under its
+  // Steam app ID); empty otherwise.
+  std::string made_on;
+  // Identity: the program, relative to the install root; empty in a settings-only recipe, which is for its game alone.
+  std::string executable;
+  std::string title;            // what the chooser shows, 1-60 printable characters; empty in an export
+  // The kit version it was tested with ("0.12", "0.12-dev.20261022.1"): information, not a requirement.
+  std::string tested_kit;
+  // The oldest kit version it needs, set by hand only when it does (a capability, a fix); the export never fills it.
+  // Older files used it for what tested_kit is now and may hold a kit id there.
+  std::string min_kit;
   std::string tested_firmware;  // PS5 system software, when known
   std::string tested_date;      // YYYY-MM-DD
   std::string status;           // works, playable, broken or untested
   std::string notes;
-  std::string author;
+  std::string author;                     // who first shared it
+  std::vector<std::string> contributors;  // people whose changes were merged into it since
   // Optional prospero-win-profiles profile used as the base; Playden's values apply on top.
   std::string base_repository;
   std::string base_path;
@@ -558,9 +716,34 @@ struct CommunityRecipe {
 // The recipe the effective settings describe. Only values that differ from Playden's default
 // and rows the runtime applies become defaults; rows the recipe locks stay locked unless the
 // player changed them anyway.
-CommunityRecipe BuildCommunityRecipe(const GameRecipe& recipe, const EffectiveSettings& settings);
+// game, game_name and made_on name the game it is shared for (SharingGameRef); the id is the export's slugless form.
+CommunityRecipe BuildCommunityRecipe(const GameRecipe& recipe, const EffectiveSettings& settings, const GameRef& game,
+                                     std::string game_name, std::string made_on = {});
+// A settings-only recipe (community.format_version 2) shared from a game whose base is the settings-only recipe `base`
+// (as its file has it) and whose program the player didn't change. before: the effective settings of the base as it
+// applies to this copy, without the player's changes; after: the game's. The base's defaults, plus every row whose
+// value the player changed (not the program rows, which stay the base's), and graphics when it changed. Its program
+// stays Playden's to fill in.
+CommunityRecipe BuildSettingsOnlyRecipe(const CommunityRecipe& base, const EffectiveSettings& before,
+                                        const EffectiveSettings& after, const GameRef& game, std::string game_name,
+                                        std::string made_on = {});
+// The rows that choose the program or how it starts, which a settings-only recipe takes from Playden's recipe: a
+// player's change to one makes a share name its program.
+bool IsProgramRow(std::string_view id);
+// A community recipe as the recipe of one installed game: recipe.app_id its runtime number, recipe.game the game.
+void BindCommunityRecipe(CommunityRecipe* community, const GameId& game, std::uint32_t runtime_number);
+// A settings-only recipe (IsSettingsOnlyRecipe) is written without the fields Playden fills in, as format_version 2.
 std::string SerializeCommunityRecipe(const CommunityRecipe& community);
-bool ParseCommunityRecipe(std::string_view json, CommunityRecipe* community, std::string* reason);
+// Reads a community recipe leniently: an export (no slug, no title, locks) and older files (a kit
+// id in min_kit) read too. CommunityRecipeRefusals (runtime/community_rules.h) holds the strict
+// rules the recipes repository and the console apply.
+// newest_format is the newest community.format_version read; a smaller one reads as an older build does.
+bool ParseCommunityRecipe(std::string_view json, CommunityRecipe* community, std::string* reason,
+                          int newest_format = kNewestCommunityFormat);
+// Whether a community recipe leaves its program to Playden (community.format_version 2).
+inline bool IsSettingsOnlyRecipe(const CommunityRecipe& community) {
+  return community.format_version == kCommunitySettingsOnlyFormat;
+}
 
 // Whether the kit's runtime has every newer profile feature the sidecar declares in
 // requires.prospero_win: the kit capability names without "settings-" (profile-environment,
@@ -608,6 +791,15 @@ inline constexpr const char* kKitGameRootUsbSearch = "game-root-usb-search";
 // The kit's libvulkan.prx keeps 120 Hz output on a display with variable refresh, so Playden may declare a game's PS5
 // title VRR-supported (param.json attribute3 0x40000). Older runtimes fall back to 60 Hz under VRR: they get no such title.
 inline constexpr const char* kKitDisplayVrr = "display-vrr";
+// The title takes [application] arguments of up to 4096 bytes and profiles of up to 16384; older ones 512 and 8192.
+inline constexpr const char* kKitLaunchArguments4096 = "launch-arguments-4096";
+// Wine gives a 32-bit program 4 GB of address space when [environment] sets WINE_LARGE_ADDRESS_AWARE = 1, as the
+// large-address-aware flag would; older titles refuse the variable.
+inline constexpr const char* kKitLargeAddressAware = "wine-large-address-aware";
+inline constexpr const char* kKitNsiproxySwitch = "nsiproxy-switch";
+// The title takes WINE_PS5_PARK_FILES and WINE_PS5_CACHED_FILES in [environment]: the in-process server's open-file
+// budgets. Older titles refuse them.
+inline constexpr const char* kKitEnvironmentFileBudgets = "environment-file-budgets";
 // The runtime honors [display] refresh = 60|120 on every graphics path (Wine reports the rate it asked for) and
 // [display] frame_rate = 0|120|60|40|30, which the display paces. Runtimes without it refuse a profile with frame_rate.
 inline constexpr const char* kKitDisplay120Hz = "display-120hz";
@@ -688,6 +880,16 @@ bool BuildSettingsLaunchPlan(const SettingsLaunchInput& input, SettingsLaunchPla
 // returns a distinct reconciliation diagnostic; false does not promise unchanged files.
 bool ApplySettingsFiles(const SettingsLaunchPlan& plan, const std::string& install_root, const std::string& prefix_dir,
                         std::int64_t unix_time, std::string* reason);
+
+// A file in the private settings folder (game-settings-private/, settings_storage.h): a regular file owned by the
+// effective user, 0600 or 0644, in a folder opened with DirectoryPolicy::kPrivate. A missing folder or file is
+// kMissing; anything else that can't be read safely (another owner or mode, a symlink, over 1 MiB) is kError.
+enum class PrivateSettingsRead { kMissing, kPresent, kError };
+PrivateSettingsRead ReadPrivateSettingsFile(const std::string& path, std::string* text);
+// Replaces it atomically (a synced temporary file renamed over it), mode 0600. Refuses one it could not read back.
+bool WritePrivateSettingsFile(const std::string& path, const std::string& text);
+// Renames it to aside_name in the same folder; never replaces a file already named so (false, EEXIST).
+bool SetPrivateSettingsFileAside(const std::string& path, const std::string& aside_name);
 
 // Per-game records in one small JSON file ({"version":1,"games":{"<key>":record}}), keyed by
 // ToKey: a Steam game's app ID, "local-<uuid>" for an imported game. A missing file loads as no

@@ -651,6 +651,148 @@ class Render::Impl
         return true;
     }
 
+    // Marks the UI fonts lack (★ ⚠ 👍 👎 → ›) are drawn as shapes in their place; the rest is text.
+    static bool drawn_mark(std::uint32_t codepoint)
+    {
+        return codepoint == 0x2605 || codepoint == 0x26A0 || codepoint == 0x1F44D || codepoint == 0x1F44E ||
+               codepoint == 0x2192 || codepoint == 0x203A;
+    }
+
+    struct MarkRun
+    {
+        std::string text;
+        std::uint32_t mark = 0;
+    };
+
+    static std::vector<MarkRun> mark_runs(const ui::FontRef &face, std::string_view value)
+    {
+        std::vector<MarkRun> runs;
+        std::size_t index = 0;
+        while (index < value.size())
+        {
+            const std::size_t start = index;
+            const std::uint32_t codepoint = gfx::next_codepoint(value, &index);
+            if (drawn_mark(codepoint) && !face.font->has_glyph(codepoint))
+            {
+                runs.push_back({{}, codepoint});
+                continue;
+            }
+            if (runs.empty() || runs.back().mark != 0)
+                runs.push_back({});
+            runs.back().text.append(value.substr(start, index - start));
+        }
+        return runs;
+    }
+
+    static float mark_width(float size) { return size * 0.9F; }
+
+    float measure_marked(const ui::FontRef &face, std::string_view value, float size) const
+    {
+        float width = 0.0F;
+        for (const MarkRun &run : mark_runs(face, value))
+            width += run.mark != 0 ? mark_width(size) : face.measure(run.text, size);
+        return width;
+    }
+
+    static void draw_mark(gfx::DrawList &list, std::uint32_t mark, float x, float baseline, float size, gfx::Color color)
+    {
+        const float cx = x + mark_width(size) * 0.5F;
+        const float cy = baseline - size * 0.36F;
+        const float r = size * 0.36F;
+        switch (mark)
+        {
+        case 0x2605:
+            list.star(cx, cy, r * 1.15F, color);
+            break;
+        case 0x26A0:
+            list.triangle({cx - r, cy - r, r * 2.0F, r * 1.85F}, kAmber, 2.0F);
+            list.line(cx, cy - r * 0.40F, cx, cy + r * 0.30F, 2.0F, kAmber);
+            list.circle(cx, cy + r * 0.58F, 1.5F, kAmber);
+            break;
+        case 0x1F44D:
+            list.triangle({cx - r * 0.8F, cy - r * 0.7F, r * 1.6F, r * 1.4F}, kGreen);
+            break;
+        case 0x1F44E:
+            list.triangle({cx - r * 0.8F, cy - r * 0.7F, r * 1.6F, r * 1.4F}, kRed, 0.0F, 3.14159265F);
+            break;
+        case 0x2192:
+            list.line(cx - r, cy, cx + r, cy, 2.0F, color);
+            list.line(cx + r * 0.35F, cy - r * 0.55F, cx + r, cy, 2.0F, color);
+            list.line(cx + r * 0.35F, cy + r * 0.55F, cx + r, cy, 2.0F, color);
+            break;
+        case 0x203A:
+            list.line(cx - r * 0.3F, cy - r * 0.6F, cx + r * 0.3F, cy, 2.0F, color);
+            list.line(cx - r * 0.3F, cy + r * 0.6F, cx + r * 0.3F, cy, 2.0F, color);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // One line with its marks drawn, cut to max_width (0: no limit) with an ellipsis. Returns the width.
+    // ui::paragraph with the marks drawn (★ after an account's name in a recipe's description): the same wrapping and
+    // ellipsis, each line drawn by marked_text. Returns the baseline after the last line drawn.
+    float marked_paragraph(gfx::DrawList &list, const ui::FontRef &face, std::string_view value, float x, float y,
+                           float size, float width, float line_height, gfx::Color color, int max_lines) const
+    {
+        // The font measures a mark it lacks as its missing glyph, narrower than the drawn shape: wrap with room for one.
+        const std::vector<MarkRun> runs = mark_runs(face, value);
+        const bool marked = std::any_of(runs.begin(), runs.end(), [](const MarkRun &run) { return run.mark != 0; });
+        const std::vector<std::string> lines = face.font->wrap(value, size, marked ? width - mark_width(size) : width);
+        int drawn = 0;
+        for (const std::string &line : lines)
+        {
+            const bool last = drawn + 1 == max_lines && lines.size() > static_cast<std::size_t>(max_lines);
+            marked_text(list, face, last ? line + " \xE2\x80\xA6" : line, x, y, size, color, gfx::Align::left, width);
+            y += line_height;
+            if (++drawn >= max_lines)
+                break;
+        }
+        return y;
+    }
+
+    float marked_text(gfx::DrawList &list, const ui::FontRef &face, std::string_view value, float x, float baseline,
+                      float size, gfx::Color color, gfx::Align align = gfx::Align::left, float max_width = 0.0F) const
+    {
+        std::vector<MarkRun> runs = mark_runs(face, value);
+        if (runs.size() <= 1 && (runs.empty() || runs.front().mark == 0))
+        {
+            const std::string text = max_width > 0.0F ? face.font->fit(value, size, max_width) : std::string(value);
+            return ui::text(list, face, text, x, baseline, size, color, align);
+        }
+        float width = 0.0F;
+        std::vector<MarkRun> kept;
+        for (MarkRun &run : runs)
+        {
+            const float run_width = run.mark != 0 ? mark_width(size) : face.measure(run.text, size);
+            if (max_width <= 0.0F || width + run_width <= max_width)
+            {
+                width += run_width;
+                kept.push_back(std::move(run));
+                continue;
+            }
+            if (run.mark == 0)
+            {
+                run.text = face.font->fit(run.text, size, max_width - width);
+                width += face.measure(run.text, size);
+                kept.push_back(std::move(run));
+            }
+            break;
+        }
+        float cursor = align == gfx::Align::right ? x - width : align == gfx::Align::center ? x - width * 0.5F : x;
+        for (const MarkRun &run : kept)
+        {
+            if (run.mark != 0)
+            {
+                draw_mark(list, run.mark, cursor, baseline, size, color);
+                cursor += mark_width(size);
+            }
+            else
+                cursor += ui::text(list, face, run.text, cursor, baseline, size, color);
+        }
+        return width;
+    }
+
     const ui::FontRef &font_for(std::string_view value, const ui::FontRef &preferred) const
     {
         std::size_t index = 0;
@@ -2908,19 +3050,35 @@ class Render::Impl
         const float offset = list_scroll(list_key, focus_index * pitch, focus_index * pitch + 80.0F, viewport, content,
                                          state.reduced_motion);
         scene_.push_clip({0.0F, top - 8.0F, kWidth, viewport + 8.0F});
+        // The rows are 4 px apart, so a focus glow and ring reach into the next row. Each layer is drawn for every row
+        // before the next one: no row drawn later covers a focus that is still fading in or out.
+        struct ListRow
+        {
+            const ViewRow *row;
+            gfx::Rect box;
+            float amount;
+        };
+        std::vector<ListRow> on_screen;
         for (std::size_t index = 0; index < games.size(); ++index)
         {
             const float y = top + index * pitch - offset;
             if (y + pitch < top - 8.0F || y > top + viewport)
                 continue;
-            const ViewRow &row = *games[index];
-            const gfx::Rect box{table_x, y, table_w, 80.0F};
-            const float amount = focus_of(row);
-            focus_glow(scene_, box, amount, true);
+            on_screen.push_back({games[index], {table_x, y, table_w, 80.0F}, focus_of(*games[index])});
+        }
+        for (const ListRow &item : on_screen)
+            focus_glow(scene_, item.box, item.amount, true);
+        for (const ListRow &item : on_screen)
+        {
+            const ViewRow &row = *item.row;
+            const gfx::Rect &box = item.box;
+            const float y = box.y;
+            const float amount = item.amount;
             if (amount > 0.0F)
             {
-                // The row covers the glow's middle, lifted a little.
-                scene_.rounded_rect(box, 10.0F, kBackground);
+                // The row covers its glow's middle, lifted a little. The cover fades with the focus, so a row
+                // losing it does not hide the glow of the row gaining it.
+                scene_.rounded_rect(box, 10.0F, kBackground.with_alpha(amount));
                 scene_.rounded_rect(box, 10.0F, kText.with_alpha(0.07F * amount));
             }
             if (!row.enabled)
@@ -2944,8 +3102,9 @@ class Render::Impl
             ui::text(scene_, fonts_.regular, row.value, size_right, y + 49.0F, 24.0F, kText, gfx::Align::right);
             if (!row.enabled)
                 scene_.pop_opacity();
-            focus_ring(scene_, box, amount, true);
         }
+        for (const ListRow &item : on_screen)
+            focus_ring(scene_, item.box, item.amount, true);
         // A running check's note under the games, or the empty tab's words.
         for (const ViewRow *row : notes)
         {
@@ -3277,7 +3436,8 @@ class Render::Impl
             for (const ViewRow &row : view.rows)
             {
                 if (row.key.rfind("details-", 0) != 0 || row.key == "details-kept" ||
-                    row.key == "details-hint" || row.key == "details-setup")
+                    row.key == "details-hint" || row.key == "details-setup" || row.key == "details-recipe" ||
+                    row.key == "details-compat")
                     continue;
                 if (row.kind == RowKind::Status)
                 {
@@ -3422,9 +3582,15 @@ class Render::Impl
             scanned_bytes ? short_size(*scanned_bytes) : std::string("Unknown");
         const std::string playtime = game->playtime_minutes && *game->playtime_minutes > 0 ?
             playtime_label(game->playtime_minutes) : std::string("Never played");
-        std::string compat = rating_label(compatibility);
-        if (const auto dot = compat.find(" · "); dot != std::string::npos)
-            compat.resize(dot);
+        // The player's own rating, apart from how the community's list has the game.
+        std::string own_rating = rating_label(compatibility);
+        if (const auto dot = own_rating.find(" · "); dot != std::string::npos)
+            own_rating.resize(dot);
+        if (compatibility == Compatibility::Untested)
+            own_rating = "Not rated";
+        const auto listed = std::find_if(view.rows.begin(), view.rows.end(),
+                                         [](const ViewRow &row) { return row.key == "details-compat"; });
+        const bool has_listed = listed != view.rows.end();
         std::string controller = game->controller_support.empty() ? "Unknown" : game->controller_support;
         controller.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(controller.front())));
         constexpr float left = 1304.0F;
@@ -3441,7 +3607,15 @@ class Render::Impl
                 setup_step.resize(dot);
             }
         }
-        const float facts_top = setup == view.rows.end() ? 754.0F : setup_detail.empty() ? 694.0F : 662.0F;
+        const auto recipe = std::find_if(view.rows.begin(), view.rows.end(),
+                                         [](const ViewRow &row) { return row.key == "details-recipe"; });
+        // "Recipe available" takes its own line under Compatibility; Setup (and the facts above it) make room.
+        const float recipe_line = recipe != view.rows.end() ? 38.0F : 0.0F;
+        // With the community's list: "Confirmed by N players" under Compatibility, and Your rating on a row of its own.
+        const float count_line = has_listed && !listed->value.empty() ? 30.0F : 0.0F;
+        const float rating_row = has_listed ? 76.0F + count_line : 0.0F;
+        const float facts_top = (setup == view.rows.end() ? 754.0F : setup_detail.empty() ? 694.0F : 662.0F) -
+                                (setup == view.rows.end() && !has_listed ? 0.0F : recipe_line) - rating_row;
         detail_cell("Playtime", playtime, left, facts_top, 240.0F);
         detail_cell("Size", size, right, facts_top, 240.0F);
         // A game a Steam family member shares comes from Steam Families, not the account's own library.
@@ -3450,7 +3624,30 @@ class Render::Impl
                                   game->source.empty() ? std::string("Steam") : game->source;
         detail_cell("Store", store, left, facts_top + 76.0F, 240.0F);
         detail_cell("Location", location, right, facts_top + 76.0F, 240.0F);
-        detail_cell("Compatibility", compat, left, facts_top + 152.0F, 240.0F);
+        if (has_listed)
+        {
+            detail_cell("Compatibility", listed->title, left, facts_top + 152.0F, 240.0F);
+            if (!listed->value.empty())
+                ui::text(scene_, fonts_.regular, fonts_.regular.font->fit(listed->value, 20.0F, 270.0F), left,
+                         facts_top + 152.0F + 82.0F, 20.0F, kSecondary);
+            detail_cell("Your rating", own_rating, left, facts_top + 228.0F + count_line + recipe_line, 240.0F);
+        }
+        else
+            detail_cell("Your rating", own_rating, left, facts_top + 152.0F, 240.0F);
+        // A game with community recipes: "Recipe available" (or "Recipe in use") on its own line under its
+        // compatibility, so it never runs into the Controller column.
+        if (recipe != view.rows.end())
+        {
+            const std::string tag = ui::upper(recipe->title);
+            const float tag_x = left;
+            const float tag_top = facts_top + 152.0F + 66.0F + count_line;
+            // The measure leaves out the 1.2 letter spacing the text is drawn with.
+            const float tag_w = mark_width(15.0F) + fonts_.semibold.measure(tag, 13.0F) + 1.2F * static_cast<float>(tag.size()) + 22.0F;
+            scene_.rounded_rect({tag_x, tag_top, tag_w, 26.0F}, 5.0F, kAccent.with_alpha(0.16F));
+            draw_mark(scene_, 0x2605, tag_x + 6.0F, tag_top + 19.0F, 15.0F, kAccent);
+            ui::text(scene_, fonts_.semibold, tag, tag_x + 8.0F + mark_width(15.0F), tag_top + 18.0F, 13.0F,
+                     kAccent, gfx::Align::left, 1.2F);
+        }
         if (game->last_played && setup == view.rows.end())
             detail_cell("Last played", relative_time(game->last_played, state.clock_ticks), right,
                         facts_top + 152.0F, 240.0F);
@@ -3458,10 +3655,10 @@ class Render::Impl
             detail_cell("Controller", controller, right, facts_top + 152.0F, 240.0F);
         if (setup != view.rows.end()) {
             const gfx::Color tone = setup->tone.empty() || setup->tone == "quiet" ? kText : save_tone(setup->tone);
-            detail_cell("Setup", setup_step, left, facts_top + 228.0F, 520.0F, tone);
+            detail_cell("Setup", setup_step, left, facts_top + 228.0F + recipe_line + rating_row, 520.0F, tone);
             if (!setup_detail.empty()) {
                 const ui::FontRef &face = font_for(setup_detail, fonts_.regular);
-                ui::text(scene_, face, face.font->fit(setup_detail, 24.0F, 520.0F), left, facts_top + 228.0F + 84.0F,
+                ui::text(scene_, face, face.font->fit(setup_detail, 24.0F, 520.0F), left, facts_top + 228.0F + recipe_line + rating_row + 84.0F,
                          24.0F, kSecondary);
             }
         }
@@ -3507,7 +3704,11 @@ class Render::Impl
                 notice.detail.empty() ? 0 : fonts_.regular.font->wrap(notice.detail, 20.0F, width - 64.0F).size();
             const float detail_height = static_cast<float>(std::min<std::size_t>(wrapped, kDetailLines)) * kDetailLine;
             const float height = 54.0F + (detail_height > 0.0F ? detail_height + 4.0F : 0.0F);
-            scene_.rounded_rect({left, y, width, height}, 8.0F, kAmber.with_alpha(0.16F));
+            // Opaque, so it stays readable over bright artwork and under the PS5 keyboard's dimming.
+            const gfx::Rect box{left, y, width, height};
+            scene_.shadow(box, 8.0F, 24.0F, gfx::Color::rgb(0x000000, 0.6F));
+            scene_.rounded_rect(box, 8.0F, kPanel);
+            scene_.rounded_rect({box.x, box.y, 6.0F, box.h}, 3.0F, kAmber);
             scene_.circle(left + 25.0F, y + 27.0F, 6.0F, kAmber);
             ui::text(scene_, fonts_.regular, fit(fonts_.regular, notice.message, 21.0F, width - 64.0F),
                      left + 44.0F, y + 35.0F, 21.0F, kText);
@@ -3820,7 +4021,9 @@ class Render::Impl
         const float text_x = panel.x + pad + qr_side + strip_gap;
         const float block_h = 30.0F + 14.0F + address_lines * address_line;
         const float block_y = y + (qr_side - block_h) * 0.5F;
-        ui::text(overlay_, fonts_.semibold, "Scan for the full release notes", text_x, block_y + 24.0F, 26.0F, kText);
+        // What the code leads to: the release notes, or a shared recipe's pull request.
+        ui::text(overlay_, fonts_.semibold, modal.link_caption.empty() ? std::string("Scan for the full release notes") : modal.link_caption,
+                 text_x, block_y + 24.0F, 26.0F, kText);
         ui::paragraph(overlay_, fonts_.regular, address, text_x, block_y + 30.0F + 14.0F + 21.0F, address_size,
                       address_w, address_line, kSecondary, 3);
         y += qr_side + 40.0F;
@@ -3844,7 +4047,7 @@ class Render::Impl
             {"game-settings", "Playden"}, {"game-maintenance", "Playden"}, {"kept-data", "Settings"}, {"leftover-titles", "Settings"},
             {"download-server", "Settings"},
             {"import-games", "Library"}, {"import-programs", "Import games"}, {"steam-programs", "Setup"}, {"import-choice", "Import games"},
-            {"import-storage", "Import games"}, {"move-storage", "Move game"},
+            {"import-storage", "Import games"}, {"move-storage", "Move game"}, {"share-recipe", "Game settings"}, {"vote-recipe", "Community recipes"}, {"feedback", "Feedback"}, {"share-as", "Community"},
             {"job-actions", "Downloads"}, {"prep-actions", "Preparation"}, {"storage-details", "Storage"}, {"context", "Game"}, {"compatibility", "Game"}, {"collections", "Game"}, {"collections-manage", "Library"},
             {"filters", "Library"}, {"logs-controls", "Logs"}, {"setting-value", "Settings"}, {"diagnostics", "Settings"},
             {"notices", "Notifications"}, {"qr-controls", "Sign in"}, {"session-controls", "Simulation"},
@@ -3894,7 +4097,8 @@ class Render::Impl
                           view.surface == "download-server" ||
                           view.surface == "import-games" ||
                           view.surface == "import-programs" || view.surface == "steam-programs" ||
-                          view.surface == "setup-programs";
+                          view.surface == "setup-programs" || view.surface == "share-recipe" || view.surface == "vote-recipe" ||
+                          view.surface == "feedback" || view.surface == "share-as";
         const float width = overlay_transition_.panel_width(wide ? 960.0F : 640.0F);
         const gfx::Rect panel{kWidth - width + (1.0F - ease) * width, 0.0F, width, kHeight};
         overlay_.shadow({panel.x - 18.0F, 0.0F, panel.w + 18.0F, panel.h}, 0.0F, 36.0F,
@@ -3991,8 +4195,8 @@ class Render::Impl
                  40.0F, kText);
         y += 18.0F;
         if (!comparison.hint.empty())
-            y = ui::paragraph(overlay_, fonts_.regular, comparison.hint, card.x + 48.0F, y + 24.0F, 21.0F,
-                              card.w - 96.0F, 29.0F, kSecondary, 3);
+            y = marked_paragraph(overlay_, fonts_.regular, comparison.hint, card.x + 48.0F, y + 24.0F, 21.0F,
+                                 card.w - 96.0F, 29.0F, kSecondary, 3);
         y += 36.0F;
         const float name_w = card.w * 0.34F;
         const float column_w = (card.w - 96.0F - name_w - 40.0F) * 0.5F;
@@ -4001,11 +4205,29 @@ class Render::Impl
         const float preset_x = arrow_x + 20.0F;
         ui::text(overlay_, fonts_.semibold, "SETTING", card.x + 48.0F, y, 14.0F, kMuted, gfx::Align::left, 1.4F);
         ui::text(overlay_, fonts_.semibold, "CURRENT", current_x, y, 14.0F, kMuted, gfx::Align::left, 1.4F);
-        ui::text(overlay_, fonts_.semibold, "THIS PRESET", preset_x, y, 14.0F, kMuted, gfx::Align::left, 1.4F);
+        ui::text(overlay_, fonts_.semibold, ui::upper(comparison.column), preset_x, y, 14.0F, kMuted, gfx::Align::left, 1.4F);
         y += 16.0F;
+        // A community recipe's start changes (program, arguments, registry) sit between the table and the note.
+        constexpr std::size_t kStartLines = 4;
+        constexpr float kStartLine = 28.0F;
+        const std::size_t start_lines = std::min(comparison.starts.size(), kStartLines);
+        const float starts_height = start_lines == 0 ? 0.0F : 44.0F + kStartLine * static_cast<float>(start_lines);
+        const float table_bottom = card.y + card.h - 80.0F - starts_height;
+        // Short of room, the rows that don't change go first, so every change stays listed.
+        std::vector<const std::array<std::string, 3> *> shown;
         for (const auto &row : comparison.rows)
+            shown.push_back(&row);
+        const auto capacity = static_cast<std::size_t>(std::max(0.0F, (table_bottom - y - 52.0F) / 56.0F + 1.0F));
+        for (auto it = shown.end(); shown.size() > capacity && it != shown.begin();)
         {
-            if (y + 52.0F > card.y + card.h - 80.0F)
+            --it;
+            if ((**it)[1] == (**it)[2])
+                it = shown.erase(it);
+        }
+        for (const auto *shown_row : shown)
+        {
+            const auto &row = *shown_row;
+            if (y + 52.0F > table_bottom)
                 break;
             overlay_.rounded_rect({card.x + 40.0F, y + 6.0F, card.w - 80.0F, 1.0F}, 0.0F, kText.with_alpha(0.10F));
             const bool changes = row[1] != row[2];
@@ -4025,8 +4247,32 @@ class Render::Impl
                      changes ? kAccent : kSecondary);
             y += 56.0F;
         }
-        ui::paragraph(overlay_, fonts_.regular, comparison.note, card.x + 48.0F, card.y + card.h - 56.0F, 19.0F,
-                      card.w - 96.0F, 26.0F, kSecondary, 2);
+        if (start_lines > 0)
+        {
+            float sy = table_bottom + 28.0F;
+            ui::text(overlay_, fonts_.semibold, "CHANGES HOW THE GAME STARTS", card.x + 48.0F, sy, 14.0F, kMuted,
+                     gfx::Align::left, 1.4F);
+            for (std::size_t line = 0; line < start_lines; ++line)
+            {
+                sy += kStartLine;
+                const bool last = line + 1 == start_lines && comparison.starts.size() > kStartLines;
+                const std::string text = last ? "and " + std::to_string(comparison.starts.size() - line) + " more"
+                                              : comparison.starts[line];
+                ui::text(overlay_, fonts_.regular, fit(fonts_.regular, text, 19.0F, card.w - 96.0F), card.x + 48.0F, sy,
+                         19.0F, kSecondary);
+            }
+        }
+        // A note that starts with ⚠ (a recipe that can't apply) draws the mark, then the words.
+        const std::string warning = "\u26a0 ";
+        if (comparison.note.rfind(warning, 0) == 0)
+        {
+            draw_mark(overlay_, 0x26A0, card.x + 48.0F, card.y + card.h - 56.0F, 19.0F, kAmber);
+            ui::paragraph(overlay_, fonts_.regular, comparison.note.substr(warning.size()), card.x + 48.0F + mark_width(19.0F) + 6.0F,
+                          card.y + card.h - 56.0F, 19.0F, card.w - 102.0F - mark_width(19.0F), 26.0F, kAmber, 2);
+        }
+        else
+            ui::paragraph(overlay_, fonts_.regular, comparison.note, card.x + 48.0F, card.y + card.h - 56.0F, 19.0F,
+                          card.w - 96.0F, 26.0F, kSecondary, 2);
     }
 
     void draw_storage_overlay_rows(const ViewData &view, const gfx::Rect &bounds)
@@ -4288,7 +4534,7 @@ class Render::Impl
     {
         // A sheet that only shows things says Close or Back on its cancel row.
         if (row.action == "cancel")
-            return row.title == "Close" || row.title == "Back" ? row.title : "Cancel";
+            return row.title == "Close" || row.title == "Back" || row.title == "Not now" ? row.title : "Cancel";
         // Titles come labeled from the model; only a bare action key needs its dashes softened.
         std::string label = row.title.empty() ? row.action : row.title;
         if (row.title.empty())
@@ -4332,11 +4578,13 @@ class Render::Impl
     // `scrolls` false: rows pinned in place (a sheet's fixed header), leaving the list's scroll alone.
     void draw_overlay_rows(const ViewData &view, const gfx::Rect &bounds, bool scrolls = true)
     {
+        // The Share and vote sheets lay out like Game settings: a line under each name, the value on the right.
         const bool settings_sheet = view.surface == "game-settings" || view.surface == "choice-picker" ||
                                     view.surface == "download-server" ||
                                     view.surface == "preset-picker" || view.surface == "button-mapping" ||
                                     view.surface == "controller-tuning" ||
-                                    view.surface == "game-maintenance";
+                                    view.surface == "game-maintenance" || view.surface == "share-recipe" ||
+                                    view.surface == "vote-recipe" || view.surface == "feedback" || view.surface == "share-as";
         // The Import sheets: each folder's path (or why it can't be added) under its name.
         const bool import_sheet = view.surface == "import-games" || view.surface == "import-programs" ||
                                   view.surface == "import-choice" || view.surface == "steam-programs" ||
@@ -4366,6 +4614,8 @@ class Render::Impl
                        ? 26.0F
                        : 0.0F;
         };
+        // The recipe chooser's rows carry more lines under the subtitle.
+        const auto lines_extra = [](const ViewRow &row) { return 28.0F * static_cast<float>(row.lines.size()); };
         // Every row's place in the list; the list scrolls only when it is taller than the sheet,
         // just enough to keep the focused row and a little of its neighbours in view, and eases there.
         const auto pitch = [&](const ViewRow &row) {
@@ -4380,8 +4630,9 @@ class Render::Impl
                 return 54.0F;
             const bool checkbox = (view.surface == "kept-data" || view.surface == "leftover-titles" || (view.surface == "collections" && row.action.rfind("collection-toggle-", 0) == 0) || view.surface == "install-dlc") &&
                                   row.kind == RowKind::Toggle;
-            const bool described = (settings_sheet || checkbox || import_sheet) && !row.subtitle.empty();
-            return (described ? 96.0F + hint_extra(row) : 72.0F) + 12.0F;
+            const bool described = (settings_sheet || checkbox || import_sheet ||
+                                    row.key == "install-settings") && !row.subtitle.empty();
+            return (described ? 96.0F + hint_extra(row) + lines_extra(row) : 72.0F) + 12.0F;
         };
         std::vector<float> tops;
         float total = 0.0F;
@@ -4483,8 +4734,9 @@ class Render::Impl
             // Kept game data: each game is a checkbox row with its kept date under the name.
             const bool checkbox = (view.surface == "kept-data" || view.surface == "leftover-titles" || (view.surface == "collections" && row.action.rfind("collection-toggle-", 0) == 0) || view.surface == "install-dlc") &&
                                   row.kind == RowKind::Toggle;
-            const bool described = (settings_sheet || checkbox || import_sheet) && !row.subtitle.empty() && row.kind != RowKind::Heading;
-            const gfx::Rect rect{bounds.x, y, bounds.w, described ? 96.0F + hint_extra(row) : 72.0F};
+            const bool described = (settings_sheet || checkbox || import_sheet ||
+                                    row.key == "install-settings") && !row.subtitle.empty() && row.kind != RowKind::Heading;
+            const gfx::Rect rect{bounds.x, y, bounds.w, described ? 96.0F + hint_extra(row) + lines_extra(row) : 72.0F};
             const float amount = control_focus("sheet-" + row.key, index == view.focused_row);
             focus_glow(overlay_, rect, amount);
             overlay_.rounded_rect(rect, 8.0F, kPanel);
@@ -4493,7 +4745,7 @@ class Render::Impl
             // A row with its subtitle under the name never repeats it on the right.
             const std::string value = settings_sheet && row.kind != RowKind::Heading ? row.value
                 : described && row.value.empty() && row.badge.empty() ? std::string() : overlay_value(row);
-            const float value_width = value.empty() ? 0.0F : std::min(rect.w * 0.45F, fonts_.regular.measure(value, 22.0F));
+            const float value_width = value.empty() ? 0.0F : std::min(rect.w * 0.45F, measure_marked(fonts_.regular, value, 22.0F));
             const float name_y = described ? rect.y + 40.0F : rect.cy() + 10.0F;
             float name_x = rect.x + 24.0F;
             if (checkbox)
@@ -4518,10 +4770,23 @@ class Render::Impl
             // Game names may need a fallback face (Greek, CJK, Arabic).
             const ui::FontRef &face = font_for(overlay_label(row), fonts_.display);
             const std::string label = fit(face, overlay_label(row), 28.0F, rect.w - (name_x - rect.x) - 40.0F - value_width);
-            ui::text(overlay_, face, label, name_x, name_y, 28.0F, ink);
+            // Names may carry a mark the fonts lack (👍 Good): drawn as shapes.
+            marked_text(overlay_, face, label, name_x, name_y, 28.0F, ink);
+            float tag_x = name_x + face.measure(label, 28.0F) + 14.0F;
+            // A player's recipe in the chooser: a filled Community tag in the accent colour, ahead of its status.
+            if (settings_sheet && row.tone == "community")
+            {
+                const std::string community = "COMMUNITY";
+                const float community_w = fonts_.semibold.measure(community, 13.0F) + 16.0F;
+                if (tag_x + community_w < rect.x + rect.w - 40.0F - value_width)
+                {
+                    overlay_.rounded_rect({tag_x, name_y - 21.0F, community_w, 24.0F}, 4.0F, kAccent);
+                    ui::text(overlay_, fonts_.semibold, community, tag_x + 8.0F, name_y - 4.0F, 13.0F, kBackground);
+                    tag_x += community_w + 8.0F;
+                }
+            }
             if (settings_sheet && !row.badge.empty() && row.kind != RowKind::Heading)
             {
-                const float tag_x = name_x + face.measure(label, 28.0F) + 14.0F;
                 const float tag_w = fonts_.semibold.measure(ui::upper(row.badge), 13.0F) + 16.0F;
                 if (tag_x + tag_w < rect.x + rect.w - 40.0F - value_width)
                 {
@@ -4536,14 +4801,40 @@ class Render::Impl
             else if (described && program_list)
                 ui::paragraph(overlay_, fonts_.regular, row.subtitle, rect.x + 24.0F, rect.y + 74.0F, 19.0F, hint_width,
                               26.0F, row.enabled ? kSecondary : kMuted);
+            else if (described && !row.author_style.empty() && row.enabled)
+            {
+                // A recipe by a Playden account: "By" as usual, the name in the account colour, a trusted account's
+                // star in gold after it.
+                const float x = rect.x + 24.0F;
+                const float y = rect.y + 74.0F;
+                const std::string by = "By ";
+                ui::text(overlay_, fonts_.regular, by, x, y, 19.0F, kSecondary);
+                const float name_left = x + fonts_.regular.measure(by, 19.0F);
+                const float star = row.author_style == "trusted" ? mark_width(19.0F) + 6.0F : 0.0F;
+                // marked_text, as for any subtitle: a name may hold a mark the fonts lack.
+                const float drawn = marked_text(overlay_, fonts_.regular, row.author, name_left, y, 19.0F, kBlue, gfx::Align::left,
+                                                rect.w - 72.0F - value_width - (name_left - x) - star);
+                if (star > 0.0F)
+                    draw_mark(overlay_, 0x2605, name_left + drawn + 6.0F, y, 19.0F, kAmber);
+            }
             else if (described)
-                ui::text(overlay_, fonts_.regular, fit(fonts_.regular, row.subtitle, 19.0F, rect.w - 72.0F - value_width),
-                         checkbox ? name_x : rect.x + 24.0F, rect.y + 74.0F, 19.0F,
-                         row.tone == "problem" ? kRed : row.tone == "good" ? kGreen : row.enabled ? kSecondary : kMuted);
+                marked_text(overlay_, fonts_.regular, row.subtitle, checkbox ? name_x : rect.x + 24.0F, rect.y + 74.0F, 19.0F,
+                            row.tone == "problem" ? kRed : row.tone == "good" ? kGreen : row.tone == "attention" ? kAmber
+                            : row.enabled ? kSecondary : kMuted,
+                            gfx::Align::left, rect.w - 72.0F - value_width);
+            // The recipe chooser: what changes, what changes how the game starts, the notes, why it can't apply.
+            for (std::size_t line = 0; described && line < row.lines.size(); ++line)
+            {
+                const std::string &text = row.lines[line];
+                const bool warning = text.rfind("\u26a0", 0) == 0;
+                marked_text(overlay_, fonts_.regular, text, rect.x + 24.0F, rect.y + 74.0F + 28.0F * static_cast<float>(line + 1),
+                            19.0F, warning ? kAmber : line == 0 ? kText.with_alpha(row.enabled ? 0.85F : 0.45F) : row.enabled ? kSecondary : kMuted,
+                            gfx::Align::left, rect.w - 48.0F);
+            }
             if (!value.empty())
-                ui::text(overlay_, fonts_.regular, fit(fonts_.regular, value, 22.0F, value_width), rect.x + rect.w - 24.0F,
-                         described ? rect.y + 52.0F : rect.cy() + 8.0F, 22.0F,
-                         row.modified || row.selected ? kAccent : row.enabled ? kSecondary : kMuted, gfx::Align::right);
+                marked_text(overlay_, fonts_.regular, value, rect.x + rect.w - 24.0F, described ? rect.y + 52.0F : rect.cy() + 8.0F,
+                            22.0F, row.modified || row.selected ? kAccent : row.enabled ? kSecondary : kMuted, gfx::Align::right,
+                            value_width);
             if (row.checked && value.empty())
             {
                 // The current choice of a pick-one group: a tick drawn as two strokes, where a value would go.

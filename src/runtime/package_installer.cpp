@@ -1,4 +1,5 @@
 #include "runtime/package_installer.h"
+#include "runtime/prospero_profile.h"
 #include "runtime/kit_trust.h"
 #include "runtime/private_directories.h"
 #include "platform/managed_directory.h"
@@ -436,7 +437,7 @@ bool PublicationIdentityMatches(const RuntimeInstall& record,
          publication.recipe_version == record.recipe_version &&
          publication.settings_revision == record.settings_revision &&
          !publication.profile_bytes.empty() &&
-         publication.profile_bytes.size() <= kMaxPublicationBytes &&
+         publication.profile_bytes.size() <= kProsperoMaxLongProfileBytes &&
          publication.profile_references_validated &&
          DescriptorMatches(record, publication.descriptor_bytes)))
     return false;
@@ -554,6 +555,7 @@ bool FilesystemPackageInstaller::RecipeAccepted(const RuntimeInstall& record) co
   if (record.recipe_version.empty()) return false;
   if (std::find(shipped_recipe_ids_.begin(), shipped_recipe_ids_.end(), record.recipe_id) != shipped_recipe_ids_.end())
     return true;
+  if (accept_recipe_ && accept_recipe_(record)) return true;
   if (record.runtime_number == 0) return false;
   if (record.game != GameId{}) return record.game.valid() && record.recipe_id == playden::GeneratedRecipeId(record.game);
   // A copy that doesn't carry its game (read back from a journal): the Steam game its number names,
@@ -680,11 +682,27 @@ bool FilesystemPackageInstaller::TitleMetadataCurrent(const RuntimeInstall& reco
   return true;
 }
 
+std::optional<std::string> FilesystemPackageInstaller::TitleIconSource(const RuntimeInstall& record) {
+  const auto path = TitleMetadataPath(record, kTitleMetadataMarker);
+  const auto marker = path.empty() ? std::nullopt : ReadBounded(path, 4096);
+  if (!marker) return std::nullopt;
+  if (*marker == "1\n") return std::string();
+  // "2\n<source>\n"
+  if (marker->size() < 3 || marker->compare(0, 2, "2\n") != 0 || marker->back() != '\n') return std::nullopt;
+  auto source = marker->substr(2, marker->size() - 3);
+  if (source.find('\n') != std::string::npos) return std::nullopt;
+  return source;
+}
+
 PackageActionResult FilesystemPackageInstaller::WriteTitleMetadata(const RuntimeInstall& record,
                                                                    const std::string& param_json,
-                                                                   const std::optional<std::string>& icon_png) {
+                                                                   const std::optional<std::string>& icon_png,
+                                                                   const std::string& icon_source) {
   const auto paths = Resolve(record);
   if (!paths) return Failed("kit-invalid", "record or verified kit view is invalid");
+  if (icon_source.find_first_of("\r\n") != std::string::npos || icon_source.find('\0') != std::string::npos ||
+      icon_source.size() > 1024)
+    return Failed("title-metadata", "the game's title icon source is not one line");
   // The parameters name this title, whichever kit title they were made from.
   const auto parameters = playden::steam::json::Parse(param_json, {64 * 1024, 8, 1024, 64 * 1024});
   const auto* title = parameters && parameters->is_object()
@@ -713,7 +731,7 @@ PackageActionResult FilesystemPackageInstaller::WriteTitleMetadata(const Runtime
   const auto icon = root / kTitleMetadataFiles[1];
   if (icon_png ? !replace(icon, *icon_png) : (::unlink(icon.c_str()) != 0 && errno != ENOENT))
     return Failed("title-metadata", "the game's title icon could not be written");
-  if (!replace(root / kTitleMetadataMarker, "1\n"))
+  if (!replace(root / kTitleMetadataMarker, "2\n" + icon_source + "\n"))
     return Failed("title-metadata", "the game's title metadata could not be recorded");
   return Complete();
 }
@@ -1601,7 +1619,72 @@ std::optional<std::string> WithFilesDigest(const std::string& marker, const std:
   if (end == std::string::npos) return std::nullopt;
   return marker.substr(0, at) + "\nfiles_sha256=" + digest + marker.substr(end);
 }
+
+// Marker text with its recipe_id and recipe_version lines replaced by the record's; nothing when
+// the marker doesn't carry each exactly once.
+std::optional<std::string> WithRecipeLines(const std::string& marker, const RuntimeInstall& record) {
+  std::string rebuilt;
+  unsigned ids = 0, versions = 0;
+  std::size_t start = 0;
+  while (start < marker.size()) {
+    auto end = marker.find('\n', start);
+    if (end == std::string::npos) end = marker.size();
+    const auto line = marker.substr(start, end - start);
+    if (line.rfind("recipe_id=", 0) == 0) { rebuilt += "recipe_id=" + record.recipe_id; ++ids; }
+    else if (line.rfind("recipe_version=", 0) == 0) { rebuilt += "recipe_version=" + record.recipe_version; ++versions; }
+    else rebuilt += line;
+    if (end < marker.size()) rebuilt += '\n';
+    start = end + 1;
+  }
+  if (ids != 1 || versions != 1) return std::nullopt;
+  return rebuilt;
+}
 }  // namespace
+
+PackageActionResult FilesystemPackageInstaller::RebindRecipe(const RuntimeInstall& record) {
+  const auto paths = Resolve(record);
+  if (!paths) return Failed("kit-invalid", "record or verified kit view is invalid");
+  struct Marker { fs::path folder; const char* name; const char* kind; };
+  for (const Marker& marker : {Marker{paths->title, kTitleOwner, "title"}, Marker{paths->bottle, kTemplateOwner, "template"}}) {
+    const auto path = marker.folder / marker.name;
+    // A marker that is missing, malformed or another install's is left for the inspection and start
+    // checks to report, whose refusals say more than this one could.
+    const auto current = ReadBounded(path, 4096);
+    if (!current) continue;
+    const auto wanted = WithRecipeLines(*current, record);
+    if (!wanted || *wanted == *current) continue;
+    // Only this install's marker, and only its recipe lines, are rewritten.
+    if (!MarkerIdentifies(path, record, marker.kind)) continue;
+    const auto temporary = marker.folder / (std::string(marker.name) + ".rebind");
+    ::unlink(temporary.c_str());
+    const bool written = WriteFile(temporary, *wanted, 0600) && SyncPath(temporary, false) &&
+                         ::rename(temporary.c_str(), path.c_str()) == 0 && SyncPath(marker.folder, true);
+    if (!written) {
+      ::unlink(temporary.c_str());
+      return Failed("rebind-write", std::string("the ") + marker.kind + " owner marker could not be rewritten");
+    }
+    if (operations_.log) operations_.log(std::string("owner marker rebound kind=") + marker.kind + " install=" + record.install_id +
+                                         " recipe=" + record.recipe_id + ":" + record.recipe_version);
+  }
+  return Complete();
+}
+
+std::optional<std::string> FilesystemPackageInstaller::TitleRuntimeRevision(const RuntimeInstall& record) const {
+  const auto paths = Resolve(record);
+  if (!paths) return std::nullopt;
+  const auto path = paths->title / kTitleOwner;
+  const auto marker = ReadBounded(path, 4096);
+  if (!marker || !MarkerIdentifies(path, record, "title")) return std::nullopt;
+  std::size_t start = 0;
+  while (start < marker->size()) {
+    auto end = marker->find('\n', start);
+    if (end == std::string::npos) end = marker->size();
+    const auto line = marker->substr(start, end - start);
+    if (line.rfind("runtime_revision=", 0) == 0) return line.substr(std::strlen("runtime_revision="));
+    start = end + 1;
+  }
+  return std::nullopt;
+}
 
 bool FilesystemPackageInstaller::TitleCurrent(const RuntimeInstall& record) {
   const auto paths = Resolve(record);

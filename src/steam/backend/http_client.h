@@ -46,11 +46,14 @@ struct HttpRequest {
   std::vector<std::pair<std::string, std::string>> headers;
   std::vector<std::uint8_t> body;
   std::uint32_t timeout_ms = 10'000;
+  // How long connecting may take, within timeout_ms; 0: all of it. A server that doesn't answer fails after this.
+  std::uint32_t connect_timeout_ms = 0;
   std::size_t max_response_bytes = 1024 * 1024;
   // Reserve the bounded response before reading it. Used for Steam chunks to avoid vector growth
   // reallocations on the PS4 heap while a previous chunk is being processed.
   bool preallocate_response = false;
   // Also accept an http:// URL. Only for content checked by other means, such as Steam CDN chunks.
+  // Community recipes set it only in a PLAYDEN_DEV_ENDPOINTS=ON build (community/endpoints.h).
   bool allow_plain_http = false;
   // A Steam depot manifest: max_response_bytes may be up to kMaxHttpManifestResponseBytes, not kMaxHttpResponseBytes.
   bool depot_manifest = false;
@@ -65,6 +68,7 @@ struct HttpTiming {
   std::uint32_t new_connections = 0;
   std::uint64_t body_bytes = 0;
   std::uint64_t uploaded_bytes = 0;
+  bool connected = false;  // a connection to the server was made (false: nothing reached it, so nothing was sent)
 };
 
 struct HttpResponse {

@@ -14,6 +14,11 @@
 #include "stores/local/library_source.h"
 #include "app/diagnostic_log.h"
 #include "runtime/game_probe.h"
+#include "community/endpoints.h"
+#include "community/recipe_service.h"
+#include "homebrew/sharing_service.hpp"
+#include "update/version.h"
+#include "diagnostics/redaction.h"
 #include "runtime/settings_storage.h"
 #include "homebrew/input_adapter.hpp"
 #include "homebrew/json.hpp"
@@ -27,6 +32,7 @@
 #include "steam/backend/library_client.h"
 #include "steam/local_session_repository.h"
 #include "library/cache.h"
+#include "app/experimental_features.h"
 
 #include "core/input.hpp"
 #include "gfx/gl.hpp"
@@ -475,6 +481,12 @@ int main(int argc, char** argv) {
     std::unique_ptr<playden::steam::CloudService> cloud;
     std::unique_ptr<playden::steam::StoreDetailsService> store_details;  // declared first: the controller uses it
     std::unique_ptr<playden::stores::Registry> stores;  // declared first: the controller uses it
+    // Community recipes; declared first: the controller uses the service, the service its HTTP client.
+    std::unique_ptr<playden::steam::HttpClient> community_http;
+    std::unique_ptr<playden::community::CommunityRecipeService> community;
+    // Sharing recipes and votes, with its own HTTP client; declared first for the same reason.
+    std::unique_ptr<playden::steam::HttpClient> sharing_http;
+    std::unique_ptr<playden::homebrew::SharingService> sharing;
     std::unique_ptr<playden::homebrew::Controller> services;
     std::unique_ptr<playden::homebrew::HttpArtworkBackend> artwork_backend;
     std::unique_ptr<playden::homebrew::ProgramIconArtworkBackend> program_icons;
@@ -512,11 +524,29 @@ int main(int argc, char** argv) {
     SDL_GL_SetSwapInterval(options->headless ? 0 : 1);
     hui::gfx::set_glsl_prefix("#version 410 core\n");
 
+    // Experimental features: one name per line in features.txt in the data folder, read once here. Simulation keeps
+    // every feature on, so its scenarios show them; nightlies and local dev builds (PLAYDEN_DEV_BUILD, on in the
+    // homebrew-host preset) have every feature on, as on the PS5.
+    playden::app::ExperimentalFeatures features = playden::app::DefaultExperimentalFeatures(true);
+    if (!options->simulation) {
+        std::vector<std::string> unknown;
+        features = playden::app::ReadExperimentalFeatures(
+            (options->data_directory / playden::app::kExperimentalFeaturesFileName).string(),
+            playden::app::DefaultExperimentalFeatures(playden::update::CurrentVersion().nightly() || PLAYDEN_DEV_BUILD), &unknown);
+        for (const auto& name : unknown) std::fprintf(stderr, "unknown experimental feature: %s\n", name.substr(0, 64).c_str());
+        if (features.community_recipes) std::fprintf(stderr, "experimental feature community-recipes on\n");
+        simulation.SetCommunityRecipesEnabled(features.community_recipes);
+    }
+
     if (!options->simulation) {
         std::string settings_reason;
         const auto settings_file = playden::runtime::PrepareGameSettingsStorage(options->data_directory, &settings_reason);
         if (!settings_file) std::fprintf(stderr, "private game settings unavailable: %s\n", settings_reason.c_str());
         simulation.SetGameSettingsFile(settings_file.value_or(std::filesystem::path{}));
+        if (settings_file)
+            for (const auto& line : playden::runtime::MyPresetsLoadLog(
+                     simulation.SetMyPresetsFile(playden::runtime::MyPresetsPath(*settings_file))))
+                std::fprintf(stderr, "%s\n", line.c_str());
         auth_storage = std::make_unique<playden::Storage>(options->data_directory.string());
         auth_cm = std::make_unique<playden::steam::CmClient>(PLAYDEN_HOMEBREW_CA_BUNDLE, *auth_storage);
         auth_cm->SetOwner("auth");
@@ -764,6 +794,51 @@ int main(int argc, char** argv) {
         });
         store_details = std::make_unique<playden::steam::StoreDetailsService>(playden::homebrew::StoreFetch(PLAYDEN_HOMEBREW_CA_BUNDLE));
         services->SetStoreDetails(store_details.get());
+        // Community recipes: the latest release of the recipes repository, kept under the data folder.
+        // The Mac host has no runtime: the cache keeps the saved choices (and the current release).
+        // Off (features.txt): no service and no requests; the recipes games already chose load from the cache.
+        if (!features.community_recipes) {
+            services->SetCommunityRecipeCache(
+                std::make_shared<playden::community::RecipeStore>(options->data_directory / "community-recipes"));
+        } else {
+            const auto root = options->data_directory / "community-recipes";
+            playden::community::RecipeServiceConfig config;
+            config.store_root = root.string();
+            std::string endpoints_line;
+            config.endpoints = playden::community::LoadEndpoints((options->data_directory / playden::community::kDevEndpointsFileName).string(),
+                                                                 &endpoints_line);
+            const auto community_log = [log_directory](const std::string& line) {
+                playden::app::AppendLogLine(log_directory, "community.log", playden::diagnostics::RedactSecrets(line));
+            };
+            if (!endpoints_line.empty()) community_log(endpoints_line);
+            community_http = std::make_unique<playden::steam::HttpClient>(PLAYDEN_HOMEBREW_CA_BUNDLE);
+            config.fetch = [client = community_http.get()](const playden::steam::HttpRequest& request, const std::atomic<bool>& cancel) {
+                return client->Perform(request, cancel);
+            };
+            config.log = community_log;
+            auto keep = std::make_shared<playden::homebrew::CommunityKeepSet>();
+            config.referenced = playden::homebrew::CommunityKeepCallback(keep);
+            const auto endpoints = config.endpoints;
+            community = std::make_unique<playden::community::CommunityRecipeService>(std::move(config));
+            community->Start();
+            services->SetCommunityRecipes(community.get(), keep, /*no_runtime_installs=*/true);
+            // Sharing and votes: the sharing ID and the vote memory live beside the recipe store.
+            playden::homebrew::SharingServiceConfig sharing_config;
+            sharing_config.store_root = root.string();
+            sharing_config.endpoints = endpoints;
+            sharing_http = std::make_unique<playden::steam::HttpClient>(PLAYDEN_HOMEBREW_CA_BUNDLE);
+            sharing_config.fetch = [client = sharing_http.get()](const playden::steam::HttpRequest& request, const std::atomic<bool>& cancel) {
+                return client->Perform(request, cancel);
+            };
+            sharing_config.log = community_log;
+            sharing_config.logs = playden::web::LogsPaths{log_directory, (options->data_directory / "homebrew").string(),
+                                                          (options->data_directory / "kits").string(),
+                                                          options->data_directory.string()};
+            sharing = std::make_unique<playden::homebrew::SharingService>(std::move(sharing_config));
+            sharing->Start();
+            services->SetSharing(sharing.get());
+            simulation.SetSharingContext("", playden::update::BuildVersionText());
+        }
     }
 
     if (!options->simulation) {
@@ -918,6 +993,8 @@ int main(int argc, char** argv) {
     SDL_StopTextInput();
     if (services) services->Shutdown();
     if (web) web->Shutdown();
+    if (community) community->Shutdown();  // before its HTTP client goes
+    if (sharing) sharing->Shutdown();
     // The install service stops before the Local store goes (`stores` is destroyed before
     // `installs`): its copy runner's change callback calls into the Local store. Explicit here, so
     // it doesn't rest on the controller's shutdown or on declaration order.

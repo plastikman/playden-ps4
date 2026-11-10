@@ -4,16 +4,24 @@
 #pragma once
 
 #include "app/preferences.h"
+#include "community/api_client.h"
+#include "community/share_decision.h"
+#include "community/vote_state.h"
 #include "library/organization.h"
 #include "library/update_check.h"
 #include "library/model.h"
 #include "runtime/game_settings.h"
 #include "steam/backend/content_language.h"
+#include "runtime/kit_version.h"
+#include "runtime/my_presets.h"
+#include "runtime/package_installer.h"
+#include "runtime/recipe_choice.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -274,6 +282,127 @@ struct LiveRuntimeGame {
     // The artwork source of the icon inside the program its title starts (homebrew/program_icon.hpp), shown
     // where the game has no cover art; empty before it is prepared.
     std::string program_icon;
+    // Community recipes: the recipe its title plays under (RuntimeInstallView::recipe_id and
+    // recipe_version, a community recipe's first 32 hex of its revision), why the wanted community
+    // recipe was not used at the last preparation (RuntimeSnapshot::recipe_fallbacks), and a switch
+    // that did not finish ("The switch didn't finish: …", RuntimeSnapshot::recipe_switch_failures).
+    std::string recipe_id;
+    std::string recipe_version;
+    std::string recipe_fallback;
+    std::string recipe_switch_failure;
+};
+// Live: a community recipe the chooser offers for a game (community::RecipeSummary, projected).
+struct CommunityRecipeOffer {
+    std::string id;  // community-<store>-<key>-<slug>
+    std::string title, status, author;
+    std::vector<std::string> contributors;
+    std::string tested_kit, min_kit, tested_firmware, tested_date, notes;
+    std::string revision;            // sha256 of the file (64 hex)
+    std::vector<std::string> flags;  // what changes how the game starts (runtime::CommunityRecipeFlags)
+    bool has_votes = false;          // the API had votes for this revision
+    std::uint32_t votes_up = 0, votes_down = 0;
+    bool verified = false;           // marked Verified, or shared by a trusted account (summary.json)
+    bool author_account = false;     // the author is a Playden account, not only a typed name
+    bool author_trusted = false;     // that account is trusted: a star by the name (summary.json author_trusted)
+    bool operator==(const CommunityRecipeOffer&) const = default;
+};
+// What the chooser and Game settings call a recipe: its title, or for one shared without a title "Recipe from
+// <author>", and "Recipe from the community" when it has no author either. The title itself stays empty.
+inline std::string CommunityRecipeLabel(const std::string& title, const std::string& author) {
+    if (!title.empty()) return title;
+    return author.empty() ? std::string("Recipe from the community") : "Recipe from " + author;
+}
+inline std::string CommunityRecipeLabel(const CommunityRecipeOffer& offer) { return CommunityRecipeLabel(offer.title, offer.author); }
+
+// Live: the community recipes Playden has (community::RecipeSnapshot, projected), by the game they are for. A library
+// game gets those of its GameRef (Simulation::community_ref: a Steam game's app ID, an imported game's Steam app ID).
+// Search by name (the chooser's "Search recipes by game name…") finds any game here that has recipes, by its name.
+// A game of the community's compatibility list: how it is listed ("works", "partial", "broken" or "refused") and how
+// many players confirmed a game listed as Works.
+struct CommunityListing {
+    std::string status;
+    std::uint32_t reports = 0;
+    bool operator==(const CommunityListing&) const = default;
+};
+struct CommunityCatalog {
+    std::map<GameRef, std::vector<CommunityRecipeOffer>> games;
+    // The compatibility list. Nothing: Playden doesn't have it (yet), which isn't "this game is not listed".
+    std::optional<std::map<GameRef, CommunityListing>> compat;
+    std::map<GameRef, std::string> names;  // each game's name as the release's index has it
+    std::string release_tag;      // empty: no copy yet
+    std::int64_t fetched_at = 0;  // the copy's last successful refresh (Unix seconds)
+    std::int64_t votes_generated_at = 0;  // when the API made the vote totals (Unix seconds); 0 unknown
+    bool refreshing = false;
+    std::string last_error;       // the last refresh's failure; empty after a success
+    bool operator==(const CommunityCatalog&) const = default;
+};
+// A game the chooser's search found (Simulation::SearchRecipeGames): one with community recipes whose name matches.
+struct RecipeSearchResult {
+    GameRef game;
+    std::string name;
+    std::size_t recipes = 0;
+    bool operator==(const RecipeSearchResult&) const = default;
+};
+// "Steam", "Epic", "GOG" or "Imported", for a recipe's store.
+std::string RecipeStoreLabel(std::string_view store);
+// Sharing recipes and voting (community recipes, plan Phases 5 and 6). The model hands these to the
+// sharing worker (homebrew/sharing_service.hpp) and gets its answers back; it never holds the
+// console's sharing ID (the install secret), which only that worker reads and sends.
+enum class SharingRequestKind { Submit, Status, Vote, MarkAsked, ResetSharingId, Report, FeedbackSeen, AccountStart, AccountPoll,
+                                AccountCheck, AccountUnlink };
+struct SharingRequest {
+    SharingRequestKind kind = SharingRequestKind::Submit;
+    std::uint64_t ticket = 0;   // matches the result to the request
+    GameId game_id;             // Submit, Vote
+    // Submit: the whole request. An empty idempotency_key asks the worker for a new one (one per share
+    // attempt); Try again sends back the key the failed attempt used.
+    playden::community::SubmissionRequest submission;
+    std::string submission_id;  // Status
+    // Vote: the whole request; MarkAsked: recipe_id and revision only.
+    playden::community::VoteRequest vote;
+    // Report: the whole request (the worker adds the versions and, when asked, the redacted logs of
+    // the game's title found by logs_app or logs_name). An empty idempotency_key asks for a new one.
+    playden::community::ReportRequest report;
+    bool attach_logs = false;
+    std::uint32_t logs_app = 0;
+    std::string logs_name;
+    // FeedbackSeen: a feedback prompt was shown (or a report sent: answered) for the game's settings.
+    std::string feedback_game, feedback_kit, feedback_settings;
+    bool feedback_answered = false;
+    bool use_account = false;  // Submit, Report: send the linked account (the player shares as it)
+};
+struct SharingResult {
+    SharingRequestKind kind = SharingRequestKind::Submit;
+    std::uint64_t ticket = 0;
+    GameId game_id;
+    playden::community::SubmissionResult submission;  // Submit
+    std::string idempotency_key;                      // Submit, Report: the key the attempt used
+    playden::community::SubmissionStatus status;      // Status (its id is the submission asked about)
+    playden::community::VoteResult vote;              // Vote
+    playden::community::ReportResult report;          // Report
+    // Account*: what the link is now. state: none, started (user_code and verification_uri to show), pending, slow,
+    // linked (name, trusted), expired, denied or error. The token never leaves the worker.
+    struct AccountAnswer {
+        std::string state;
+        std::string user_code, verification_uri;
+        std::int64_t interval = 5, expires_in = 900;
+        std::string name;
+        bool trusted = false;
+        std::string error;
+    } account;
+    bool account_unlinked = false;  // Submit, Report: the API said the account link ended (the token is forgotten)
+    bool ok = false;                                  // ResetSharingId
+    std::string error;                                // ResetSharingId: why it failed
+};
+// A shared recipe's pull request as GET /v1/submissions/<id> last answered.
+struct SubmissionView {
+    std::string state;       // provisioning, in-review, published, closed, duplicate; empty: not known yet
+    std::string recipe_id;
+    std::string pr_url;
+    std::int64_t checked_at = 0;  // wall clock of the last answer (or request), 0 never
+    bool checking = false;
+    std::string error;       // the last check's failure, short
+    bool operator==(const SubmissionView&) const = default;
 };
 // A preparation that ended Ready, listed in Queue after the waiting games.
 struct LiveCompletedPreparation {
@@ -724,6 +853,7 @@ struct ModalEntry {
     std::string body;  // explanatory text; empty uses the simulation's default wording
     std::string setting_id;  // Game settings picker: the catalogue setting being chosen
     std::string link;  // a web page the dialog shows as a QR code with its address (release notes)
+    std::string link_caption;  // the line beside the code; empty: the release notes' wording
 };
 
 struct Navigation {
@@ -831,6 +961,33 @@ struct State {
     bool import_scanning = false;                       // live: Playden is looking for games to import
     LiveSavesJob saves_job;                             // live: the Saves tab's running check or Sync all
     UpdateCheckState update_check;                      // live: installed games' updates, the signed-in account's
+    CommunityCatalog community;                         // community recipes the chooser offers
+    // Sharing and votes: the shared recipes' pull requests by submission id, and what the sharing worker
+    // remembers about votes (votes cast and revisions asked about; never the sharing ID).
+    std::map<std::string, SubmissionView> submissions;
+    playden::community::VoteState vote_memory;
+    bool vote_memory_loaded = false;
+    // Preferences: Recipe votes (Settings › Community), whether a share explained what it sends, and
+    // the name shared recipes credit.
+    playden::RecipeVotesPreference recipe_votes = playden::RecipeVotesPreference::kUnset;
+    bool sharing_explained = false;
+    bool reports_explained = false;  // the first report said what it sends
+    playden::ShareAs share_as = playden::ShareAs::kNone;  // who shares and reports credit (Settings › Community)
+    bool ask_after_games = true;  // Settings › Community › Ask how games ran; "Don't ask again" turns it off
+    // The Playden account this console is linked to (Settings › Community › Account), as the sharing worker last said.
+    struct AccountLink {
+        std::string state;  // "" not linked (or not known yet), "linking" (a code shown), "linked"
+        std::string name;
+        bool trusted = false;
+        std::string user_code, verification_uri, error;
+        std::int64_t interval = 5, next_poll = 0, expires_at = 0;
+        bool waiting = false;  // a request is with the worker
+        bool checked = false;  // the worker was asked once since start
+        // The saved link couldn't be checked (the API didn't answer): counted as linked, checked again at next_poll.
+        bool unverified = false;
+        bool operator==(const AccountLink&) const = default;
+    } account_link;
+    std::string share_name;
     std::map<GameId, std::uint64_t> save_sizes;         // live: Windows user folders of games without Steam Cloud
     Navigation navigation;
     EditorState editor;
@@ -903,6 +1060,11 @@ struct ViewRow {
     std::string aside;    // Saves: the right-hand note (size, last sync)
     bool rail_only = false;  // Settings: the section's rail entry is the action (Quit Playden), no card
     std::string qr;          // Settings: a link drawn as a QR code beside the row's text (Web access)
+    // Recipe chooser: more lines under the subtitle (what changes, what changes how the game starts, notes).
+    std::vector<std::string> lines;
+    // Recipe chooser: the author's name drawn in the account colour ("account"), with a star when trusted ("trusted").
+    std::string author;
+    std::string author_style;
 };
 
 // A read-only label and value above a sheet's rows; the focus never goes there.
@@ -946,9 +1108,14 @@ struct ViewData {
         std::string hint;
         std::vector<std::array<std::string, 3>> rows;
         std::string note;
+        std::string column = "This preset";  // the right column's heading
+        std::vector<std::string> starts;      // a community recipe's "Changes how the game starts" items
     };
     std::optional<Comparison> comparison;
 };
+
+// The recipe chooser's section headings ("Community recipes", "Built-in presets"): rows that never take focus.
+inline bool IsChooserHeading(std::string_view key) { return key.rfind("chooser-heading-", 0) == 0; }
 
 // Characters a Details description page holds: live pages have status lines above it.
 inline std::size_t DetailsDescriptionPage(bool simulation_mode) { return simulation_mode ? 300 : 200; }
@@ -1049,6 +1216,10 @@ public:
     // saved settings yet (just added); never over anything the player changed, a reset Program
     // included. Saved at once so the next preparation reads it. True when it was written.
     bool SeedGameProgram(GameId id, const std::string& program);
+    // The program each imported game was added with (relative to its folder): Reset goes back to it.
+    void UpdateImportedPrograms(std::map<GameId, std::string> programs);
+    // Whether Reset would change the game's settings (never for an imported game before UpdateImportedPrograms).
+    [[nodiscard]] bool can_reset_settings(GameId id) const;
     [[nodiscard]] std::vector<GameId> TakeKeptDeleteRequests();
     // Live mode: maintenance the player confirmed (and settings to apply when the sheet
     // closes), and games whose title activity the sheet needs to know.
@@ -1074,9 +1245,10 @@ public:
     void SetKitInfo(LiveKitInfo kit);
     void UpdateRuntime(RuntimeState runtime, const std::vector<LiveRuntimeGame>& games);
     // Live mode: the preparation queue for Queue, and what the player asked of it there: games to
-    // prepare next, finished preparations dismissed, and Clear completed.
+    // prepare next, waiting games canceled, finished preparations dismissed, and Clear completed.
     void UpdatePreparationQueue(PreparationQueue queue);
     [[nodiscard]] std::vector<GameId> TakePrepareNextRequests();
+    [[nodiscard]] std::vector<GameId> TakePrepareCancels();
     [[nodiscard]] std::vector<LiveCompletedPreparation> TakePreparedDismissals();
     [[nodiscard]] bool TakePreparedClear();
     // The game runtime could not start (raw: its log reason; empty: it runs). Shown on every screen
@@ -1170,6 +1342,45 @@ public:
     void SetKitCapabilities(playden::runtime::KitCapabilities kit);
     // Live mode: where per-game settings are kept (loaded now, saved on every change).
     void SetGameSettingsFile(std::filesystem::path path);
+    // Live mode: the player's own presets (my-presets.json beside the settings file), loaded now. A file that can't be
+    // read as presets is set aside (my-presets.json.bad) or, when that isn't safe, left alone with changes refused;
+    // either shows a notice. The load comes back for the log (runtime::MyPresetsLoadLog).
+    playden::runtime::MyPresetsLoad SetMyPresetsFile(std::filesystem::path path);
+    // Where new presets get their id (a random UUID) and time (Unix seconds); unset: RandomUuid and the clock.
+    void SetMyPresetSources(std::function<std::optional<std::string>()> uuid, std::function<std::int64_t()> now);
+    // The player's presets, in the order they were made, and how many games' settings use each (by id; unused ones
+    // are left out).
+    [[nodiscard]] const std::vector<playden::runtime::MyPreset>& MyPresets() const noexcept { return my_presets_; }
+    [[nodiscard]] std::map<std::string, std::size_t> MyPresetUseCounts() const;
+    // Changes to the player's presets. Live, a failed game-settings save restores the previous preset file; a failed
+    // restoration is reported and disables further preset writes. New settings or a deletion reach every game using
+    // the preset as a Game settings edit does: its record's revision goes up (a deletion also takes it back to Playden default, keeping its own changes), the
+    // settings are saved, and a prepared game gets its title updated (applied now when stopped, otherwise from its
+    // next start in Playden). A rename changes no game. *created_id: the new preset's id.
+    playden::runtime::MyPresetChange CreateMyPreset(std::string_view name, std::map<std::string, std::string> settings,
+                                                    std::string* created_id = nullptr);
+    playden::runtime::MyPresetChange RenameMyPreset(const std::string& id, std::string_view name);
+    playden::runtime::MyPresetChange ReplaceMyPresetSettings(const std::string& id, std::map<std::string, std::string> settings);
+    playden::runtime::MyPresetChange DeleteMyPreset(const std::string& id);
+    // Game settings › Save as my preset…: a new player preset with what the player chose for the game
+    // (runtime::PresetSettingsFromGame, kSave). The game then uses it with no changes of its own: its record names the
+    // new preset and loses the overrides the preset now holds; overrides a preset can't hold (program, arguments,
+    // graphics, INI values, locked or unavailable rows) stay. A game on a community recipe keeps it and its changes, as
+    // switching away would change its program and what else the recipe sets; *switched says which happened. The
+    // preset file and the game's settings are saved together (a failed settings save takes the new preset back out)
+    // and a prepared game has its title updated as after a Game settings edit. Nothing chosen: kNoSettings, and
+    // nothing changes.
+    playden::runtime::MyPresetChange SaveGameAsMyPreset(GameId id, std::string_view name, std::string* created_id = nullptr,
+                                                        bool* switched = nullptr);
+    // Game settings › Update “<name>”: the game's own changes (PresetSettingsFromGame, kOwnChanges) go into the player
+    // preset it uses, and come off the game. Every other game using the preset follows it (ReplaceMyPresetSettings),
+    // all saved together. kUnknownId: the game doesn't use one of the player's presets; kNoSettings: it has no changes
+    // a preset can hold.
+    playden::runtime::MyPresetChange UpdateMyPresetFromGame(GameId id);
+    // Which of the two Game settings offers: Update for a game on one of the player's presets with changes a preset can
+    // hold, nothing for one on a player preset without, Save for every other game.
+    enum class MyPresetAction { kNone, kSave, kUpdate };
+    [[nodiscard]] MyPresetAction MyPresetActionFor(GameId id) const;
     // The recipe and effective settings the sheet shows for a game.
     // Recipes the runtime generated from Steam launch options; a shipped recipe wins.
     void SetGeneratedRecipes(const std::vector<playden::runtime::GameRecipe>& recipes);
@@ -1193,6 +1404,70 @@ public:
     [[nodiscard]] std::vector<std::string> setting_value_actions(const std::string& id) const;
     // "Export as recipe": the game's effective settings as recipe-<app id>.json for a pull request.
     void export_recipe(GameId id);
+
+    // Community recipes (docs/community-recipes.md). The catalog the service has (no IO here), and
+    // how to read one recipe's object by its revision (64 hex): the service's LoadRecipe, called at
+    // most once per revision and kept (objects are named by their content, so they never change).
+    void UpdateCommunityCatalog(CommunityCatalog catalog);
+    // Community recipes, sharing, votes, test reports and the Playden account (features.txt, app/experimental_features.h);
+    // on unless set. Off: none of their rows, sheets or questions, and no requests; a recipe a game already uses stays
+    // its base (read from the cache), shown in Choose settings without the others. My presets is not part of it.
+    void SetCommunityRecipesEnabled(bool enabled);
+    [[nodiscard]] bool CommunityRecipesEnabled() const noexcept { return community_enabled_; }
+    void SetCommunityRecipeLoader(std::function<std::optional<playden::runtime::CommunityRecipe>(const std::string& revision)> loader);
+    // The admitted kit (the view CommunityRecipeFits checks requirements against); nothing: no kit.
+    void SetKitView(std::optional<playden::runtime::VerifiedKitView> view);
+    // The Install sheet opened (or Install was pressed): the catalog may be refreshed (it limits itself).
+    [[nodiscard]] bool TakeCommunityRefreshRequest();
+    // Every community revision a game's settings choose (wanted, saved or not), plus the ones still
+    // pending in an open Install sheet or switch confirmation, for the cache's garbage collection.
+    // Nothing when the game settings file could not be read: what is in use is not known.
+    [[nodiscard]] std::optional<std::set<std::string>> CommunityChoicesInUse() const;
+    // The community recipe a game's settings run with now (the wanted one, when it applies); nothing
+    // for Playden's own recipe. Share uses it as the recipe the game is based on.
+    [[nodiscard]] std::optional<playden::runtime::CommunityRecipeChoice> RecipeBaseFor(GameId id) const;
+    // The base the game's last "Export as recipe" was made from (RecipeBaseFor at that time).
+    [[nodiscard]] std::optional<playden::runtime::CommunityRecipeChoice> ExportedRecipeBase(GameId id) const;
+    // Why the wanted community recipe is not what the game runs with: the runtime's reason from the last
+    // preparation when it gave one, else SelectRecipe's now. Empty when it is used or none is wanted.
+    [[nodiscard]] std::string RecipeFallbackFor(GameId id) const;
+    // The game's community recipes in the chooser's order: works, playable, broken, then untested; then
+    // by votes (up − down), then by title.
+    [[nodiscard]] std::vector<CommunityRecipeOffer> CommunityOffersFor(GameId id) const;
+    // Another game's recipes in the same order (the linked game's, a search result's).
+    [[nodiscard]] std::vector<CommunityRecipeOffer> CommunityOffersOf(const GameRef& game) const;
+    // Search by game name (docs/community-recipes.md): the games with community recipes whose name matches the query
+    // (playden::NameMatchesSearch), the game's own GameRef left out; by name, then store.
+    bool SearchMatchesOwnGame(GameId id, std::string_view query) const;  // the game's own recipes match the search
+    [[nodiscard]] std::vector<RecipeSearchResult> SearchRecipeGames(GameId id, std::string_view query) const;
+    // The other game whose recipes the chooser lists beside the game's own (GameSettingsRecord::linked_game).
+    [[nodiscard]] std::optional<GameRef> LinkedGameFor(GameId id) const;
+    // Another game's recipe whose program isn't in this copy: "Made for <name> · <store>: <program> isn't in this copy,
+    // so Playden's program is used." Empty for the game's own recipes and when the program is there.
+    [[nodiscard]] std::string ProgramNoteFor(GameId id, const std::string& revision) const;
+
+    // Sharing and votes. Requests for the sharing worker (live; fixture mode answers them itself),
+    // its answers, and what it remembers about votes.
+    [[nodiscard]] std::vector<SharingRequest> TakeSharingRequests();
+    void ApplySharingResult(const SharingResult& result);
+    void UpdateVoteMemory(playden::community::VoteState memory);
+    // The console's firmware and Playden's version, sent with every share and vote.
+    void SetSharingContext(std::string firmware, std::string playden_version);
+    // A session of a game Playden started ended after played_seconds: Playden may ask how it ran
+    // (community::NextFeedbackQuestion); with a community recipe in use the answer is also its vote.
+    void NotifySessionEnded(GameId id, std::int64_t played_seconds);
+    // A game Playden handed off to exited with an error before it got going (`message`: the runtime's reason, may be
+    // empty). Playden already knows the answer to "Did it start?": it says the game couldn't start and offers Change
+    // settings, Report the problem and Open logs instead of asking.
+    void NotifyStartFailed(GameId id, std::string message);
+    // The community recipe revision (64 hex) the game's title plays with, by the runtime's
+    // recipe_id and recipe_version; nothing for Playden's own.
+    [[nodiscard]] std::optional<playden::community::RecipeRef> AppliedCommunityRecipe(GameId id) const;
+    // The recipe "Your vote" in Game settings is for: the one the game was prepared with
+    // (AppliedCommunityRecipe) once it is; the chosen one (RecipeBaseFor) before that.
+    [[nodiscard]] std::optional<playden::community::RecipeRef> VoteTargetFor(GameId id) const;
+    // What Share would do for a game now (the decision table, plan Phase 5 item 3).
+    [[nodiscard]] playden::community::ShareDecision ShareDecisionFor(GameId id) const;
 
     [[nodiscard]] const State& state() const noexcept { return state_; }
     [[nodiscard]] const ViewData& view() const noexcept { return view_; }
@@ -1259,10 +1534,242 @@ private:
     std::map<GameId, LiveGameSetup> game_setups_;
     std::vector<GameId> pending_program_scans_;
     std::set<GameId> requested_program_scans_;
+    // Community recipes: the loader and the objects read so far (nothing: missing or refused), the
+    // admitted kit's view and version, the Install sheet's refresh request, the bases exports were
+    // made from, the Install sheet's pending choice and the chooser's game and context.
+    std::function<std::optional<playden::runtime::CommunityRecipe>(const std::string&)> community_loader_;
+    mutable std::map<std::string, std::optional<playden::runtime::CommunityRecipe>> community_objects_;
+    std::map<std::string, playden::runtime::CommunityRecipe> synthetic_community_;  // simulation scenarios
+    std::optional<playden::runtime::VerifiedKitView> kit_view_;
+    std::optional<playden::runtime::KitVersion> kit_version_;
+    bool community_refresh_requested_ = false;
+    std::map<GameId, playden::runtime::CommunityRecipeChoice> exported_bases_;
+    // A game's base: a preset (empty: Playden default) or a community recipe (its id set).
+    struct BaseChoice {
+        std::string preset_id;
+        playden::runtime::CommunityRecipeChoice community;
+        bool operator==(const BaseChoice&) const = default;
+    };
+    std::optional<BaseChoice> install_choice_;  // the Install sheet's Settings row, until Install
+    GameId install_choice_game_;
+    GameId chooser_game_;
+    bool chooser_for_install_ = false;
+    // The chooser's search: the results of a query (set), or one result's recipes (chooser_browse_ too). Both empty:
+    // the game's own recipes (and its linked game's).
+    std::optional<std::string> chooser_query_;
+    std::optional<GameRef> chooser_browse_;
+    // Other games' recipes as they apply to a game: with Playden's own program when theirs isn't in the copy
+    // (runtime::UseOwnProgram), by game and revision. Rebuilt when asked, so they follow the game's programs.
+    mutable std::map<std::pair<GameId, std::string>, playden::runtime::CommunityRecipe> adapted_community_;
+    // The game a catalog revision is for (its object's when the catalog no longer lists it).
+    [[nodiscard]] std::optional<GameRef> offer_game(const std::string& revision) const;
+    // The game a chosen recipe is for, as a choice records it: empty when it is the game's own.
+    [[nodiscard]] GameRef choice_game(GameId id, const std::string& revision) const;
+    // A community recipe object as it applies to the game: another game's whose program isn't in this copy starts
+    // the game's own (*missing names it); the object itself otherwise.
+    [[nodiscard]] const playden::runtime::CommunityRecipe* applied_object(GameId id, const playden::runtime::CommunityRecipe& object,
+                                                                         std::string* missing = nullptr) const;
+    // A game-relative program's architecture in the game's copy, as far as Playden knows without reading the folder
+    // here: the game's own launch entries (its recipe's architecture) and its scanned programs; empty when the copy
+    // hasn't it. A live game not scanned yet counts as having it, built as `assumed` says (the recipe's).
+    [[nodiscard]] std::string program_in_copy(GameId id, const std::string& program, const std::string& assumed) const;
+    // "<name> · <store>" for another game.
+    [[nodiscard]] std::string recipe_game_label(const GameRef& game) const;
+    // The chooser's rows again (after a search, a result chosen, Back or Unlink), focused on focus when it is listed.
+    void refresh_chooser(const std::string& focus);
+    // Live: a scan of the game's folder when it has another game's recipe chosen, linked or shown (program_in_copy).
+    void request_program_scan_for_other_recipes(GameId id);
+    // A switch on an installed game waits for the player's confirmation.
+    std::optional<BaseChoice> pending_switch_;
+    GameId pending_switch_game_;
+    std::string pending_switch_label_;
+    [[nodiscard]] BaseChoice base_of(GameId id) const;
+    // The recipe Playden itself picks (shipped, generated, the refused game's draft or a generic one).
+    [[nodiscard]] const playden::runtime::GameRecipe& own_recipe(GameId id) const;
+    // SelectRecipe for a wanted community recipe (null: none).
+    [[nodiscard]] playden::runtime::RecipeSelection select_recipe(GameId id, const playden::runtime::CommunityRecipeChoice* wanted) const;
+    [[nodiscard]] const playden::runtime::CommunityRecipe* community_object(const std::string& revision,
+                                                                           playden::runtime::CommunityObjectState* state) const;
+    // The recipe and preset a base gives the game (a community recipe that can't apply gives Playden's own).
+    [[nodiscard]] const playden::runtime::GameRecipe& recipe_for_base(GameId id, const BaseChoice& base) const;
+    // A base as the chooser previews it: a community recipe's own settings even when it can't apply
+    // here (its refusal is shown apart); recipe_for_base is what the game would really run.
+    [[nodiscard]] const playden::runtime::GameRecipe& candidate_recipe(GameId id, const BaseChoice& base) const;
+    [[nodiscard]] const playden::runtime::SettingsPreset* preset_for_base(const BaseChoice& base) const;
+    // A preset by id: a built-in one, then the player's. A player's preset that is gone is Playden default.
+    [[nodiscard]] const playden::runtime::SettingsPreset* find_preset(const std::string& id) const;
+    // What a change to the player's presets does to the games using one.
+    enum class MyPresetFollow { kNone, kSettings, kDeleted };
+    // edited: one game's new record, saved with the presets and rolled back with them; it doesn't follow again.
+    playden::runtime::MyPresetChange commit_my_presets(
+        std::vector<playden::runtime::MyPreset> next, const std::string& id, MyPresetFollow follow,
+        const std::optional<std::pair<GameId, playden::runtime::GameSettingsRecord>>& edited = std::nullopt);
+    // What a game's effective settings give a preset (runtime::PresetSettingsFromGame); false when they can't be built.
+    bool preset_settings_from_game(GameId id, playden::runtime::PresetCapture capture,
+                                   std::map<std::string, std::string>* settings) const;
+    [[nodiscard]] const CommunityRecipeOffer* community_offer(GameId id, const std::string& recipe_id,
+                                                              const std::string& revision = {}) const;
+    // The Steam app ID another store's game uses for Steamworks: its own steam_appid.txt's (as the runtime last saw
+    // it), else the one in Game settings; 0 when none. A Steam game's own app ID.
+    [[nodiscard]] std::uint32_t steam_app_of(GameId id) const;
+    // The GameRef whose community recipes the game gets (MatchingGameRef), and the one its shares are for
+    // (SharingGameRef: an imported game without a Steam app ID shares under imported/<name key>).
+    [[nodiscard]] std::optional<GameRef> community_ref(GameId id) const;
+    [[nodiscard]] std::optional<GameRef> sharing_ref(GameId id) const;
+    // The catalog's offers for the game's community_ref; null when none.
+    [[nodiscard]] const std::vector<CommunityRecipeOffer>* community_offers(GameId id) const;
+    // Why a community recipe can't apply to the game now (CommunityRecipeFits with the title's kit); empty when it can.
+    [[nodiscard]] std::string community_refusal(GameId id, const CommunityRecipeOffer& offer) const;
+    // "Playden default", a preset's name, or "Community: <title>".
+    [[nodiscard]] std::string base_name(GameId id, const BaseChoice& base) const;
+    // A newer revision of the game's chosen community recipe than the one it runs (or chose).
+    [[nodiscard]] const CommunityRecipeOffer* updated_offer(GameId id) const;
+    // Community recipes off and the chosen recipe isn't in the cache or can't be read: nothing can bring it back.
+    [[nodiscard]] bool recipe_out_of_reach(GameId id) const;
+    [[nodiscard]] bool title_made(GameId id) const;  // the game has a PS5 title (live) or is installed (fixtures)
+    [[nodiscard]] std::vector<std::string> install_sheet_actions(GameId id) const;
+    void open_install_sheet(GameId id, std::vector<std::string> actions);
+    void open_chooser(GameId id, bool install);
+    // The chooser's rows for a game: Playden default, its community recipes, the other presets.
+    [[nodiscard]] std::vector<std::string> chooser_actions(GameId id, bool install, int* focused) const;
+    // A chooser row's recipe: from the catalog, or from its object (a chosen revision the catalog no longer lists).
+    [[nodiscard]] std::optional<CommunityRecipeOffer> chooser_offer(GameId id, const std::string& revision) const;
+    // The offer's thumbs with this console's own accepted vote counted while the catalog's totals predate it.
+    void add_own_vote(CommunityRecipeOffer* offer) const;
+    [[nodiscard]] BaseChoice chooser_current(GameId id) const;
+    // Makes base the game's (or the Install sheet's) choice; a switch on an installed game that involves a
+    // community recipe asks first, unless confirmed.
+    void choose_base(GameId id, const BaseChoice& base, bool confirmed);
+    void build_recipe_comparison(GameId id, const CommunityRecipeOffer& offer);
+    void seed_community_scenario(bool offline);
+    // My presets in Choose settings and Game settings: the Triangle menu on a preset's row, the keyboard that names one
+    // (Save as my preset… when editing_target_id_ is empty, else Rename… of that preset), and the dialog after a change.
+    void open_my_preset_menu(const std::string& id);
+    void start_my_preset_save();
+    void commit_my_preset_name();
+    void finish_my_preset_change(GameId game, const playden::runtime::GameSettingsRecord& before);
+    void show_my_preset_dialog(std::string title, std::string body);
+    void show_my_preset_refusal(const playden::runtime::MyPresetChange& change, const std::string& title);
+    void seed_my_presets_scenario(const std::string& name);
+    // Sharing: the Share sheet's draft, what it compares and sends, and the votes it offers.
+    struct ShareDraft {
+        GameId game;
+        playden::community::ShareDecision decision;
+        playden::community::ShareChoice answer = playden::community::ShareChoice::kNone;  // kAskPlayer: the radio
+        std::optional<playden::community::RecipeRef> based_on;
+        std::string base_title, base_author;
+        std::string title;
+        std::string changes;   // the Changes list against Playden default or the base recipe
+        std::string sent;      // what is sent: program, graphics and the changes
+        // The attempt's Idempotency-Key once the worker made one: Try again sends it back.
+        std::string idempotency_key;
+        std::uint64_t ticket = 0;  // the request in flight; 0 none
+        std::string error;
+        // Nothing to share: the recipe the game matches, for a thumbs up.
+        std::optional<playden::community::RecipeRef> vote_offer;
+        std::string vote_title;
+        bool nothing_new = false;
+    };
+    std::optional<ShareDraft> share_;
+    // The vote sheet: its recipe revision, the game, and the answer being made.
+    struct VoteDraft {
+        GameId game;
+        playden::community::RecipeRef recipe;
+        std::string recipe_title;
+        std::string vote;         // up or down; empty until the player chooses
+        std::string reason;       // down only
+        std::string reason_text;  // what "Other" was, typed by the player (sent with Other only)
+        std::uint64_t ticket = 0; // the vote is sending: the sheet waits for its answer
+        std::string error;        // why the last send failed: Send reads Try again
+    };
+    std::optional<VoteDraft> vote_;
+    // Game settings › How did this recipe run?: a vote still sending ("sending") or that failed ("failed"), per game.
+    std::map<GameId, std::string> vote_status_;
+    // The feedback sheet: "How did it run?" (or "Did it start?") and the test report it sends.
+    struct FeedbackDraft {
+        GameId game;
+        bool short_session = false;  // asks "Did it start?"
+        bool after_play = false;     // the prompt after a session, not Share feedback…
+        bool from_failure = false;   // Report the problem from "couldn't start": no question to go back to
+        std::string step = "ask";    // ask, good or problems
+        std::string result;          // works, partial, broken or no-start
+        std::string reason;          // a problem's reason (the vote reasons)
+        std::string reason_text;     // what "Other" was, typed by the player (optional; sent with Other only)
+        std::string details;         // What happened, optional
+        bool attach_logs = false;
+        bool recipe_offer = false;   // the settings count as a recipe (program, arguments, controls...)
+        bool share_recipe = false;   // and the player wants them shared after the report
+        std::optional<playden::community::RecipeRef> recipe;  // the community recipe in use: the answer votes for it
+        std::string recipe_title;
+        std::string kit, settings;   // the feedback memory's keys
+        std::uint64_t ticket = 0;
+        std::string error;
+        std::string idempotency_key;
+    };
+    std::optional<FeedbackDraft> feedback_;
+    struct FeedbackPrompt { GameId game; std::int64_t played_seconds = 0; };
+    std::vector<FeedbackPrompt> feedback_prompts_;  // sessions that may ask, oldest first
+    std::vector<SharingRequest> pending_sharing_requests_;
+    std::map<std::uint64_t, playden::community::CastVote> votes_in_flight_;  // by ticket
+    std::set<std::uint64_t> feedback_votes_;  // votes sent with a report: no notice of their own
+    std::uint64_t next_sharing_ticket_ = 0;
+    std::string sharing_playden_version_;
+    std::uint64_t simulated_submissions_ = 0;
+    void open_share_sheet(GameId id);
+    void refresh_share_sheet();
+    void send_share();
+    void open_share_privacy();
+    void open_vote_sheet(GameId id, const playden::community::RecipeRef& recipe);
+    void send_vote();
+    void dismiss_vote();
+    void show_feedback_prompt();
+    void start_account_link();
+    void apply_account_answer(SharingRequestKind kind, const SharingResult::AccountAnswer& answer);
+    void account_link_tick();
+    void open_feedback(GameId id, bool short_session, bool after_play);
+    [[nodiscard]] std::vector<std::string> feedback_actions() const;
+    void send_feedback();
+    void open_feedback_privacy();
+    void note_feedback(const FeedbackDraft& draft, bool answered);
+    [[nodiscard]] std::string feedback_settings(GameId id) const;
+    [[nodiscard]] std::string feedback_kit() const;
+    [[nodiscard]] bool changes_worth_sharing(GameId id) const;
+    // Shared as: what is credited now (an unlinked account or an empty name credits nobody), its label, the picker.
+    [[nodiscard]] playden::ShareAs share_as_effective() const;
+    [[nodiscard]] std::string share_as_label() const;
+    [[nodiscard]] std::vector<std::string> share_as_actions() const;
+    void set_share_as(playden::ShareAs share_as);
+    std::optional<playden::ShareAs> pending_share_as_;  // chosen once its name is typed or its account linked
+    void request_submission_status(GameId id, bool force);
+    std::optional<playden::runtime::CommunityRecipe> build_community_recipe(GameId id) const;
+    // What a share sends: the recipe with its program, or (settings_only, ShareDecision::settings_only) a settings-only
+    // recipe made from the game's settings-only base (runtime::BuildSettingsOnlyRecipe).
+    std::optional<playden::runtime::CommunityRecipe> build_shared_recipe(GameId id, bool settings_only) const;
+    // The Changes list between the game's base (Playden default without one) and its effective settings,
+    // and whether anything, or the program or graphics, differs; program_changed: whether the player changed a row
+    // that chooses the program or how it starts (runtime::IsProgramRow).
+    std::string share_changes(GameId id, const std::optional<playden::community::RecipeRef>& base, bool* differs,
+                              bool* program_or_graphics, bool* program_changed = nullptr) const;
+    [[nodiscard]] std::string community_title(GameId id, const std::string& recipe_id, const std::string& revision) const;
+    [[nodiscard]] std::string vote_words(const playden::community::CastVote* vote) const;
+    [[nodiscard]] std::vector<std::string> share_actions() const;
+    [[nodiscard]] std::vector<std::string> vote_actions() const;
+    [[nodiscard]] bool sheet_open(const std::string& id) const;
+    void close_sheet(const std::string& id);
+    void record_vote_locally(const playden::community::CastVote& vote);
     std::filesystem::path recipe_export_directory_;
     std::string console_firmware_;
     std::filesystem::path game_settings_file_;
     std::map<GameId, playden::runtime::GameSettingsRecord> saved_game_settings_;
+    // The player's presets (SetMyPresetsFile); unavailable: the file couldn't be read or set aside, so none are shown
+    // and none are saved.
+    std::filesystem::path my_presets_file_;
+    std::vector<playden::runtime::MyPreset> my_presets_;
+    bool my_presets_unavailable_ = false;
+    bool community_enabled_ = true;
+    std::function<std::optional<std::string>()> my_preset_uuid_;
+    std::function<std::int64_t()> my_preset_now_;
+    std::string my_preset_menu_id_;  // the preset whose Triangle menu (or its Delete dialog) is open
     bool settings_save_failed_ = false;
     bool settings_load_failed_ = false;
     std::optional<playden::runtime::GameSettingsRecord> settings_opened_record_;  // for the close toast
@@ -1281,6 +1788,9 @@ private:
     std::vector<ImportRequest> pending_import_requests_;
     std::vector<GameId> pending_runtime_prepare_requests_;
     std::vector<GameId> pending_prepare_next_requests_;
+    std::vector<GameId> pending_prepare_cancels_;
+    // Waiting games the player canceled that the runtime still lists: Queue hides them until it doesn't.
+    std::vector<GameId> prepare_cancel_asked_;
     std::vector<LiveCompletedPreparation> pending_prepared_dismissals_;
     bool pending_prepared_clear_ = false;
     // Asked of the runtime and not carried out yet: finished preparations dismissed, a game moved first.
@@ -1341,7 +1851,16 @@ private:
     std::map<GameId, StoreFacts> store_facts_;  // live: from the Steam store, applied over library refreshes
     std::vector<GameId> ready_prompts_;  // games to announce as ready to play, oldest first
     // settings_game: a game whose refusal Game settings can get past; the dialog offers it.
-    struct AlertPrompt { std::string title; std::string body; GameId settings_game; bool launcher_hint = false; };
+    struct AlertPrompt {
+        std::string title;
+        std::string body;
+        GameId settings_game;
+        bool launcher_hint = false;
+        bool start_failed = false;  // "<game> couldn't start": titled when shown, once the library names the game
+    };
+    // Games whose start failure has its own dialog, and when (clock seconds): the runtime's "Could not start" for that
+    // failure, arriving within a minute, raises no notice too. Older marks are for an outcome long past.
+    std::map<GameId, std::int64_t> start_failures_told_;
     GameId alert_settings_game_;  // the game the open failure dialog's "Game settings" opens
     // Games refused at Prepare whose program or "Try anyway" the player changed since: their page
     // no longer shows the old refusal.
@@ -1441,6 +1960,8 @@ private:
     void load_fixtures();
     void load_profile();
     bool save_profile();
+    // Raises saved settings that are behind their prepared PS5 title's settings revision above it; true when one was.
+    bool lift_settings_behind_titles();
     GameId import_page_asked_;  // the imported game whose open page has asked whether it runs
     void reset_default_state();
     void rebuild_view();
@@ -1461,6 +1982,7 @@ private:
     void change_route(int delta);
     void open_modal(ModalEntry modal);
     void prepare_next(GameId id);
+    void cancel_preparations(std::vector<GameId> ids);
     void close_modal();
     void open_details_from_queue(GameId id);
     void start_editor(std::string purpose, std::string value, bool secret = false);
@@ -1473,6 +1995,7 @@ private:
     // Steam Guard codes: five characters, uppercase.
     void normalize_editor();
     void commit_editor();
+    void show_setting_validation(std::string message, std::string detail);
     void advance_jobs();
     [[nodiscard]] std::vector<std::string> game_settings_actions() const;
     [[nodiscard]] std::vector<std::string> kept_manager_actions() const;
@@ -1487,6 +2010,8 @@ private:
     void move_import_sheet(int delta);
     void look_for_games();
     std::string import_programs_key_;  // the candidate whose program list is open
+    std::map<GameId, std::string> imported_programs_;  // UpdateImportedPrograms
+    bool imported_programs_known_ = false;             // the first UpdateImportedPrograms came
     // The import wizard. Step 1 (surface import-choice), for the program picked in the open program
     // list: play the game from its folder, or Copy to storage. Step 2 (surface import-storage):
     // the drive the game goes to, for that program's folder or for a game already added
@@ -1613,6 +2138,8 @@ private:
     void refresh_collection_sheets(const std::string& focus = {});
     void refresh_game_settings();
     bool can_change_game_settings();
+    // What Reset leaves of a game's changes: an imported game's own program.
+    std::map<std::string, std::string> reset_overrides(GameId id) const;
     void set_game_setting(const std::string& id, const std::string& value);
     void announce_settings_saved();
     // The game's Game settings and maintenance can change it: in live mode, its title is prepared.

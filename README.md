@@ -37,7 +37,8 @@ private Windows environment and its own tile on the PS5 Home screen.
   sync by hand from the Saves tab.
 - **Per-game settings.** Graphics, frame rate, resolution, controller mapping, and how the game starts: pick any
   program from the game folder, edit its arguments and library overrides, or try a game Playden flagged anyway. A
-  game's settings can be exported as a recipe ([format](docs/community-recipes.md)).
+  game's settings can be exported as a community recipe for
+  [playden-ps5-recipes](https://github.com/leolobato/playden-ps5-recipes) ([format](docs/community-recipes.md)).
 - **Graphics.** Direct3D 8–11 through [DXVK](https://github.com/doitsujin/dxvk), Direct3D 12 through
   [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) (kit 0.11 and later), OpenGL through Mesa's Zink, and
   Vulkan, all on the PS5 GPU's Vulkan driver.
@@ -306,7 +307,9 @@ game's title to Home when Playden quits. Importing a game later keeps its saves.
 - Cloud saves are only for Steam games.
 
 **Steam games copied from a PC** usually run without Steam. If a game needs Steam, Playden uses the game's
-`steam_appid.txt`, or the **Steam app ID** in Game settings. Most games run without either.
+`steam_appid.txt`, or the **Steam app ID** in Game settings. Most games run without either. With a Steam app ID, the
+game also gets that Steam game's community recipes, and a recipe you share from it is filed under it. Without one, a
+shared recipe is filed under the game's name.
 
 Games that need their own launcher, or DRM beyond SteamStub (Denuvo, or the Ubisoft, EA or Rockstar launchers), won't
 run.
@@ -416,7 +419,16 @@ See the [compatibility list](COMPATIBILITY.md) for what we know about each game.
 
 ## Testing games and reporting problems
 
-Every test helps, including games that work. To report one:
+Every test helps, including games that work.
+
+**From Playden:** after you play a game, Playden asks how it ran (or choose **Share feedback…** in the game's
+actions). Choose whether it ran well or had problems, and Playden sends a test report for you: the game, its
+settings, your versions and, when it had problems, its logs with your Steam account name, IDs, PS5 user and home
+network addresses removed. The report is a public issue on this repository. With a community recipe in use, your
+answer is also its vote (unless **Recipe votes** is off). Settings › Community › **Ask how games ran** turns the
+question off; votes and **Share feedback…** still work.
+
+**By hand**, for anything Playden can't send:
 
 1. If the game did not work, start Playden once more, so it copies the game's log.
 2. Collect the logs from your computer:

@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define CHECK(cond)                                                                     \
@@ -92,10 +93,55 @@ int main(int argc, char** argv) {
   CHECK(Read(plugin / "steam_settings/configs.app.ini") == "[app::dlcs]\nunlock_all=0\n3000=dlc3000\n3001=dlc3001\n");
   CHECK(Read(plugin / "steam_settings/configs.main.ini").find("offline=1\n") != std::string::npos);
   CHECK(Read(plugin / "steam_settings/depots.txt") == "2062431\n");
+  // No other owned apps: no owned_app_ids.txt.
+  CHECK(!fs::exists(plugin / "steam_settings/owned_app_ids.txt"));
+  // Another owned app the game asks about (Black Mesa checks Source SDK Base 2006, 215): the emulator reads
+  // owned_app_ids.txt, and the DLC list and the depots stay as they are.
+  identity.owned_apps = {243730, 215};
+  CHECK(EmulateSteamworks(root.string(), emulator, identity).ok);
+  CHECK(Read(plugin / "steam_settings/owned_app_ids.txt") == "215\n243730\n");
+  CHECK(Read(root / "bin/steam_settings/owned_app_ids.txt") == "215\n243730\n");
+  CHECK(Read(plugin / "steam_settings/depots.txt") == "2062431\n");
+  CHECK(Read(plugin / "steam_settings/configs.app.ini") == "[app::dlcs]\nunlock_all=0\n3000=dlc3000\n3001=dlc3001\n");
+  // An app the account no longer owns leaves the file with it.
+  identity.owned_apps.clear();
+  CHECK(EmulateSteamworks(root.string(), emulator, identity).ok);
+  CHECK(!fs::exists(plugin / "steam_settings/owned_app_ids.txt"));
   CHECK(Read(plugin / "steam_settings/steam_interfaces.txt") ==
         "STEAMAPPS_INTERFACE_VERSION008\nSTEAMCONTROLLER_INTERFACE_VERSION\nSteamClient017\nSteamUser021\n");
   CHECK(Read(plugin / "steam_interfaces.txt") == Read(plugin / "steam_settings/steam_interfaces.txt"));
   CHECK(!fs::exists(root / ".hidden/steam_api.dll.orig"));
+  // No Steam Input map: no controller folder, so the emulator reports no Steam Input controller.
+  CHECK(!fs::exists(plugin / "steam_settings/controller"));
+  // With the game's Steam Input map, each action set gets its file.
+  identity.steam_input_sets = {{"Menu", "select=A\n"}, {"OnFoot", "Move=LJOY=joystick_move\n"}};
+  CHECK(EmulateSteamworks(root.string(), emulator, identity).ok);
+  CHECK(Read(plugin / "steam_settings/controller/Menu.txt") == "select=A\n");
+  CHECK(Read(plugin / "steam_settings/controller/OnFoot.txt") == "Move=LJOY=joystick_move\n");
+  CHECK(Read(root / "bin/steam_settings/controller/Menu.txt") == "select=A\n");
+  // A later setup with fewer action sets removes the others; one without a map removes them all, so the emulator
+  // reports no Steam Input controller again. Other files in the folder stay.
+  identity.steam_input_sets = {{"Menu", "select=A\n"}};
+  CHECK(EmulateSteamworks(root.string(), emulator, identity).ok);
+  CHECK(fs::exists(plugin / "steam_settings/controller/Menu.txt"));
+  CHECK(!fs::exists(plugin / "steam_settings/controller/OnFoot.txt"));
+  identity.steam_input_sets.clear();
+  CHECK(EmulateSteamworks(root.string(), emulator, identity).ok);
+  CHECK(!fs::exists(plugin / "steam_settings/controller"));
+  CHECK(!fs::exists(root / "bin/steam_settings/controller"));
+  Write(plugin / "steam_settings/controller/Menu.txt", "select=A\n");
+  Write(plugin / "steam_settings/controller/readme.md", "mine");
+  CHECK(EmulateSteamworks(root.string(), emulator, identity).ok);
+  CHECK(!fs::exists(plugin / "steam_settings/controller/Menu.txt"));
+  CHECK(Read(plugin / "steam_settings/controller/readme.md") == "mine");
+  // A stale action set that can't be removed fails the setup: the emulator would still report a Steam Input controller.
+  Write(plugin / "steam_settings/controller/Menu.txt", "select=A\n");
+  CHECK(chmod((plugin / "steam_settings/controller").c_str(), 0555) == 0);
+  CHECK(!EmulateSteamworks(root.string(), emulator, identity).ok);
+  CHECK(chmod((plugin / "steam_settings/controller").c_str(), 0755) == 0);
+  CHECK(EmulateSteamworks(root.string(), emulator, identity).ok);
+  CHECK(!fs::exists(plugin / "steam_settings/controller/Menu.txt"));
+  fs::remove_all(plugin / "steam_settings/controller");
 
   // Another store's game: no steam_appid.txt of Playden's beside the DLL, only the emulator's own; a
   // game's own file stays as it is.
@@ -154,7 +200,18 @@ int main(int argc, char** argv) {
   SteamworksIdentity facts;
   CHECK(ReadSteamworksFacts(root.string(), &facts));
   CHECK((facts.depots == std::vector<std::uint32_t>{10, 20}) && (facts.owned_dlc == std::vector<std::uint32_t>{3000, 3001}));
-  CHECK(facts.excluded_dlc.empty());
+  CHECK(facts.excluded_dlc.empty() && facts.owned_apps.empty());
+  // Owned Source SDK Base apps are kept too, for a start before the next license read.
+  Write(root / kSteamworksFactsFile, SerializeSteamworksFacts({10}, {}, {}, {}, {243730, 215}, 76561198000000001ull));
+  CHECK(Read(root / kSteamworksFactsFile) == "depots=10\ndlc=\napps=215,243730\napps_account=76561198000000001\n");
+  SteamworksIdentity sdk;
+  CHECK(ReadSteamworksFacts(root.string(), &sdk));
+  CHECK((sdk.owned_apps == std::vector<std::uint32_t>{215, 243730}) && (sdk.depots == std::vector<std::uint32_t>{10}));
+  CHECK(sdk.owned_apps_account == 76561198000000001ull);
+  // An account that isn't a number makes the file unreadable, like any other bad value.
+  Write(root / kSteamworksFactsFile, "depots=10\napps=215\napps_account=x\n");
+  SteamworksIdentity bad_account;
+  CHECK(!ReadSteamworksFacts(root.string(), &bad_account));
   Write(root / kSteamworksFactsFile, SerializeSteamworksFacts({10}, {3000}, {}, {4001, 4000}));
   SteamworksIdentity turned_off;
   CHECK(ReadSteamworksFacts(root.string(), &turned_off));
@@ -232,7 +289,7 @@ int main(int argc, char** argv) {
     CHECK(!restored.ok && restored.message.find("reinstall the game") != std::string::npos);
     CHECK(Read(game / "steam_api.dll") == emulator32);
     // The pins Playden ships cover both architectures of every earlier build.
-    CHECK(RetiredSteamApiSha256().size() == 2);
+    CHECK(RetiredSteamApiSha256().size() == 8);
   }
 
   {  // A game that hashes its library at one path and loads it from another (Clair Obscur: Expedition 33).

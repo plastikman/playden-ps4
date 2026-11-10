@@ -68,9 +68,14 @@ add_library(playden_steam_cm_codec STATIC
     "${CMAKE_SOURCE_DIR}/src/steam/backend/app_info.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/prospero_profile.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/game_settings.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/my_presets.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/recipe_ini.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/recipe_files.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/kit_version.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/community_rules.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/recipe_choice.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/install_script.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/steam_input.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/msi_package.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/lzx_decoder.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/burn_bundle.cpp"
@@ -80,9 +85,16 @@ target_include_directories(playden_steam_cm_codec PUBLIC "${CMAKE_SOURCE_DIR}/sr
 target_include_directories(playden_steam_cm_codec PRIVATE "${PLAYDEN_STB_IMAGE_INCLUDE_DIR}")
 target_compile_features(playden_steam_cm_codec PUBLIC cxx_std_17)
 target_link_libraries(playden_steam_cm_codec PUBLIC playden_game_paths playden_steam_protocol playden_managed_directory
-    playden_runtime_steamworks playden_runtime_artifact_hash playden_miniz playden_library playden_steam_content_language)
+    playden_runtime_steamworks playden_runtime_artifact_hash playden_miniz playden_library playden_steam_content_language
+    playden_runtime_package_installer)
 if(PLAYDEN_PLATFORM_PS5)
     target_compile_options(playden_steam_cm_codec PRIVATE -fno-exceptions -fno-rtti)
+else()
+    # The recipes repository's CI checks community recipes with Playden's own parser and rules
+    # (docs/community-recipes.md). Core libraries only, no UI.
+    add_executable(community_recipe_check "${CMAKE_SOURCE_DIR}/src/tools/community_recipe_check.cpp")
+    target_link_libraries(community_recipe_check PRIVATE playden_steam_cm_codec)
+    target_compile_features(community_recipe_check PRIVATE cxx_std_17)
 endif()
 
 add_library(playden_runtime_settings_publication STATIC "${CMAKE_SOURCE_DIR}/src/runtime/settings_publication.cpp"
@@ -194,7 +206,8 @@ add_library(playden_homebrew_model STATIC
     "${CMAKE_SOURCE_DIR}/src/homebrew/browse.cpp"
     "${CMAKE_SOURCE_DIR}/src/homebrew/store_art.cpp")
 target_compile_features(playden_homebrew_model PUBLIC cxx_std_20)
-target_link_libraries(playden_homebrew_model PUBLIC playden_library playden_diagnostic_log playden_steam_cm_codec)
+# The model builds share and vote requests and decides what Share does (community/), never sending them.
+target_link_libraries(playden_homebrew_model PUBLIC playden_library playden_diagnostic_log playden_steam_cm_codec playden_community playden_preferences)
 target_include_directories(playden_homebrew_model PUBLIC "${CMAKE_SOURCE_DIR}/src")
 
 foreach(qr_file qrcodegen.c qrcodegen.h LICENSE README.md)
@@ -238,15 +251,17 @@ target_include_directories(playden_persistence_controller PUBLIC "${CMAKE_SOURCE
 target_link_libraries(playden_persistence_controller PUBLIC playden_homebrew_model playden_persistence_service)
 
 add_library(playden_homebrew_controller STATIC
-    "${CMAKE_SOURCE_DIR}/src/homebrew/controller.cpp" "${CMAKE_SOURCE_DIR}/src/homebrew/uninstall_flow.cpp")
+    "${CMAKE_SOURCE_DIR}/src/homebrew/controller.cpp" "${CMAKE_SOURCE_DIR}/src/homebrew/uninstall_flow.cpp"
+    "${CMAKE_SOURCE_DIR}/src/homebrew/sharing_service.cpp")
 target_compile_features(playden_homebrew_controller PUBLIC cxx_std_20)
 target_include_directories(playden_homebrew_controller PUBLIC "${CMAKE_SOURCE_DIR}/src")
 target_link_libraries(playden_homebrew_controller PUBLIC
     playden_homebrew_model playden_steam_core playden_auth_diagnostics playden_library_controller playden_persistence_controller playden_runtime_settings_storage
-    playden_homebrew_runtime_host playden_self_update playden_local_store playden_web)
+    playden_homebrew_runtime_host playden_self_update playden_local_store playden_web playden_community)
 
 # Worker-owned per-game runtime composition (OWNER records, native inventory, kit layer).
 add_library(playden_homebrew_runtime_host STATIC "${CMAKE_SOURCE_DIR}/src/homebrew/runtime_host.cpp"
+    "${CMAKE_SOURCE_DIR}/src/homebrew/gog_icon.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/writable_folders.cpp" "${CMAKE_SOURCE_DIR}/src/runtime/self_heal.cpp")
 target_compile_features(playden_homebrew_runtime_host PUBLIC cxx_std_20)
 target_include_directories(playden_homebrew_runtime_host PUBLIC "${CMAKE_SOURCE_DIR}/src")
@@ -404,9 +419,10 @@ target_compile_definitions(playden-homebrew PRIVATE
     PLAYDEN_HOMEBREW_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/fixtures/ui-comparison"
     PLAYDEN_HOMEBREW_DEFAULT_PROFILE="${CMAKE_BINARY_DIR}/homebrew-profile.json"
     PLAYDEN_HOMEBREW_DEFAULT_DATA_DIR="${CMAKE_BINARY_DIR}/playden-data"
-    PLAYDEN_HOMEBREW_CA_BUNDLE="${playden_staged_ca}")
+    PLAYDEN_HOMEBREW_CA_BUNDLE="${playden_staged_ca}"
+    PLAYDEN_DEV_BUILD=$<BOOL:${PLAYDEN_DEV_BUILD}>)
 target_link_libraries(playden-homebrew PRIVATE
-    playden_homebrew_ui playden_homebrew_controller playden_local_session_repository
+    playden_experimental_features playden_homebrew_ui playden_homebrew_controller playden_local_session_repository
     playden_library playden_steam_auth playden_steam_library playden_steam_cm playden_local_copy playden_game_move PkgConfig::SDL2 OpenGL::GL)
 add_dependencies(playden-homebrew playden_homebrew_assets playden_steam_trust)
 set_target_properties(playden-homebrew PROPERTIES
@@ -472,6 +488,12 @@ if(BUILD_TESTING)
         "${CMAKE_SOURCE_DIR}/third_party/ps5-homebrew-ui/third_party/stb")
     target_link_libraries(homebrew_program_icon_test PRIVATE playden_homebrew_artwork)
     add_test(NAME homebrew_program_icon COMMAND homebrew_program_icon_test)
+    add_executable(homebrew_gog_icon_test "${CMAKE_SOURCE_DIR}/tests/homebrew_gog_icon_test.cpp"
+        "${CMAKE_SOURCE_DIR}/src/homebrew/gog_icon.cpp")
+    target_compile_features(homebrew_gog_icon_test PRIVATE cxx_std_20)
+    target_include_directories(homebrew_gog_icon_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    target_link_libraries(homebrew_gog_icon_test PRIVATE playden_steam_protocol)
+    add_test(NAME homebrew_gog_icon COMMAND homebrew_gog_icon_test)
     add_executable(homebrew_controller_tour_test "${CMAKE_SOURCE_DIR}/tests/homebrew_controller_tour_test.cpp")
     target_compile_features(homebrew_controller_tour_test PRIVATE cxx_std_20)
     target_link_libraries(homebrew_controller_tour_test PRIVATE playden_homebrew_model)
@@ -487,8 +509,9 @@ if(BUILD_TESTING)
         PLAYDEN_HOMEBREW_DEFAULT_DATA_DIR="unused-live-data"
         PLAYDEN_HOMEBREW_CA_BUNDLE="${playden_staged_ca}"
         PLAYDEN_HOMEBREW_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/fixtures/ui-comparison"
-        PLAYDEN_HOMEBREW_ASSETS_DIR="${playden_homebrew_assets}")
-    target_link_libraries(homebrew_host_input_test PRIVATE playden_homebrew_ui
+        PLAYDEN_HOMEBREW_ASSETS_DIR="${playden_homebrew_assets}"
+        PLAYDEN_DEV_BUILD=$<BOOL:${PLAYDEN_DEV_BUILD}>)
+    target_link_libraries(homebrew_host_input_test PRIVATE playden_experimental_features playden_homebrew_ui
         playden_homebrew_controller playden_local_session_repository playden_library playden_steam_auth playden_steam_library playden_steam_cm
         playden_local_copy playden_game_move PkgConfig::SDL2 OpenGL::GL)
     add_test(NAME homebrew_host_input COMMAND homebrew_host_input_test "${CMAKE_SOURCE_DIR}/fixtures/ui-comparison")
@@ -504,10 +527,21 @@ if(BUILD_TESTING)
         COMMAND homebrew_simulation_test "${CMAKE_SOURCE_DIR}/fixtures/ui-comparison")
 
     add_executable(homebrew_live_model_test
-        "${CMAKE_SOURCE_DIR}/tests/homebrew_live_model_test.cpp")
+        "${CMAKE_SOURCE_DIR}/tests/homebrew_live_model_test.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/managed_directory.cpp")
+    # Intercept only this test's directory barriers, including failures after a settings rename.
+    target_compile_definitions(homebrew_live_model_test PRIVATE fsync=playden_live_test_fsync)
     target_compile_features(homebrew_live_model_test PRIVATE cxx_std_20)
     target_link_libraries(homebrew_live_model_test PRIVATE playden_homebrew_model)
     add_test(NAME homebrew_live_model COMMAND homebrew_live_model_test)
+
+    # Sharing recipes and votes: the model's requests through the sharing worker against a fake API.
+    add_executable(homebrew_sharing_test "${CMAKE_SOURCE_DIR}/tests/homebrew_sharing_test.cpp")
+    target_compile_features(homebrew_sharing_test PRIVATE cxx_std_20)
+    target_link_libraries(homebrew_sharing_test PRIVATE playden_homebrew_controller)
+    target_compile_definitions(homebrew_sharing_test PRIVATE
+        PLAYDEN_COMMUNITY_FIXTURES="${CMAKE_SOURCE_DIR}/tests/fixtures/community-recipes")
+    add_test(NAME homebrew_sharing COMMAND homebrew_sharing_test)
 
     add_executable(homebrew_library_model_test
         "${CMAKE_SOURCE_DIR}/tests/homebrew_library_model_test.cpp")
@@ -526,6 +560,7 @@ if(BUILD_TESTING)
     target_compile_definitions(homebrew_library_graphical_test PRIVATE
         PLAYDEN_HOMEBREW_ASSETS_DIR="${playden_homebrew_assets}"
         PLAYDEN_HOMEBREW_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/fixtures/ui-comparison")
+    target_include_directories(homebrew_library_graphical_test PRIVATE "${PLAYDEN_STB_IMAGE_INCLUDE_DIR}")
     target_link_libraries(homebrew_library_graphical_test PRIVATE
         playden_persistence_controller playden_library_controller playden_homebrew_ui PkgConfig::SDL2 OpenGL::GL)
     add_dependencies(homebrew_library_graphical_test playden_homebrew_assets)
@@ -538,6 +573,22 @@ if(BUILD_TESTING)
     target_link_libraries(homebrew_artwork_graphical_test PRIVATE playden_homebrew_ui PkgConfig::SDL2 OpenGL::GL)
     add_dependencies(homebrew_artwork_graphical_test playden_homebrew_assets)
     add_test(NAME homebrew_artwork_graphical COMMAND homebrew_artwork_graphical_test "${CMAKE_BINARY_DIR}/synthetic-live-artwork")
+    # Community recipes on screen: each scenario drawn, checked and captured (docs/community-recipes.md).
+    add_executable(homebrew_community_graphical_test "${CMAKE_SOURCE_DIR}/tests/homebrew_community_graphical_test.cpp")
+    target_compile_features(homebrew_community_graphical_test PRIVATE cxx_std_20)
+    target_compile_definitions(homebrew_community_graphical_test PRIVATE PLAYDEN_HOMEBREW_ASSETS_DIR="${playden_homebrew_assets}")
+    target_link_libraries(homebrew_community_graphical_test PRIVATE playden_homebrew_ui PkgConfig::SDL2 OpenGL::GL)
+    add_dependencies(homebrew_community_graphical_test playden_homebrew_assets)
+    add_test(NAME homebrew_community_graphical COMMAND homebrew_community_graphical_test
+        "${CMAKE_SOURCE_DIR}/fixtures/ui-comparison" "${CMAKE_BINARY_DIR}/community-recipes-graphical")
+    # My presets on screen: Choose settings, the preset menu, the keyboards and dialogs, Game settings' rows.
+    add_executable(homebrew_my_presets_graphical_test "${CMAKE_SOURCE_DIR}/tests/homebrew_my_presets_graphical_test.cpp")
+    target_compile_features(homebrew_my_presets_graphical_test PRIVATE cxx_std_20)
+    target_compile_definitions(homebrew_my_presets_graphical_test PRIVATE PLAYDEN_HOMEBREW_ASSETS_DIR="${playden_homebrew_assets}")
+    target_link_libraries(homebrew_my_presets_graphical_test PRIVATE playden_homebrew_ui PkgConfig::SDL2 OpenGL::GL)
+    add_dependencies(homebrew_my_presets_graphical_test playden_homebrew_assets)
+    add_test(NAME homebrew_my_presets_graphical COMMAND homebrew_my_presets_graphical_test
+        "${CMAKE_SOURCE_DIR}/fixtures/ui-comparison" "${CMAKE_BINARY_DIR}/my-presets-graphical")
     add_executable(homebrew_glyph_fallback_graphical_test "${CMAKE_SOURCE_DIR}/tests/homebrew_glyph_fallback_graphical_test.cpp")
     target_compile_features(homebrew_glyph_fallback_graphical_test PRIVATE cxx_std_20)
     target_compile_definitions(homebrew_glyph_fallback_graphical_test PRIVATE PLAYDEN_HOMEBREW_ASSETS_DIR="${playden_homebrew_assets}")
@@ -554,7 +605,8 @@ if(BUILD_TESTING)
     target_include_directories(title_registry_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
     target_compile_features(title_registry_test PRIVATE cxx_std_17)
     add_test(NAME title_registry COMMAND title_registry_test)
-    foreach(test_name steam_gzip steam_binary_kv steam_vdf steam_app_info prospero_profile game_settings game_probe)
+    foreach(test_name steam_gzip steam_binary_kv steam_vdf steam_app_info prospero_profile game_settings game_probe
+            settings_only_recipe)
         add_executable(${test_name}_test "${CMAKE_SOURCE_DIR}/tests/${test_name}_test.cpp")
         target_link_libraries(${test_name}_test PRIVATE playden_steam_cm_codec)
         target_compile_features(${test_name}_test PRIVATE cxx_std_20)
@@ -565,7 +617,21 @@ if(BUILD_TESTING)
     add_test(NAME steam_app_info COMMAND steam_app_info_test "${CMAKE_SOURCE_DIR}/fixtures/steam/appinfo")
     add_test(NAME prospero_profile COMMAND prospero_profile_test "${CMAKE_SOURCE_DIR}/fixtures/prospero-win-profiles")
     add_test(NAME game_settings COMMAND game_settings_test "${CMAKE_SOURCE_DIR}")
+    add_test(NAME settings_only_recipe COMMAND settings_only_recipe_test)
+    add_executable(community_rules_test "${CMAKE_SOURCE_DIR}/tests/community_rules_test.cpp")
+    target_link_libraries(community_rules_test PRIVATE playden_steam_cm_codec)
+    target_compile_features(community_rules_test PRIVATE cxx_std_20)
+    add_test(NAME community_rules COMMAND community_rules_test "${CMAKE_SOURCE_DIR}/tests/fixtures/community-recipes")
+    # The checker on the good and hostile fixtures, as the recipes repository's CI runs it.
+    add_test(NAME community_recipe_check
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_community_recipe_check.py"
+            "$<TARGET_FILE:community_recipe_check>" "${CMAKE_SOURCE_DIR}/tests/fixtures/community-recipes")
+    set_tests_properties(community_recipe_check PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
     add_test(NAME game_probe COMMAND game_probe_test)
+    add_executable(runtime_steam_input_test tests/runtime_steam_input_test.cpp)
+    target_link_libraries(runtime_steam_input_test PRIVATE playden_steam_cm_codec)
+    target_compile_features(runtime_steam_input_test PRIVATE cxx_std_17)
+    add_test(NAME runtime_steam_input COMMAND runtime_steam_input_test)
     add_executable(runtime_redist_test tests/runtime_redist_test.cpp)
     target_link_libraries(runtime_redist_test PRIVATE playden_steam_cm_codec)
     target_compile_features(runtime_redist_test PRIVATE cxx_std_20)
@@ -616,6 +682,17 @@ if(BUILD_TESTING)
     add_executable(pe_architecture_test tests/pe_architecture_test.cpp)
     target_compile_features(pe_architecture_test PRIVATE cxx_std_20)
     add_test(NAME pe_architecture COMMAND pe_architecture_test)
+    add_executable(my_presets_test tests/my_presets_test.cpp)
+    target_link_libraries(my_presets_test PRIVATE playden_steam_cm_codec)
+    target_compile_features(my_presets_test PRIVATE cxx_std_20)
+    add_test(NAME my_presets COMMAND my_presets_test)
+    # The same file handling through the console's managed-directory backend.
+    add_executable(my_presets_native_policy_test tests/my_presets_test.cpp src/runtime/my_presets.cpp
+        src/runtime/game_settings.cpp src/runtime/game_probe.cpp src/platform/managed_directory.cpp src/library/store.cpp)
+    target_link_libraries(my_presets_native_policy_test PRIVATE playden_steam_cm_codec)
+    target_compile_features(my_presets_native_policy_test PRIVATE cxx_std_20)
+    target_compile_definitions(my_presets_native_policy_test PRIVATE PLAYDEN_PLATFORM_PS5=1)
+    add_test(NAME my_presets_native_policy COMMAND my_presets_native_policy_test)
     add_executable(steam_depot_chunk_test "${CMAKE_SOURCE_DIR}/tests/steam_depot_chunk_test.cpp")
     target_link_libraries(steam_depot_chunk_test PRIVATE playden_depot_codec)
     target_compile_features(steam_depot_chunk_test PRIVATE cxx_std_20)

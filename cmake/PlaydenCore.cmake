@@ -19,6 +19,7 @@ add_library(playden_library STATIC
     "${CMAKE_SOURCE_DIR}/src/library/cache.cpp"
     "${CMAKE_SOURCE_DIR}/src/library/organization.cpp"
     "${CMAKE_SOURCE_DIR}/src/library/store.cpp"
+    "${CMAKE_SOURCE_DIR}/src/library/game_ref.cpp"
     "${CMAKE_SOURCE_DIR}/src/library/update_check.cpp")
 target_include_directories(playden_library PUBLIC "${CMAKE_SOURCE_DIR}/src"
     PRIVATE "${CMAKE_SOURCE_DIR}/third_party/utf8proc")
@@ -61,6 +62,11 @@ target_link_libraries(playden_library_service PUBLIC playden_steam_core)
 add_library(playden_diagnostic_log STATIC "${CMAKE_SOURCE_DIR}/src/app/diagnostic_log.cpp")
 target_include_directories(playden_diagnostic_log PUBLIC "${CMAKE_SOURCE_DIR}/src")
 target_compile_features(playden_diagnostic_log PUBLIC cxx_std_17)
+
+# features.txt: no dependencies, so any layer can ask which experimental features are on.
+add_library(playden_experimental_features STATIC "${CMAKE_SOURCE_DIR}/src/app/experimental_features.cpp")
+target_include_directories(playden_experimental_features PUBLIC "${CMAKE_SOURCE_DIR}/src")
+target_compile_features(playden_experimental_features PUBLIC cxx_std_17)
 
 # The languages Steam ships game content in. The depot selection, the preferences and the
 # Steamworks emulator all name them, and none of those may depend on the others.
@@ -295,6 +301,9 @@ if(BUILD_TESTING AND NOT PLAYDEN_PLATFORM_PS5)
     add_executable(diagnostic_log_test "${CMAKE_SOURCE_DIR}/tests/diagnostic_log_test.cpp")
     target_link_libraries(diagnostic_log_test PRIVATE playden_diagnostic_log)
     add_test(NAME diagnostic_log COMMAND diagnostic_log_test)
+    add_executable(experimental_features_test "${CMAKE_SOURCE_DIR}/tests/experimental_features_test.cpp")
+    target_link_libraries(experimental_features_test PRIVATE playden_experimental_features)
+    add_test(NAME experimental_features COMMAND experimental_features_test)
     add_executable(preferences_test "${CMAKE_SOURCE_DIR}/tests/preferences_test.cpp")
     target_link_libraries(preferences_test PRIVATE playden_preferences)
     add_test(NAME preferences COMMAND preferences_test)

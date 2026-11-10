@@ -34,6 +34,7 @@ struct PeSpec {
   bool shared_data = false;  // the data section is writable and shared, on 4 KB pages
   std::vector<std::string> delay_imports;  // delay-loaded DLLs (descriptors at RVA 0x2a00)
   std::string resource;      // the resource directory's bytes, at RVA 0x2c00 (at most 0x400)
+  std::string code_section = ".text";  // the first section's name (Watcom's linker calls it BEGTEXT)
 };
 
 void Put32(std::string* bytes, std::size_t at, std::uint32_t value) {
@@ -67,7 +68,7 @@ void WritePe(const fs::path& path, const PeSpec& spec) {
     Put32(&bytes, table + row * 40 + 16, 0x1000);
     Put32(&bytes, table + row * 40 + 20, raw);
   };
-  section(0, spec.bind_entry ? ".bind" : ".text", 0x1000, 0x400);
+  section(0, spec.bind_entry ? ".bind" : spec.code_section.c_str(), 0x1000, 0x400);
   section(1, ".rdata", 0x2000, static_cast<std::uint32_t>(spec.data_at));
   if (spec.shared_data) Put32(&bytes, table + 40 + 36, 0xd0000040);
   bytes.replace(0x400, spec.text.size(), spec.text);
@@ -346,6 +347,22 @@ int main() {
     CHECK(DefaultsFor(ProbeGame(root.string(), "Gl.exe")).graphics == "opengl");
     const auto plain = ProbeGame(root.string(), "Plain.exe");
     CHECK(plain.apis.count("ddraw") && DefaultsFor(plain).graphics == "auto");
+    CHECK(!plain.watcom && DefaultsFor(plain).cpu.empty());
+  }
+  {  // A 32-bit program linked by Watcom (Fallout) runs on the translator: its runtime reloads FS.
+    const auto root = fresh();
+    PeSpec fallout{false, {"USER32.dll", "ddraw.dll"}};
+    fallout.code_section = "BEGTEXT";
+    WritePe(root / "falloutw.exe", fallout);
+    const auto probe = ProbeGame(root.string(), "falloutw.exe");
+    CHECK(probe.watcom);
+    const auto defaults = DefaultsFor(probe);
+    CHECK(defaults.cpu == "translator" && defaults.summary.find(",watcom ") != std::string::npos);
+    CHECK(DetectedLabel(defaults.summary).empty());
+    PeSpec x64{true, {"USER32.dll"}};
+    x64.code_section = "BEGTEXT";
+    WritePe(root / "w64.exe", x64);
+    CHECK(!ProbeGame(root.string(), "w64.exe").watcom && DefaultsFor(ProbeGame(root.string(), "w64.exe")).cpu.empty());
   }
   {  // Godot and Source.
     const auto root = fresh();
@@ -477,6 +494,46 @@ int main() {
     unity.arguments = "-force-d3d11";
     CHECK(!RefreshRecipeDefaults(root.string(), kit, &unity) && unity.arguments == "-force-d3d11");
     CHECK(DefaultsRevision("unity,d3d11 graphics=dxvk") == 0 && DefaultsRevision("nwjs,nwjs-0.86,d3d11") == 2);
+  }
+  {  // A Watcom program set up before Watcom got Translator: the next Play adds only that default.
+    const auto root = fresh();
+    PeSpec fallout{false, {"USER32.dll", "ddraw.dll"}};
+    fallout.code_section = "BEGTEXT";
+    WritePe(root / "falloutwHR.exe", fallout);
+    WritePe(root / "Plain.exe", {false, {"USER32.dll", "ddraw.dll"}});
+    KitCapabilities kit;
+    GameRecipe recipe;
+    std::string reason;
+    CHECK(GenerateGameRecipe(38400, "Fallout", {{"", "", "falloutwHR.exe", "", ""}}, root.string(), &recipe, &reason, kit));
+    CHECK(recipe.defaults.at("cpu") == "translator" && !RefreshRecipeDefaults(root.string(), kit, &recipe));
+    // As it was saved before: no cpu default, no watcom fact, a graphics value of its own.
+    auto old = recipe;
+    old.defaults.erase("cpu");
+    old.detected = "ddraw graphics=auto";
+    old.graphics = "dxvk";
+    CHECK(WatcomProgram((root / "falloutwHR.exe").string()) && !WatcomProgram((root / "Plain.exe").string()));
+    auto missing = old;
+    CHECK(!RefreshRecipeDefaults((root / "not-plugged-in").string(), kit, &missing) && !missing.defaults.count("cpu"));
+    CHECK(RefreshRecipeDefaults(root.string(), kit, &old));
+    CHECK(old.defaults.at("cpu") == "translator" && old.detected == "ddraw,watcom graphics=auto" && old.graphics == "dxvk");
+    CHECK(!RefreshRecipeDefaults(root.string(), kit, &old));
+    // A Native the recipe already says, a 32-bit program that isn't Watcom's and a 64-bit recipe stay as they are.
+    auto native = recipe;
+    native.defaults["cpu"] = "native";
+    native.detected = "ddraw graphics=auto";
+    CHECK(!RefreshRecipeDefaults(root.string(), kit, &native) && native.defaults.at("cpu") == "native");
+    auto plain = old;
+    plain.defaults.erase("cpu");
+    plain.detected = "unknown graphics=auto";
+    plain.launch_entries.front().executable = "Plain.exe";
+    CHECK(!RefreshRecipeDefaults(root.string(), kit, &plain) && !plain.defaults.count("cpu"));
+    auto x64 = plain;
+    x64.launch_entries.front().executable = "falloutwHR.exe";
+    x64.architecture = "pe64";
+    CHECK(!RefreshRecipeDefaults(root.string(), kit, &x64) && !x64.defaults.count("cpu"));
+    auto unknown = plain;
+    unknown.launch_entries.front().executable = "falloutwHR.exe";
+    CHECK(RefreshRecipeDefaults(root.string(), kit, &unknown) && unknown.detected == "watcom graphics=auto");
   }
   {  // node-webkit before NW.js 0.13 (CrossCode's demo): Chromium in the program, nw.pak beside it, no nw.dll.
     const auto root = fresh();
@@ -674,8 +731,14 @@ int main() {
     CHECK(settings.graphics == "auto" && settings.dll_overrides.empty());
     // Steam features: emulation by default here, and the player may choose the game's own files.
     CHECK(settings.values.at("steam_features").value == "emulate" && !settings.values.at("steam_features").locked);
-    CHECK(BuildEffectiveSettings(recipe, nullptr, {{"steam_features", "game"}}, KitCapabilities{}, &settings, &error));
+    CHECK(settings.values.at("steam_input").value == "auto" && settings.values.at("steam_input").available);
+    CHECK(BuildEffectiveSettings(recipe, nullptr, {{"steam_input", "off"}}, KitCapabilities{}, &settings, &error));
+    CHECK(settings.values.at("steam_input").value == "off");
+    CHECK(BuildEffectiveSettings(recipe, nullptr, {{"steam_features", "game"}, {"steam_input", "on"}}, KitCapabilities{},
+                                 &settings, &error));
     CHECK(settings.values.at("steam_features").value == "game");
+    // Steam Input comes from the emulator: with the game's own files the row is off and back to Automatic.
+    CHECK(!settings.values.at("steam_input").available && settings.values.at("steam_input").value == "auto");
     // A shipped recipe that says nothing about Steam features keeps the game's own library, whatever the player asks.
     auto shipped = recipe;
     shipped.id = "steam-2062430-shipped-v1";

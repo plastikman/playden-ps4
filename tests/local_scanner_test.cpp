@@ -181,6 +181,21 @@ void LimitsStopTheScanAndSaySo() {
     CHECK(scan.status == ScanStatus::kOk && scan.limit_reached);
     CHECK(scan.file_count == kMaxScanEntries);
   }
+  {  // A folder's own programs are found before the limit is spent in its subfolders, whatever the listing order.
+    TemporaryDirectory root;
+    for (const char* folder : {"a", "m", "z"})
+      for (std::size_t i = 0; i < kMaxScanEntries / 2; ++i) {
+        const auto path = root.path / "Game" / folder / ("f" + std::to_string(i) + ".dat");
+        if (i == 0) fs::create_directories(path.parent_path());
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT, 0644);
+        CHECK(fd >= 0);
+        ::close(fd);
+      }
+    File(root.path / "Game/Wanted.exe", 1);
+    const auto scan = ScanGameFolder((root.path / "Game").string());
+    CHECK(scan.status == ScanStatus::kOk && scan.limit_reached);
+    CHECK(scan.programs.size() == 1 && scan.programs.front().path == "Wanted.exe");
+  }
 }
 
 void NonAsciiPathsAreFlagged() {
@@ -195,6 +210,10 @@ void NonAsciiPathsAreFlagged() {
   CHECK(plain.status == ScanStatus::kOk && plain.printable_path);
   CHECK(plain.programs.size() == 1 && !plain.programs[0].printable);
   CHECK(IsPrintableAscii("/mnt/usb0/playden/import/Old School Rally") && !IsPrintableAscii("a\tb"));
+  // A colon or backslash can't be in Wine's path for the folder (prospero-win's Z: is the console root).
+  CHECK(IsPlayableInPlace("/mnt/usb0/playden/import/Old School Rally"));
+  CHECK(!IsPlayableInPlace("/mnt/usb0/playden/import/Warhammer 40k: Space Marine"));
+  CHECK(!IsPlayableInPlace("/mnt/usb0/playden/import/a\\b") && !IsPlayableInPlace("/mnt/usb0/Caf\xc3\xa9"));
 }
 
 void FailuresAreReported() {
