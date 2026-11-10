@@ -14,6 +14,8 @@
 #include "library/model.h"
 #include "library/organization.h"
 #include "steam/backend/app_info.h"
+#include "steam/backend/cm_client.h"
+#include "steam/backend/entitled_library.h"
 #include <optional>
 
 namespace playden { class LibraryCache; class LibraryService; class Storage; }
@@ -57,6 +59,7 @@ class SteamQrAuth
     bool library_is_hidden(std::uint32_t app_id) const;
     bool library_toggle_favorite(std::uint32_t app_id);
     bool library_toggle_hidden(std::uint32_t app_id);
+    bool library_is_family(std::uint32_t app_id) const;
     // Library search, sort and collections, kept in the organization file (Leo's format: query, sort
     // name, collections), so they survive a restart. They apply to the Library tab's views, not Home.
     std::string library_query() const;
@@ -150,6 +153,11 @@ class SteamQrAuth
     std::unique_ptr<playden::Storage> library_storage_;
     std::unique_ptr<playden::LibraryCache> library_cache_;
     std::unique_ptr<playden::steam::LibraryClient> library_backend_;
+    // The Library as the PS5 loads it: owned games plus the account's licenses (CM), so games a Steam family
+    // member shares are listed (marked family_shared) and their depots count as licensed for installs.
+    std::unique_ptr<playden::steam::CmClient> library_cm_;
+    std::unique_ptr<playden::steam::EntitledLibraryBackend> entitled_library_;
+    playden::steam::LicensedDepots licensed_depots_;
     std::unique_ptr<playden::LibraryService> library_service_;
     std::uint64_t library_request_ = 0;
     std::string library_detail_;

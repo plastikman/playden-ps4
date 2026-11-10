@@ -1097,6 +1097,8 @@ SteamQrAuth::~SteamQrAuth()
     delete store_details_service_;
     store_details_service_ = nullptr;
     library_service_.reset();
+    entitled_library_.reset();
+    library_cm_.reset();
     library_backend_.reset();
     library_cache_.reset();
     library_storage_.reset();
@@ -1342,6 +1344,14 @@ bool SteamQrAuth::library_toggle_collection(std::uint32_t app_id, std::size_t in
     if (persist_library_organization_locked()) return true;
     if (added) members.erase(id);
     else members.insert(id);
+    return false;
+}
+
+bool SteamQrAuth::library_is_family(std::uint32_t app_id) const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    for (const auto &game : games_)
+        if (game.id.steam_app().value_or(0) == app_id) return game.family_shared;
     return false;
 }
 
@@ -1803,6 +1813,8 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
                 return content_language_;
             });
             runner.SetFreeDlcMemory(&storage);
+            // The licenses the Library read, family-shared ones included, for depot selection.
+            runner.SetLicensedDepots(&licensed_depots_);
             runner.SetLog([](std::uint32_t app, const char *step, const char *category,
                              const char *detail) {
                 LogNetworkLine("install app=" + std::to_string(app) + " step=" + step +
@@ -2597,8 +2609,20 @@ bool SteamQrAuth::start_auth(bool cached_only)
         service_ = new playden::steam::SteamService(
             *backend_, *repository_, [](const std::string &line) { LogNetworkLine(line); });
         library_backend_ = std::make_unique<playden::steam::LibraryClient>("/app0/assets/cacert.pem");
+        library_storage_ = std::make_unique<playden::Storage>("/data/PLDN10001");
+        library_storage_->AllowTraversableRoot();
+        (void)library_storage_->EnsureRootDirectory();
+        library_cm_ = std::make_unique<playden::steam::CmClient>("/app0/assets/cacert.pem", *library_storage_);
+        library_cm_->SetOwner("library");
+        entitled_library_ = std::make_unique<playden::steam::EntitledLibraryBackend>(*library_backend_, *library_cm_);
+        entitled_library_->SetLicensedDepots(&licensed_depots_);
+        entitled_library_->SetAppNameStorage(library_storage_.get());
+        // The family service names the games a family member shares (and logs what it lists).
+        entitled_library_->SetFamilyDiagnostics("/app0/assets/cacert.pem", [](const std::string &line) {
+            LogNetworkLine(line);
+        });
         library_service_ = std::make_unique<playden::LibraryService>(
-            *library_backend_, *repository_, nullptr,
+            *entitled_library_, *repository_, nullptr,
             std::function<std::uint64_t()>{},
             [](const char *step) { LogNetworkLine(std::string("library worker step=") + step); });
     }
@@ -3049,6 +3073,7 @@ extern "C" int playden_ps4_library_collection_toggle(std::uint32_t app_id, std::
 {
     return auth().library_toggle_collection(app_id, index) ? 1 : 0;
 }
+extern "C" int playden_ps4_library_is_family(std::uint32_t app_id) { return auth().library_is_family(app_id) ? 1 : 0; }
 extern "C" int playden_ps4_library_toggle_favorite(std::uint32_t app_id)
 {
     return auth().library_toggle_favorite(app_id) ? 1 : 0;

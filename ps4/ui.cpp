@@ -53,6 +53,7 @@ extern "C" const char *playden_ps4_library_collection_name(std::size_t index);
 extern "C" std::size_t playden_ps4_library_collection_size(std::size_t index);
 extern "C" int playden_ps4_library_in_collection(std::uint32_t app_id, std::size_t index);
 extern "C" int playden_ps4_maintenance_state(void);
+extern "C" int playden_ps4_library_is_family(std::uint32_t app_id);
 extern "C" const char *playden_ps4_auth_prompt();
 extern "C" const char *playden_ps4_auth_account_name();
 extern "C" int playden_ps4_auth_guard_code_wanted();
@@ -766,6 +767,12 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 if (playden_ps4_library_is_favorite(app_id))
                     list.rounded_rect({cover.x + cover.w - 24.0F, cover.y + 8.0F, 14.0F, 14.0F},
                                       7.0F, accent);
+                // Shared by a Steam family member: a label in the cover's top corner.
+                if (playden_ps4_library_is_family(app_id) && font_ready)
+                {
+                    list.rounded_rect({cover.x + 6.0F, cover.y + 6.0F, 72.0F, 24.0F}, 6.0F, Color::rgb(0x0e0d0c, 0.82F));
+                    list.text(font, 0, "FAMILY", cover.x + 42.0F, cover.y + 24.0F, 14, ink, Align::center);
+                }
                 // A newer version on Steam: a label across the cover's foot.
                 if (playden_ps4_library_update_available(app_id) && font_ready)
                 {

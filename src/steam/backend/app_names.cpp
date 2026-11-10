@@ -9,8 +9,15 @@ namespace {
 
 constexpr const char* kPath = "app-names.cache";
 // Version 2 added each entry's dlc_for. Version 1 files still load, without their kOther entries.
-const Bytes kMagicV1 = {'P', 'D', 'N', 'A', 'M', 'E', 0, 1};
-const Bytes kMagic = {'P', 'D', 'N', 'A', 'M', 'E', 0, 2};
+// Function-local: a module whose static initializers never run (the PS4 UI) would see them empty.
+const Bytes& MagicV1() {
+  static const Bytes magic = {'P', 'D', 'N', 'A', 'M', 'E', 0, 1};
+  return magic;
+}
+const Bytes& Magic() {
+  static const Bytes magic = {'P', 'D', 'N', 'A', 'M', 'E', 0, 2};
+  return magic;
+}
 constexpr std::size_t kMaxName = 1024;
 constexpr std::size_t kMaxIcon = 64;
 // Games and demos fill at most kMaxNamedBytes; the other apps' entries are fixed-size and fit beside them.
@@ -67,13 +74,13 @@ AppNames LoadAppNames(const Storage& storage) {
   const auto read = storage.Read(kPath, kMaxBytes);
   if (!read.ok()) return {};
   const Bytes& bytes = read.value();
-  if (bytes.size() < kMagic.size() + 8) return {};
-  const bool v1 = std::equal(kMagicV1.begin(), kMagicV1.end(), bytes.begin());
-  if (!v1 && !std::equal(kMagic.begin(), kMagic.end(), bytes.begin())) return {};
+  if (bytes.size() < Magic().size() + 8) return {};
+  const bool v1 = std::equal(MagicV1().begin(), MagicV1().end(), bytes.begin());
+  if (!v1 && !std::equal(Magic().begin(), Magic().end(), bytes.begin())) return {};
   const std::size_t body = bytes.size() - 4;
   Reader crc{bytes, body, bytes.size()};
   if (static_cast<std::uint32_t>(crc.Number(4)) != Checksum(bytes, body)) return {};
-  Reader reader{bytes, kMagic.size(), body};
+  Reader reader{bytes, Magic().size(), body};
   const auto count = reader.Number(4);
   if (!reader.okay || count > kMaxAppNames + kMaxOtherApps) return {};
   AppNames names;
@@ -108,7 +115,7 @@ bool SaveAppNames(const Storage& storage, const AppNames& names) {
   // kMaxOtherApps other apps without a name or icon.
   const auto newest = [](const Entry& a, const Entry& b) { return a.second->learned_at > b.second->learned_at; };
   std::sort(named.begin(), named.end(), newest);
-  std::size_t bytes = kMagic.size() + 4 + 4;
+  std::size_t bytes = Magic().size() + 4 + 4;
   std::size_t kept = 0;
   for (; kept < named.size() && kept < kMaxAppNames; ++kept) {
     const auto& name = *named[kept].second;
@@ -122,7 +129,7 @@ bool SaveAppNames(const Storage& storage, const AppNames& names) {
   std::vector<Entry> entries = std::move(named);
   entries.insert(entries.end(), others.begin(), others.end());
   std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-  Bytes out = kMagic;
+  Bytes out = Magic();
   Number(out, entries.size(), 4);
   for (const auto& [id, name] : entries) {
     Number(out, id, 4);
