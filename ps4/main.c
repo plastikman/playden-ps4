@@ -88,6 +88,7 @@ int playden_ps4_delete_stage = 0;
 char playden_ps4_delete_note[160] = "";
 /* Settings' Steam account row: signing out takes a second Cross; ui.cpp shows it. */
 int playden_ps4_signout_armed = 0;
+int playden_ps4_launching = 0;   /* page 7: the game is starting (the launch call blocks) */
 /* Maintenance (page 10): the prefix reset takes a second Cross; ui.cpp shows it. */
 int playden_ps4_maintenance_armed = 0;
 /* The game the collection picker (page 9) is for; ui.cpp draws from it. */
@@ -462,11 +463,20 @@ int playden_ps4_main(int argc, char **argv) {
             }
             if (launch) {
                 sync_waiting = 0;
+                /* The launch blocks (Steam setup, a first-launch prefix copy of about a minute): show why first. */
+                playden_ps4_launching = 1;
+                current = (current + 1) % BUFFERS;
+                draw_screen(buffers[current], tab, selected, page, pad_ready,
+                            playden_ps4_auth_state(), game_focus, game_selected, delete_choice,
+                            playden_ps4_auth_challenge(),
+                            playden_ps4_auth_failure(), playden_ps4_wine_status());
+                sceVideoOutSubmitFlip(handle, current, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
                 if (!playden_ps4_game_prepare_steamworks(detail_app_id) ||
                     playden_ps4_wine_launch_game(detail_app_id) != 0) {
                     log_line("PLDN10001 runtime: could not launch the selected Steam game");
                     page = 2;
                 }
+                playden_ps4_launching = 0;
                 changed = 1;
             }
             if (playden_ps4_saves_poll()) changed = 1;
@@ -513,7 +523,7 @@ int playden_ps4_main(int argc, char **argv) {
             if ((pressed & ORBIS_PAD_BUTTON_UP) && delete_choice > 0) {
                 --delete_choice; playden_ps4_maintenance_armed = 0; changed = 1;
             }
-            if ((pressed & ORBIS_PAD_BUTTON_DOWN) && delete_choice < 4) {
+            if ((pressed & ORBIS_PAD_BUTTON_DOWN) && delete_choice < 5) {
                 ++delete_choice; playden_ps4_maintenance_armed = 0; changed = 1;
             }
             if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !working) {
@@ -530,6 +540,8 @@ int playden_ps4_main(int argc, char **argv) {
                     } else {
                         playden_ps4_maintenance_armed = 1;
                     }
+                } else if (delete_choice == 4) {
+                    playden_ps4_maintenance_start(detail_app_id, 5);
                 } else {
                     page = 2;
                 }
@@ -659,7 +671,7 @@ int playden_ps4_main(int argc, char **argv) {
                 const int max_selection = tab == 1 ? library_rows - (steam_connected ? 1 : 0) : tab == 3 && saves_state == 3 ? 2 :
                                           tab == 3 && saves_state == 1 ? 0 :
                                           tab == 3 ? (installed_games > 0 ? installed_games - 1 : 0) :
-                                          tab == 4 ? 7 : 0;
+                                          tab == 4 ? 8 : 0;
                 if ((pressed & ORBIS_PAD_BUTTON_DOWN) && selected < max_selection) { ++selected; changed = 1; }
                 /* Library search and sort from the views menu too. */
                 if (tab == 1 && (pressed & (ORBIS_PAD_BUTTON_TRIANGLE | ORBIS_PAD_BUTTON_R1))) {

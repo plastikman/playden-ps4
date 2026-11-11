@@ -61,6 +61,8 @@ extern "C" int playden_ps4_auth_guard_code_wanted();
 extern "C" int playden_ps4_signout_armed;
 // Delete (page 3): main.c's stage (0 choosing, 1 Cloud sync, 2-3 prefix backup and removal) and why it stopped.
 extern "C" int playden_ps4_delete_stage;
+extern "C" int playden_ps4_launching;
+extern "C" int playden_ps4_download_fastest();
 extern "C" char playden_ps4_delete_note[160];
 extern "C" const char *playden_ps4_maintenance_message(void);
 extern "C" const char *playden_ps4_maintenance_backup_label(std::uint32_t app_id);
@@ -837,6 +839,9 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                       370, 709, 18, installed ? accent : incomplete ? Color::rgb(0xffc164) : secondary,
                       Align::center);
             hint_text(list, font, action_state, 530, 405, 21, action_color);
+            // Maintenance has no other sign on this page: name its button under the badge.
+            if (details_state == 2 && (installed || incomplete) && install_state != 1)
+                hint_text(list, font, "OPTIONS  MAINTENANCE", 262, 770, 15, secondary);
 
             const char *developers = playden_ps4_game_store_developers();
             const char *publishers = playden_ps4_game_store_publishers();
@@ -1085,10 +1090,18 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             const std::uint32_t app_id = playden_ps4_game_details_app_id();
             const char *title = playden_ps4_library_title_by_app_id(app_id);
             const int state = playden_ps4_saves_state();
-            list.text(font, 0, "STEAM CLOUD SAVES", 390, 306, 24, accent);
+            list.text(font, 0, playden_ps4_launching ? "STARTING" : "STEAM CLOUD SAVES", 390, 306, 24, accent);
             list.text(font, 0, font.fit(title[0] ? title : "Selected game", 40, 1140), 390, 378, 40, ink);
-            list.text(font, 0, font.fit(playden_ps4_saves_message(), 21, 1140), 390, 438, 21, secondary);
-            if (state == 3)
+            if (playden_ps4_launching)
+            {
+                list.text(font, 0, "Setting up Steam and Windows for this game…", 390, 438, 21, secondary);
+                list.text(font, 0, "The first launch after an install or a prefix reset copies Windows: about a minute.",
+                          390, 590, 19, secondary);
+            }
+            else
+                list.text(font, 0, font.fit(playden_ps4_saves_message(), 21, 1140), 390, 438, 21, secondary);
+            if (playden_ps4_launching) {}
+            else if (state == 3)
             {
                 const char *choices[] = {"USE THE CLOUD SAVES, THEN PLAY", "USE THE PS4 SAVES, THEN PLAY",
                                          "PLAY WITHOUT SYNCING", "CANCEL"};
@@ -1160,23 +1173,24 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             list.text(font, 0, font.fit(title[0] ? title : "Selected game", 34, 920), 500, 322, 34, ink);
             const char *choices[] = {"CHECK AND REPAIR FILES", "BACK UP SAVES", "RESTORE LAST BACKUP",
                                      playden_ps4_maintenance_armed ? "PRESS CROSS AGAIN TO RESET THE PREFIX"
-                                                                   : "RESET WINE PREFIX", "CLOSE"};
+                                                                   : "RESET WINE PREFIX", "CLEAR SHADER CACHE", "CLOSE"};
             const char *notes[] = {"Hashes every file; downloads only what is missing or changed.",
                                    "Copies the Wine prefix's user folders (Documents, AppData, Saved Games).",
                                    "Copies the newest backup back over the prefix's user folders.",
                                    "Backs up, then rebuilds Windows and the registry at the next launch. Saves stay.",
+                                   "This game's DXVK cache and the shared GPU shader cache. They rebuild as you play.",
                                    ""};
-            for (int i = 0; i < 5; ++i)
+            for (int i = 0; i < 6; ++i)
             {
-                const float y = 362.0F + static_cast<float>(i) * 76.0F;
-                const Rect row{500, y, 920, 62};
+                const float y = 362.0F + static_cast<float>(i) * 68.0F;
+                const Rect row{500, y, 920, 60};
                 if (delete_choice == i)
                     list.bordered_rect(row, 8, Color::rgb(0xf0863a, 0.16F), 1.5F, accent);
                 else
                     list.rounded_rect(row, 8, bg);
-                list.text(font, 0, choices[i], 526, y + (notes[i][0] ? 28.0F : 40.0F), 21,
+                list.text(font, 0, choices[i], 526, y + (notes[i][0] ? 26.0F : 38.0F), 21,
                           i == 3 && playden_ps4_maintenance_armed ? accent : delete_choice == i ? ink : secondary);
-                if (notes[i][0]) list.text(font, 0, notes[i], 526, y + 52, 15, secondary);
+                if (notes[i][0]) list.text(font, 0, notes[i], 526, y + 49, 15, secondary);
             }
             const int state = playden_ps4_maintenance_state();
             const char *message = playden_ps4_maintenance_message();
@@ -1348,7 +1362,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             list.text(font, 0, "DOWNLOAD & RUNTIME SETTINGS", 590, 242, 24, accent);
             const char *labels[] = {"Content language", "Remote diagnostic logging",
                                     "Wine log level", "Wait watchdog traces", "Full GPU hang report",
-                                    "Log receiver IP", "Playden update", "Steam account"};
+                                    "Log receiver IP", "Playden update", "Steam account", "Download server"};
             PwUpdateDownload update{};
             pw_update_ps4_download_status(&update);
             char update_value[64];
@@ -1379,17 +1393,18 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 auth_state != 6 && auth_state != 7 ? std::string("Not signed in")
                 : playden_ps4_signout_armed ? std::string("CROSS AGAIN TO SIGN OUT")
                 : playden_ps4_auth_account_name()[0] ? std::string(playden_ps4_auth_account_name())
-                                                     : std::string("Signed in")};
-            for (int i = 0; i < 8; ++i)
+                                                     : std::string("Signed in"),
+                playden_ps4_download_fastest() ? "FASTEST" : "STEAM'S ORDER"};
+            for (int i = 0; i < 9; ++i)
             {
-                const Rect row{590, 258.0F + static_cast<float>(i) * 68.0F, 900, 56};
+                const Rect row{590, 258.0F + static_cast<float>(i) * 62.0F, 900, 52};
                 if (selected == i)
                     list.bordered_rect(row, 8, Color::rgb(0xf0863a, 0.12F), 1.5F, accent);
                 else
                     list.rounded_rect(row, 8, bg);
-                list.text(font, 0, labels[i], 614, 294.0F + static_cast<float>(i) * 68.0F,
+                list.text(font, 0, labels[i], 614, 292.0F + static_cast<float>(i) * 62.0F,
                           22, selected == i ? ink : secondary);
-                list.text(font, 0, values[i].c_str(), 1450, 294.0F + static_cast<float>(i) * 68.0F,
+                list.text(font, 0, values[i].c_str(), 1450, 292.0F + static_cast<float>(i) * 62.0F,
                           22, accent, Align::right);
             }
             hint_text(list, font,
@@ -1398,6 +1413,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                                        update.state == PW_UPDATE_DOWNLOAD_READY || update.state == PW_UPDATE_DOWNLOAD_FAILED
                                            ? "CROSS downloads it to /data/pkg, checked against GitHub." :
                                        "Checked once at start on github.com/plastikman/playden-ps4.") :
+                      selected == 8 ? "Fastest tests Steam's servers when a download starts and keeps the quickest." :
                       selected == 5 ? "CROSS opens the system keyboard. Saved IP applies when Wine starts." :
                       selected == 7 ? (auth_state == 6 || auth_state == 7
                                            ? "CROSS signs out. Installed games and saves stay; sign in again for any account."

@@ -22,6 +22,7 @@ extern "C" {
 int playden_ps4_wine_prefix_path(std::uint32_t app_id, char *out, std::size_t capacity);
 int playden_ps4_wine_prepare_game_prefix(std::uint32_t app_id);
 void playden_ps4_log_text(const char *line);
+const char *playden_ps4_game_program_relative(std::uint32_t app_id);
 }
 
 // Everything here is function-local or a plain constant: the UI module's static initializers do not run.
@@ -285,7 +286,8 @@ void Run(std::uint32_t app_id, int action)
             Finish(false, "Restore stopped: " + stats.error);
             return;
         }
-        Finish(true, "Restored the backup from " + stamp.substr(0, 8) + ": " + std::to_string(stats.files) + " files.");
+        Finish(true, "Restored the backup from " + stamp.substr(0, 4) + "-" + stamp.substr(4, 2) + "-" + stamp.substr(6, 2) +
+                   (stamp.size() >= 13 ? " " + stamp.substr(9, 2) + ":" + stamp.substr(11, 2) + " UTC" : std::string()) + ": " + std::to_string(stats.files) + " files.");
         return;
     }
     if (action == 3) {
@@ -317,6 +319,27 @@ void Run(std::uint32_t app_id, int action)
             return;
         }
         Finish(true, "Saves backed up and the Wine prefix removed.");
+        return;
+    }
+    if (action == 5) {
+        // The game's DXVK pipeline cache beside its program, and the RADV shader cache all games share.
+        int removed = 0;
+        const char *program = playden_ps4_game_program_relative(app_id);
+        if (program && program[0]) {
+            std::string base = "/data/PLDN10001/games/" + std::to_string(app_id) + "/" + program;
+            const auto dot = base.rfind('.');
+            if (dot != std::string::npos && base.find('/', dot) == std::string::npos) base.erase(dot);
+            if (std::remove((base + ".dxvk-cache").c_str()) == 0) ++removed;
+        }
+        TreeStats stats;
+        bool kept = false;
+        const std::string radv = "/data/PLDN10001/cache/radv";
+        if (IsDirectory(radv) && !RemoveTree(radv, "", {}, &stats, &kept)) {
+            Finish(false, "Shader cache clear stopped partway: " + stats.error);
+            return;
+        }
+        Finish(true, "Shader caches cleared (" + std::to_string(stats.files + removed) +
+                         " files). Games build them again as they play; the first minutes may stutter.");
         return;
     }
     Finish(false, "Unknown maintenance action.");
@@ -373,7 +396,7 @@ bool ListDirectory(const std::string &path, std::vector<DirectoryEntry> *out, st
 extern "C" int playden_ps4_maintenance_start(std::uint32_t app_id, int action)
 {
     auto &job = playden::ps4::CurrentJob();
-    if (app_id == 0 || action < 1 || action > 4) return -1;
+    if (app_id == 0 || action < 1 || action > 5) return -1;
     int state = job.state.load();
     do {
         if (state == 1) return -1;
@@ -381,7 +404,8 @@ extern "C" int playden_ps4_maintenance_start(std::uint32_t app_id, int action)
     {
         const std::lock_guard<std::mutex> guard(job.mutex);
         job.message = action == 1 ? "Backing up saves…" : action == 2 ? "Restoring saves…" :
-                      action == 3 ? "Resetting the Wine prefix…" : "Backing up saves, then removing the Wine prefix…";
+                      action == 3 ? "Resetting the Wine prefix…" : action == 5 ? "Clearing shader caches…" :
+                      "Backing up saves, then removing the Wine prefix…";
     }
     playden::ps4::Log("start app=" + std::to_string(app_id) + " action=" + std::to_string(action));
     std::thread([app_id, action] { playden::ps4::Run(app_id, action); }).detach();

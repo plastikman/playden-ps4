@@ -117,6 +117,7 @@ class SteamQrAuth
     std::string wine_debug_level() const;
     bool wait_watchdog_enabled() const;
     bool gpu_hang_dump_enabled() const;
+    bool download_fastest() const;
     void start_game_uninstall(std::uint32_t app_id);
     int game_uninstall_state() const;
     std::uint32_t game_uninstall_app_id() const;
@@ -246,6 +247,7 @@ class SteamQrAuth
     std::string wine_debug_level_ = "profile";
     bool wait_watchdog_enabled_ = false;
     bool gpu_hang_dump_enabled_ = false;
+    bool download_fastest_ = false;   // race the CDN servers at download start (DownloadTuning::fastest)
     bool persist_runtime_settings_locked();
     std::thread uninstall_worker_;
     mutable std::mutex uninstall_mutex_;

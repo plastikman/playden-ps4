@@ -1052,6 +1052,7 @@ SteamQrAuth::SteamQrAuth()
             if (watchdog == "0" || watchdog == "1") wait_watchdog_enabled_ = watchdog == "1";
             const std::string gpu = value_for("gpu_hang_report");
             if (gpu == "0" || gpu == "1") gpu_hang_dump_enabled_ = gpu == "1";
+            download_fastest_ = value_for("download_server") == "fastest";
             // The old parallel-download preference is intentionally ignored until
             // the PS4 allocator passes a full multi-connection hardware run.
         }
@@ -1885,6 +1886,7 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
             runner.SetTuning([this] {
                 playden::steam::DownloadTuning tuning;
                 tuning.slots = download_connections();
+                tuning.fastest = download_fastest();
                 return tuning;
             });
             runner.SetContentLanguage([this] {
@@ -1998,6 +2000,12 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
                 ? "Download canceled. Completed files are saved; Cross resumes the install."
                 : (outcome.failure.empty() ? "Install failed. See the console network log." : outcome.failure);
             if (installed) {
+                {
+                    // The prefix copy takes about a minute and reports nothing: say what is happening.
+                    const std::lock_guard<std::mutex> guard(install_mutex_);
+                    install_message_ = "Setting up Windows for this game (about a minute)…";
+                    ++install_version_;
+                }
                 if (app_id != 220 && playden_ps4_wine_prepare_game_prefix(app_id) != 0)
                     message = std::string("Game files installed, but runtime setup failed: ") +
                               playden_ps4_wine_status();
@@ -2227,6 +2235,12 @@ bool SteamQrAuth::wine_debug_enabled() const
     return wine_debug_level_ != "profile";
 }
 
+bool SteamQrAuth::download_fastest() const
+{
+    std::lock_guard<std::mutex> guard(settings_mutex_);
+    return download_fastest_;
+}
+
 int SteamQrAuth::download_connections() const
 {
     const std::lock_guard<std::mutex> guard(settings_mutex_);
@@ -2268,6 +2282,7 @@ void SteamQrAuth::cycle_setting(int setting)
         ? "profile" : "detailed";
     else if (setting == 3) wait_watchdog_enabled_ = !wait_watchdog_enabled_;
     else if (setting == 4) gpu_hang_dump_enabled_ = !gpu_hang_dump_enabled_;
+    else if (setting == 8) download_fastest_ = !download_fastest_;
     else return;
 
     if (setting == 0) (void)persist_settings_locked();
@@ -2294,7 +2309,8 @@ bool SteamQrAuth::persist_runtime_settings_locked()
         "\nwine_log=" + (wine_debug_level_ == "detailed" || wine_debug_level_ == "quiet"
             ? wine_debug_level_ : "profile") +
         "\nwait_watchdog=" + std::to_string(wait_watchdog_enabled_ ? 1 : 0) +
-        "\ngpu_hang_report=" + std::to_string(gpu_hang_dump_enabled_ ? 1 : 0) + "\n";
+        "\ngpu_hang_report=" + std::to_string(gpu_hang_dump_enabled_ ? 1 : 0) +
+        "\ndownload_server=" + (download_fastest_ ? "fastest" : "steam") + "\n";
     return storage.WriteAtomicPrivate("settings.conf", playden::Bytes(text.begin(), text.end())).ok();
 }
 
@@ -3194,6 +3210,13 @@ extern "C" int playden_ps4_game_details_state() { return auth().game_details_sta
 extern "C" int playden_ps4_game_details_installed() { return auth().game_details_installed() ? 1 : 0; }
 extern "C" int playden_ps4_game_details_incomplete() { return auth().game_details_incomplete() ? 1 : 0; }
 // One line in the network log, for Playden's C code (the update check).
+// The game's program, relative to its install folder ("" when the profile names none).
+extern "C" const char *playden_ps4_game_program_relative(std::uint32_t app_id)
+{
+    static std::string program;
+    program = LaunchExecutableRelative(app_id);
+    return program.c_str();
+}
 extern "C" void playden_ps4_log_text(const char *line)
 {
     if (line) LogNetworkLine(line);
@@ -3367,6 +3390,7 @@ extern "C" const char *playden_ps4_wine_debug_level()
 extern "C" int playden_ps4_wait_watchdog_enabled() { return auth().wait_watchdog_enabled() ? 1 : 0; }
 extern "C" int playden_ps4_gpu_hang_dump_enabled() { return auth().gpu_hang_dump_enabled() ? 1 : 0; }
 extern "C" int playden_ps4_download_connections() { return auth().download_connections(); }
+extern "C" int playden_ps4_download_fastest() { return auth().download_fastest() ? 1 : 0; }
 extern "C" const char *playden_ps4_content_language()
 {
     static std::string language;
