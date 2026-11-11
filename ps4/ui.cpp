@@ -63,6 +63,7 @@ extern "C" int playden_ps4_signout_armed;
 extern "C" int playden_ps4_delete_stage;
 extern "C" int playden_ps4_launching;
 extern "C" int playden_ps4_download_fastest();
+extern "C" int playden_ps4_download_connections();
 extern "C" char playden_ps4_delete_note[160];
 extern "C" const char *playden_ps4_maintenance_message(void);
 extern "C" const char *playden_ps4_maintenance_backup_label(std::uint32_t app_id);
@@ -1407,7 +1408,8 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             list.text(font, 0, "DOWNLOAD & RUNTIME SETTINGS", 590, 242, 24, accent);
             const char *labels[] = {"Content language", "Remote diagnostic logging",
                                     "Wine log level", "Wait watchdog traces", "Full GPU hang report",
-                                    "Log receiver IP", "Playden update", "Steam account", "Download server"};
+                                    "Log receiver IP", "Playden update", "Steam account", "Download server",
+                                    "Download connections"};
             PwUpdateDownload update{};
             pw_update_ps4_download_status(&update);
             char update_value[64];
@@ -1439,17 +1441,18 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 : playden_ps4_signout_armed ? std::string("CROSS AGAIN TO SIGN OUT")
                 : playden_ps4_auth_account_name()[0] ? std::string(playden_ps4_auth_account_name())
                                                      : std::string("Signed in"),
-                playden_ps4_download_fastest() ? "FASTEST" : "STEAM'S ORDER"};
-            for (int i = 0; i < 9; ++i)
+                playden_ps4_download_fastest() ? "FASTEST" : "STEAM'S ORDER",
+                std::to_string(playden_ps4_download_connections())};
+            for (int i = 0; i < 10; ++i)
             {
-                const Rect row{590, 258.0F + static_cast<float>(i) * 62.0F, 900, 52};
+                const Rect row{590, 254.0F + static_cast<float>(i) * 57.0F, 900, 48};
                 if (selected == i)
                     list.bordered_rect(row, 8, Color::rgb(0xf0863a, 0.12F), 1.5F, accent);
                 else
                     list.rounded_rect(row, 8, bg);
-                list.text(font, 0, labels[i], 614, 292.0F + static_cast<float>(i) * 62.0F,
+                list.text(font, 0, labels[i], 614, 286.0F + static_cast<float>(i) * 57.0F,
                           22, selected == i ? ink : secondary);
-                list.text(font, 0, values[i].c_str(), 1450, 292.0F + static_cast<float>(i) * 62.0F,
+                list.text(font, 0, values[i].c_str(), 1450, 286.0F + static_cast<float>(i) * 57.0F,
                           22, accent, Align::right);
             }
             hint_text(list, font,
@@ -1459,6 +1462,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                                            ? "CROSS downloads it to /data/pkg, checked against GitHub." :
                                        "Checked once at start on github.com/plastikman/playden-ps4.") :
                       selected == 8 ? "Fastest tests Steam's servers when a download starts and keeps the quickest." :
+                      selected == 9 ? "Connections a download uses at once: fewer is gentler on the network and the PS4." :
                       selected == 5 ? "CROSS opens the system keyboard. Saved IP applies when Wine starts." :
                       selected == 7 ? (auth_state == 6 || auth_state == 7
                                            ? "CROSS signs out. Installed games and saves stay; sign in again for any account."

@@ -766,7 +766,7 @@ int playden_ps4_main(int argc, char **argv) {
                 const int max_selection = tab == 1 ? library_rows - (steam_connected ? 1 : 0) : tab == 3 && saves_state == 3 ? 2 :
                                           tab == 3 && saves_state == 1 ? 0 :
                                           tab == 3 ? (installed_games > 0 ? installed_games - 1 : 0) :
-                                          tab == 4 ? 8 :
+                                          tab == 4 ? 9 :
                                           tab == 2 ? (int)playden_ps4_queue_waiting_count() +
                                                      (playden_ps4_update_count() > 0 ? 1 : 0) : 0;
                 if ((pressed & ORBIS_PAD_BUTTON_DOWN) && selected < max_selection) { ++selected; changed = 1; }

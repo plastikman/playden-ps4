@@ -1053,6 +1053,10 @@ SteamQrAuth::SteamQrAuth()
             const std::string gpu = value_for("gpu_hang_report");
             if (gpu == "0" || gpu == "1") gpu_hang_dump_enabled_ = gpu == "1";
             download_fastest_ = value_for("download_server") == "fastest";
+            // download_connections: the player's choice (1, 2 or 4); the old parallel-download key stays ignored.
+            const std::string connections = value_for("download_connections");
+            if (connections == "1" || connections == "2" || connections == "4")
+                download_connections_ = std::stoi(connections);
             // The old parallel-download preference is intentionally ignored until
             // the PS4 allocator passes a full multi-connection hardware run.
         }
@@ -2491,6 +2495,7 @@ void SteamQrAuth::cycle_setting(int setting)
     else if (setting == 3) wait_watchdog_enabled_ = !wait_watchdog_enabled_;
     else if (setting == 4) gpu_hang_dump_enabled_ = !gpu_hang_dump_enabled_;
     else if (setting == 8) download_fastest_ = !download_fastest_;
+    else if (setting == 9) download_connections_ = download_connections_ == 4 ? 1 : download_connections_ == 1 ? 2 : 4;
     else return;
 
     if (setting == 0) (void)persist_settings_locked();
@@ -2518,7 +2523,8 @@ bool SteamQrAuth::persist_runtime_settings_locked()
             ? wine_debug_level_ : "profile") +
         "\nwait_watchdog=" + std::to_string(wait_watchdog_enabled_ ? 1 : 0) +
         "\ngpu_hang_report=" + std::to_string(gpu_hang_dump_enabled_ ? 1 : 0) +
-        "\ndownload_server=" + (download_fastest_ ? "fastest" : "steam") + "\n";
+        "\ndownload_server=" + (download_fastest_ ? "fastest" : "steam") +
+        "\ndownload_connections=" + std::to_string(download_connections_) + "\n";
     return storage.WriteAtomicPrivate("settings.conf", playden::Bytes(text.begin(), text.end())).ok();
 }
 
