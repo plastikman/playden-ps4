@@ -253,6 +253,29 @@ int EditTextWithSystemKeyboard(int user_id, const char *title_ascii, const char 
     settings.placeholder = reinterpret_cast<const wchar_t *>(placeholder);
     settings.title = reinterpret_cast<const wchar_t *>(title);
     int init_result = sceImeDialogInit(&settings, nullptr);
+    // A keyboard opened right after another one (the password after the account name) was refused with
+    // 0x80bc0008 on 02.11 while the first was still closing: wait for it, up to two seconds.
+    for (int tries = 0; init_result == static_cast<int>(0x80bc0008) && tries < 20; ++tries) {
+        usleep(100000);
+        init_result = sceImeDialogInit(&settings, nullptr);
+        if (init_result >= 0 || tries == 19) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "keyboard init after %d waits rc=0x%08x", tries + 1,
+                          static_cast<unsigned>(init_result));
+            LogNetworkLine(line);
+        }
+    }
+    if (init_result < 0 && (option & kImePassword)) {
+        // Still refused: the hidden-text option may be what this firmware rejects. Ask without it
+        // rather than not at all, and say so in the log.
+        settings.option = option & ~kImePassword;
+        const int hidden = init_result;
+        init_result = sceImeDialogInit(&settings, nullptr);
+        char line[112];
+        std::snprintf(line, sizeof(line), "keyboard init rc=0x%08x; without the password option rc=0x%08x",
+                      static_cast<unsigned>(hidden), static_cast<unsigned>(init_result));
+        LogNetworkLine(line);
+    }
     if (init_result < 0) {
         // Retry with the settings the receiver-IP keyboard uses, which open on this console.
         const int first = init_result;
