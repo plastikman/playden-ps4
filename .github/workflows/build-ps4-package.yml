@@ -114,6 +114,7 @@ jobs:
 
       - name: Build PLDN10001
         env:
+          GH_TOKEN: ${{ github.token }}   # prepare-orbis-win.sh downloads the Orbis-Win release
           ORBIS_WIN_ROOT: ${{ github.workspace }}/orbis-win
           PS4_PKGTOOL_OPENSSL_LIB: /orbis-cache/deps/openssl11/lib
           OUT: ${{ runner.temp }}/playden-artifacts
