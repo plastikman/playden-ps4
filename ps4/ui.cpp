@@ -833,7 +833,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 ? (details[0] ? details : "Checking Steam install options…")
                 : install_state == 3 ? install
                 : install_state == 1 ? install
-                : install_state == 4 ? "QUEUED  ·  STARTS AFTER THE CURRENT DOWNLOAD"
+                : install_state == 5 ? "ONE DOWNLOAD AT A TIME  ·  WAIT FOR THE CURRENT ONE TO FINISH"
                 : incomplete ? "INCOMPLETE  ·  CROSS TO RESUME"
                 : !installed ? "NOT INSTALLED  ·  CROSS TO INSTALL"
                 : playden_ps4_game_details_update() ? "UPDATE AVAILABLE  ·  CROSS TO UPDATE"
@@ -915,7 +915,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             const char *detail_hint = details_state != 2 ? "CIRCLE  BACK TO LIBRARY" :
                 uninstall_for_game && uninstall_state == 1 ? "REMOVING GAME FILES…" :
                 install_state == 1 ? "INSTALL IN PROGRESS     LEFT / RIGHT  SECTIONS" :
-                install_state == 4 ? "QUEUED: SEE THE QUEUE TAB     CIRCLE  BACK TO LIBRARY" :
+                install_state == 5 ? "ANOTHER GAME IS DOWNLOADING     CIRCLE  BACK TO LIBRARY" :
                 !installed ? "CROSS  INSTALL     CIRCLE  BACK TO LIBRARY" :
                 installed && playden_ps4_game_details_update()
                     ? "CROSS  UPDATE     TRIANGLE  SETTINGS     OPTIONS  MAINTENANCE     SQUARE  DELETE     CIRCLE  BACK" :
@@ -1270,7 +1270,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             const int state = playden_ps4_queue_state();
             const std::uint32_t app = playden_ps4_queue_app_id();
             const int waiting = static_cast<int>(playden_ps4_queue_waiting_count());
-            const std::size_t updates = playden_ps4_update_count();
+            const std::size_t updates = 0;   // one download at a time: no Update all
             const char *status = state == 1 ? "DOWNLOADING" :
                                  state == 2 ? "LAST DOWNLOAD COMPLETE" :
                                  state == 3 ? "LAST DOWNLOAD NEEDS ATTENTION" : "DOWNLOAD QUEUE";

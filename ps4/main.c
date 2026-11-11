@@ -333,7 +333,7 @@ int playden_ps4_main(int argc, char **argv) {
             }
             /* Maintenance: check and repair, save backups, prefix reset. */
             if ((pressed & ORBIS_PAD_BUTTON_OPTIONS) && playden_ps4_game_details_installed() &&
-                playden_ps4_game_details_state() == 2 && playden_ps4_game_install_state() != 1) {
+                playden_ps4_game_details_state() == 2 && playden_ps4_game_install_state() != 1 && playden_ps4_game_install_state() != 5) {
                 page = 10;
                 delete_choice = 0;
                 playden_ps4_maintenance_armed = 0;
@@ -342,7 +342,7 @@ int playden_ps4_main(int argc, char **argv) {
             if ((pressed & ORBIS_PAD_BUTTON_CROSS) &&
                 playden_ps4_game_uninstall_state() != 1 &&
                 playden_ps4_game_details_state() == 2 &&
-                playden_ps4_game_install_state() != 1) {
+                playden_ps4_game_install_state() != 1 && playden_ps4_game_install_state() != 5) {
                 if (!playden_ps4_game_details_installed() && !playden_ps4_game_details_incomplete() &&
                     playden_ps4_install_sheet_open(detail_app_id)) {
                     /* Not installed: the install sheet (version, language, sizes) first. */
@@ -768,7 +768,7 @@ int playden_ps4_main(int argc, char **argv) {
                                           tab == 3 ? (installed_games > 0 ? installed_games - 1 : 0) :
                                           tab == 4 ? 9 :
                                           tab == 2 ? (int)playden_ps4_queue_waiting_count() +
-                                                     (playden_ps4_update_count() > 0 ? 1 : 0) : 0;
+                                                     0 : 0;
                 if ((pressed & ORBIS_PAD_BUTTON_DOWN) && selected < max_selection) { ++selected; changed = 1; }
                 /* Library search and sort from the views menu too. */
                 if (tab == 1 && (pressed & (ORBIS_PAD_BUTTON_TRIANGLE | ORBIS_PAD_BUTTON_R1))) {
@@ -803,8 +803,6 @@ int playden_ps4_main(int argc, char **argv) {
                     else if (selected >= 1 && selected <= waiting) {
                         playden_ps4_queue_remove((size_t)(selected - 1));
                         if (selected > (int)playden_ps4_queue_waiting_count()) --selected;
-                    } else if (selected == waiting + 1 && playden_ps4_update_count() > 0) {
-                        playden_ps4_queue_all_updates();
                     }
                     changed = 1;
                 } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 3) {

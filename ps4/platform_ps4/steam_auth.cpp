@@ -1935,14 +1935,10 @@ int SteamQrAuth::details_install_state() const
         const std::lock_guard<std::mutex> guard(details_mutex_);
         app = details_app_id_;
     }
-    {
-        const std::lock_guard<std::mutex> guard(install_mutex_);
-        if (install_app_id_ == app) return install_state_;
-    }
-    const std::lock_guard<std::mutex> guard(queue_mutex_);
-    for (const auto &queued : install_queue_)
-        if (queued.first == app) return 4;
-    return 0;
+    const std::lock_guard<std::mutex> guard(install_mutex_);
+    if (install_app_id_ == app) return install_state_;
+    // 5: another game is downloading; one download at a time.
+    return install_state_ == 1 ? 5 : 0;
 }
 
 std::size_t SteamQrAuth::update_count() const
@@ -1987,7 +1983,7 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id, int mode)
             const std::lock_guard<std::mutex> guard(install_mutex_);
             busy = install_state_ == 1 && install_app_id_ != app_id;
         }
-        if (busy && !verify) {
+        if (busy) {
             if (!repair) {
                 const std::lock_guard<std::mutex> sheet_guard(details_mutex_);
                 if (sheet_.app_id == app_id) {
@@ -1998,7 +1994,8 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id, int mode)
                     SaveInstallChoice(app_id, options);
                 }
             }
-            queue_install(app_id, repair);
+            // One download at a time on the PS4 (Zak, 2026-11-10): nothing is queued; the page says to wait.
+            LogNetworkLine("install app=" + std::to_string(app_id) + " result=refused reason=another-download");
             return;
         }
     }
