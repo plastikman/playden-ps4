@@ -1332,13 +1332,23 @@ std::vector<SteamQrAuth::HomeShelf> SteamQrAuth::home_shelves_locked() const
     });
     if (played.indices.size() > kShelfLimit) played.indices.resize(kShelfLimit);
     if (!played.indices.empty()) shelves.push_back(std::move(played));
-    // Downloading: the one install job the PS4 runs.
-    if (const auto active = active_install_app_.load(); active != 0)
-        for (std::size_t i = 0; i < games_.size(); ++i)
-            if (games_[i].id.steam_app().value_or(0) == active) {
-                shelves.push_back({"DOWNLOADING", {i}});
-                break;
-            }
+    // Downloading: the running install, then the queue in order.
+    {
+        std::vector<std::uint32_t> apps;
+        if (const auto active = active_install_app_.load(); active != 0) apps.push_back(active);
+        {
+            const std::lock_guard<std::mutex> guard(queue_mutex_);
+            for (const auto &queued : install_queue_) apps.push_back(queued.first);
+        }
+        HomeShelf downloading{"DOWNLOADING", {}};
+        for (const auto app : apps)
+            for (std::size_t i = 0; i < games_.size(); ++i)
+                if (games_[i].id.steam_app().value_or(0) == app) {
+                    downloading.indices.push_back(i);
+                    break;
+                }
+        if (!downloading.indices.empty()) shelves.push_back(std::move(downloading));
+    }
     // Recently installed: newest install record first.
     HomeShelf installed{"RECENTLY INSTALLED", {}};
     std::vector<std::pair<std::int64_t, std::size_t>> dated;
@@ -1865,19 +1875,128 @@ void SteamQrAuth::start_game_verify(std::uint32_t app_id)
     start_game_install(app_id);
 }
 
-void SteamQrAuth::start_game_install(std::uint32_t app_id)
+bool SteamQrAuth::queue_install(std::uint32_t app_id, bool update)
+{
+    if (app_id == 0) return false;
+    {
+        const std::lock_guard<std::mutex> guard(queue_mutex_);
+        for (const auto &queued : install_queue_)
+            if (queued.first == app_id) return true;
+        install_queue_.emplace_back(app_id, update);
+    }
+    LogNetworkLine("install app=" + std::to_string(app_id) + " step=queued update=" + (update ? "1" : "0"));
+    return true;
+}
+
+void SteamQrAuth::pump_install_queue()
+{
+    {
+        const std::lock_guard<std::mutex> guard(install_mutex_);
+        if (install_state_ == 1) return;
+    }
+    std::pair<std::uint32_t, bool> next{0, false};
+    {
+        const std::lock_guard<std::mutex> guard(queue_mutex_);
+        if (install_queue_.empty()) return;
+        next = install_queue_.front();
+        install_queue_.pop_front();
+    }
+    start_game_install(next.first, next.second ? 2 : 1);
+}
+
+std::size_t SteamQrAuth::queued_count() const
+{
+    const std::lock_guard<std::mutex> guard(queue_mutex_);
+    return install_queue_.size();
+}
+
+std::uint32_t SteamQrAuth::queued_app(std::size_t index) const
+{
+    const std::lock_guard<std::mutex> guard(queue_mutex_);
+    return index < install_queue_.size() ? install_queue_[index].first : 0;
+}
+
+bool SteamQrAuth::unqueue(std::size_t index)
+{
+    const std::lock_guard<std::mutex> guard(queue_mutex_);
+    if (index >= install_queue_.size()) return false;
+    install_queue_.erase(install_queue_.begin() + static_cast<std::ptrdiff_t>(index));
+    return true;
+}
+
+int SteamQrAuth::details_install_state() const
+{
+    std::uint32_t app = 0;
+    {
+        const std::lock_guard<std::mutex> guard(details_mutex_);
+        app = details_app_id_;
+    }
+    {
+        const std::lock_guard<std::mutex> guard(install_mutex_);
+        if (install_app_id_ == app) return install_state_;
+    }
+    const std::lock_guard<std::mutex> guard(queue_mutex_);
+    for (const auto &queued : install_queue_)
+        if (queued.first == app) return 4;
+    return 0;
+}
+
+std::size_t SteamQrAuth::update_count() const
+{
+    const std::lock_guard<std::mutex> guard(updates_mutex_);
+    return updates_.size();
+}
+
+int SteamQrAuth::queue_all_updates()
+{
+    std::vector<std::uint32_t> apps;
+    {
+        const std::lock_guard<std::mutex> guard(updates_mutex_);
+        apps.assign(updates_.begin(), updates_.end());
+    }
+    int queued = 0;
+    for (const auto app : apps)
+        if (HasInstalledRecord(app) && queue_install(app, true)) ++queued;
+    return queued;
+}
+
+void SteamQrAuth::start_game_install(std::uint32_t app_id, int mode)
 {
     if (app_id == 0) return;
     bool repair = false, verify = false;
     {
         const std::lock_guard<std::mutex> guard(details_mutex_);
-        verify = verify_requested_ == app_id;
-        verify_requested_ = 0;
+        verify = mode == 0 && verify_requested_ == app_id;
+        if (mode == 0) verify_requested_ = 0;
         // An update downloads the changed files beside the game, then swaps them in (the shared UpdateApp).
         // Only a game with an install record can be updated or repaired: a first download cut short has
         // none yet, and resumes as an install (UpdateApp refuses it: "update without install").
-        repair = verify || (details_app_id_ == app_id && (details_incomplete_ || details_update_) &&
-                            HasInstalledRecord(app_id));
+        repair = verify || (HasInstalledRecord(app_id) &&
+                            (mode == 2 || (mode == 0 && details_app_id_ == app_id &&
+                                           (details_incomplete_ || details_update_))));
+    }
+    // Another game is downloading: this one waits its turn. A first install keeps the sheet's choice now,
+    // since the sheet may show another game by the time this one starts.
+    {
+        bool busy = false;
+        {
+            const std::lock_guard<std::mutex> guard(install_mutex_);
+            busy = install_state_ == 1 && install_app_id_ != app_id;
+        }
+        if (busy && !verify) {
+            if (!repair) {
+                const std::lock_guard<std::mutex> sheet_guard(details_mutex_);
+                if (sheet_.app_id == app_id) {
+                    playden::steam::InstallOptions options;
+                    if (!sheet_.offers.empty() && sheet_.offers[sheet_.branch].name != "public")
+                        options.branch = sheet_.offers[sheet_.branch].name;
+                    if (!sheet_.languages.empty()) options.language = sheet_.languages[sheet_.language];
+                    SaveInstallChoice(app_id, options);
+                }
+            }
+            queue_install(app_id, repair);
+            return;
+        }
     }
     if (HasInstalledRecord(app_id) && !repair)
     {
@@ -1898,7 +2017,7 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
     }
     const std::string install_root = GameInstallRoot(app_id);
     std::string unavailable_reason;
-    {
+    if (mode == 0) {
         const std::lock_guard<std::mutex> guard(details_mutex_);
         if (details_app_id_ != app_id || details_state_ != 2)
             unavailable_reason = "Steam install details are still loading. Open the game again and retry.";
@@ -2952,6 +3071,7 @@ std::string SteamQrAuth::account_name() const { return account_name_; }
 bool SteamQrAuth::poll()
 {
     bool changed = false;
+    pump_install_queue();
     if (store_details_service_ != nullptr)
     {
         for (auto &details : store_details_service_->Pump())
@@ -3425,7 +3545,7 @@ extern "C" int playden_ps4_game_prepare_steamworks(std::uint32_t app_id)
 {
     return auth().prepare_game_steamworks(app_id) ? 1 : 0;
 }
-extern "C" int playden_ps4_game_install_state() { return auth().game_install_state(); }
+extern "C" int playden_ps4_game_install_state() { return auth().details_install_state(); }
 extern "C" void playden_ps4_game_uninstall_start(std::uint32_t app_id) { auth().start_game_uninstall(app_id); }
 extern "C" int playden_ps4_game_uninstall_state() { return auth().game_uninstall_state(); }
 extern "C" std::uint32_t playden_ps4_game_uninstall_app_id() { return auth().game_uninstall_app_id(); }
@@ -3442,6 +3562,11 @@ extern "C" const char *playden_ps4_game_install_message()
     return detail.c_str();
 }
 extern "C" std::uint32_t playden_ps4_queue_app_id() { return auth().queue_app_id(); }
+extern "C" std::size_t playden_ps4_queue_waiting_count() { return auth().queued_count(); }
+extern "C" std::uint32_t playden_ps4_queue_waiting_app(std::size_t index) { return auth().queued_app(index); }
+extern "C" int playden_ps4_queue_remove(std::size_t index) { return auth().unqueue(index) ? 1 : 0; }
+extern "C" std::size_t playden_ps4_update_count() { return auth().update_count(); }
+extern "C" int playden_ps4_queue_all_updates() { return auth().queue_all_updates(); }
 extern "C" int playden_ps4_queue_state() { return auth().game_install_state(); }
 extern "C" void playden_ps4_queue_cancel() { auth().cancel_game_install(); }
 extern "C" const char *playden_ps4_queue_message()

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <deque>
 #include <set>
 #include <cstdint>
 #include <memory>
@@ -93,7 +94,20 @@ class SteamQrAuth
     std::string game_store_metacritic_score() const;
     std::string game_store_controller_support() const;
     bool game_store_windows_supported() const;
-    void start_game_install(std::uint32_t app_id);
+    // mode 0: from the game's details (as before); 1: a queued first install; 2: a queued update. Queued
+    // jobs don't need the details page loaded.
+    void start_game_install(std::uint32_t app_id, int mode = 0);
+    // The download queue in front of the one install the PS4 runs: a job asked for while another runs
+    // waits here; poll() starts the next when the current one ends.
+    bool queue_install(std::uint32_t app_id, bool update);
+    void pump_install_queue();
+    std::size_t queued_count() const;
+    std::uint32_t queued_app(std::size_t index) const;
+    bool unqueue(std::size_t index);
+    std::size_t update_count() const;
+    // The install state for the game on the details page: 0 when the job belongs to another game, 4 queued.
+    int details_install_state() const;
+    int queue_all_updates();
     bool prepare_game_steamworks(std::uint32_t app_id);
     int game_install_state() const;
     std::string game_install_message() const;
@@ -180,6 +194,8 @@ private:
     std::atomic<bool> updates_cancel_{false};
     mutable std::mutex updates_mutex_;
     std::set<std::uint32_t> updates_;
+    mutable std::mutex queue_mutex_;   // only install_queue_; never held while taking another lock
+    std::deque<std::pair<std::uint32_t, bool>> install_queue_;   // app, update
     bool updates_started_ = false;
     void start_update_check(std::vector<std::uint32_t> installed);
   public:

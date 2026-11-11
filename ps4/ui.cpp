@@ -106,6 +106,9 @@ extern "C" int playden_ps4_game_install_state();
 extern "C" const char *playden_ps4_game_install_message();
 extern "C" std::uint32_t playden_ps4_queue_app_id();
 extern "C" int playden_ps4_queue_state();
+extern "C" std::size_t playden_ps4_queue_waiting_count();
+extern "C" std::uint32_t playden_ps4_queue_waiting_app(std::size_t index);
+extern "C" std::size_t playden_ps4_update_count();
 extern "C" const char *playden_ps4_queue_message();
 extern "C" int playden_ps4_saves_state();
 extern "C" std::uint32_t playden_ps4_saves_app_id();
@@ -829,6 +832,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 ? (details[0] ? details : "Checking Steam install options…")
                 : install_state == 3 ? install
                 : install_state == 1 ? install
+                : install_state == 4 ? "QUEUED  ·  STARTS AFTER THE CURRENT DOWNLOAD"
                 : incomplete ? "INCOMPLETE  ·  CROSS TO RESUME"
                 : !installed ? "NOT INSTALLED  ·  CROSS TO INSTALL"
                 : playden_ps4_game_details_update() ? "UPDATE AVAILABLE  ·  CROSS TO UPDATE"
@@ -910,6 +914,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             const char *detail_hint = details_state != 2 ? "CIRCLE  BACK TO LIBRARY" :
                 uninstall_for_game && uninstall_state == 1 ? "REMOVING GAME FILES…" :
                 install_state == 1 ? "INSTALL IN PROGRESS     LEFT / RIGHT  SECTIONS" :
+                install_state == 4 ? "QUEUED: SEE THE QUEUE TAB     CIRCLE  BACK TO LIBRARY" :
                 !installed ? "CROSS  INSTALL     CIRCLE  BACK TO LIBRARY" :
                 installed && playden_ps4_game_details_update()
                     ? "CROSS  UPDATE     TRIANGLE  SETTINGS     OPTIONS  MAINTENANCE     SQUARE  DELETE     CIRCLE  BACK" :
@@ -1258,30 +1263,62 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
     }
     else if (page == 0 && tab == 2)
     {
-        list.rounded_rect({510, 272, 1304, 542}, 16, panel);
+        list.rounded_rect({510, 200, 1304, 700}, 16, panel);
         if (font_ready)
         {
             const int state = playden_ps4_queue_state();
             const std::uint32_t app = playden_ps4_queue_app_id();
-            const char *status = state == 1 ? "DOWNLOAD IN PROGRESS" :
+            const int waiting = static_cast<int>(playden_ps4_queue_waiting_count());
+            const std::size_t updates = playden_ps4_update_count();
+            const char *status = state == 1 ? "DOWNLOADING" :
                                  state == 2 ? "LAST DOWNLOAD COMPLETE" :
                                  state == 3 ? "LAST DOWNLOAD NEEDS ATTENTION" : "DOWNLOAD QUEUE";
-            list.text(font, 0, status, 590, 350, 22, accent);
-            if (app != 0)
+            list.text(font, 0, status, 590, 262, 22, accent);
+            // Row 0: the running (or last) job.
             {
-                const char *title = playden_ps4_library_title_by_app_id(app);
-                list.text(font, 0, title[0] ? title : "Game", 590, 410, 24, ink);
+                const Rect row{590, 284, 1144, 112};
+                if (selected == 0 && state == 1)
+                    list.bordered_rect(row, 9, Color::rgb(0xf0863a, 0.12F), 1.5F, accent);
+                else
+                    list.rounded_rect(row, 9, bg);
+                const char *title = app ? playden_ps4_library_title_by_app_id(app) : "";
+                list.text(font, 0, font.fit(title[0] ? title : "Nothing downloading", 24, 1100), 614, 326, 24, ink);
+                const char *message = playden_ps4_queue_message();
+                list.text(font, 0, font.fit(state == 0 ? "No download has been started this session." : message, 18, 1100),
+                          614, 368, 18, secondary);
             }
-            const char *message = playden_ps4_queue_message();
-            list.text(font, 0, state == 0 ? "No download has been started this session." : message,
-                      590, 466, 22, secondary);
-            if (state == 1)
+            list.text(font, 0, waiting > 0 ? "WAITING" : "WAITING  ·  NONE", 590, 440, 20, secondary);
+            constexpr int kVisible = 5;
+            const int first = std::max(0, std::min(selected - 1 - kVisible / 2, waiting - kVisible));
+            for (int i = 0; i < kVisible && first + i < waiting; ++i)
             {
-                list.bordered_rect({590, 570, 390, 64}, 9, bg, 2.0F, Color::rgb(0xf3efe9, 0.25F));
-                list.text(font, 0, "CANCEL DOWNLOAD", 785, 610, 22, ink, Align::center);
+                const int index = first + i;
+                const float y = 456.0F + static_cast<float>(i) * 62.0F;
+                const Rect row{590, y, 1144, 52};
+                if (selected == index + 1)
+                    list.bordered_rect(row, 8, Color::rgb(0xf0863a, 0.12F), 1.5F, accent);
+                else
+                    list.rounded_rect(row, 8, bg);
+                const char *title = playden_ps4_library_title_by_app_id(
+                    playden_ps4_queue_waiting_app(static_cast<std::size_t>(index)));
+                list.text(font, 0, std::to_string(index + 1) + ".  " + (title[0] ? title : "Game"), 614, y + 34, 20,
+                          selected == index + 1 ? ink : secondary);
             }
-            hint_text(list, font, state == 1 ? "CROSS  CANCEL     LEFT / RIGHT  SECTIONS" :
-                      "LEFT / RIGHT  SECTIONS",
+            if (updates > 0)
+            {
+                const Rect row{590, 786, 1144, 56};
+                if (selected == waiting + 1)
+                    list.bordered_rect(row, 8, Color::rgb(0xf0863a, 0.16F), 1.5F, accent);
+                else
+                    list.rounded_rect(row, 8, bg);
+                list.text(font, 0, "UPDATE ALL  ·  " + std::to_string(updates) + (updates == 1 ? " GAME" : " GAMES"),
+                          614, 822, 21, accent);
+            }
+            hint_text(list, font,
+                      selected == 0 && state == 1 ? "UP / DOWN  CHOOSE     CROSS  CANCEL DOWNLOAD     LEFT / RIGHT  SECTIONS" :
+                      selected >= 1 && selected <= waiting ? "UP / DOWN  CHOOSE     CROSS  REMOVE FROM QUEUE     LEFT / RIGHT  SECTIONS" :
+                      selected == waiting + 1 && updates > 0 ? "UP / DOWN  CHOOSE     CROSS  QUEUE EVERY UPDATE     LEFT / RIGHT  SECTIONS" :
+                      "UP / DOWN  CHOOSE     LEFT / RIGHT  SECTIONS",
                       96, 970, 17, secondary);
         }
     }

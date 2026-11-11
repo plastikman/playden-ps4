@@ -98,6 +98,10 @@ uint32_t playden_ps4_collection_app_id = 0;
 int playden_ps4_home_shelf = 0;
 size_t playden_ps4_home_shelf_count(void);
 int playden_ps4_library_collection_pin_toggle(size_t index);
+size_t playden_ps4_queue_waiting_count(void);
+int playden_ps4_queue_remove(size_t index);
+size_t playden_ps4_update_count(void);
+int playden_ps4_queue_all_updates(void);
 static int library_filter(int tab, int row) { return tab == 0 ? 3000 + playden_ps4_home_shelf : 1000 + row; }
 const char *playden_ps4_auth_failure(void);
 
@@ -692,7 +696,9 @@ int playden_ps4_main(int argc, char **argv) {
                 const int max_selection = tab == 1 ? library_rows - (steam_connected ? 1 : 0) : tab == 3 && saves_state == 3 ? 2 :
                                           tab == 3 && saves_state == 1 ? 0 :
                                           tab == 3 ? (installed_games > 0 ? installed_games - 1 : 0) :
-                                          tab == 4 ? 8 : 0;
+                                          tab == 4 ? 8 :
+                                          tab == 2 ? (int)playden_ps4_queue_waiting_count() +
+                                                     (playden_ps4_update_count() > 0 ? 1 : 0) : 0;
                 if ((pressed & ORBIS_PAD_BUTTON_DOWN) && selected < max_selection) { ++selected; changed = 1; }
                 /* Library search and sort from the views menu too. */
                 if (tab == 1 && (pressed & (ORBIS_PAD_BUTTON_TRIANGLE | ORBIS_PAD_BUTTON_R1))) {
@@ -720,9 +726,16 @@ int playden_ps4_main(int argc, char **argv) {
                         selected = 1;
                     }
                     changed = 1;
-                } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 2 &&
-                           playden_ps4_queue_state() == 1) {
-                    playden_ps4_queue_cancel();
+                } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 2) {
+                    /* Row 0: the running download (cancel); then the waiting games (remove); then Update all. */
+                    const int waiting = (int)playden_ps4_queue_waiting_count();
+                    if (selected == 0 && playden_ps4_queue_state() == 1) playden_ps4_queue_cancel();
+                    else if (selected >= 1 && selected <= waiting) {
+                        playden_ps4_queue_remove((size_t)(selected - 1));
+                        if (selected > (int)playden_ps4_queue_waiting_count()) --selected;
+                    } else if (selected == waiting + 1 && playden_ps4_update_count() > 0) {
+                        playden_ps4_queue_all_updates();
+                    }
                     changed = 1;
                 } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 3) {
                     if (saves_state == 3) {
