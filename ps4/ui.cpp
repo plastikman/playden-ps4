@@ -71,7 +71,11 @@ extern "C" int playden_ps4_maintenance_armed;
 // The game the collection picker (page 9) is for; main.c sets it when the picker opens.
 extern "C" std::uint32_t playden_ps4_collection_app_id;
 // The Library tab's views (Home uses 0: the installed list, unsearched); main.c has the same rule.
-static int library_filter(int tab, int row) { return tab == 0 ? 0 : 1000 + row; }
+extern "C" int playden_ps4_home_shelf;
+extern "C" std::size_t playden_ps4_home_shelf_count();
+extern "C" const char *playden_ps4_home_shelf_title(std::size_t shelf);
+extern "C" int playden_ps4_library_collection_pinned(std::size_t index);
+static int library_filter(int tab, int row) { return tab == 0 ? 3000 + playden_ps4_home_shelf : 1000 + row; }
 extern "C" const char *playden_ps4_library_detail();
 extern "C" int playden_ps4_game_details_state();
 extern "C" int playden_ps4_game_details_installed();
@@ -1237,13 +1241,17 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 list.text(font, 0, font.fit(label, 21, 640), 586, y + 36, 21,
                           on ? accent : row == delete_choice ? ink : secondary);
                 if (row < count)
-                    list.text(font, 0, std::to_string(playden_ps4_library_collection_size(static_cast<std::size_t>(row))),
-                              1336, y + 36, 18, secondary, Align::right);
+                {
+                    const bool pinned = playden_ps4_library_collection_pinned(static_cast<std::size_t>(row)) != 0;
+                    list.text(font, 0, (pinned ? std::string("ON HOME  ·  ") : std::string()) +
+                                           std::to_string(playden_ps4_library_collection_size(static_cast<std::size_t>(row))),
+                              1336, y + 36, 18, pinned ? accent : secondary, Align::right);
+                }
             }
             if (count == 0)
                 list.text(font, 0, "No collections yet. Make one, then add games to it.", 560, 850, 18, secondary);
             hint_text(list, font,
-                      delete_choice < count ? "UP / DOWN  CHOOSE     CROSS  ADD / REMOVE     SQUARE  DELETE COLLECTION     CIRCLE  BACK"
+                      delete_choice < count ? "UP / DOWN  CHOOSE     CROSS  ADD / REMOVE     TRIANGLE  PIN TO HOME     SQUARE  DELETE     CIRCLE  BACK"
                                             : "UP / DOWN  CHOOSE     CROSS  NEW COLLECTION     CIRCLE  BACK",
                       96, 970, 17, secondary);
         }
@@ -1432,71 +1440,77 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
     }
     else if (page == 0)
     {
-        const std::size_t installed_count = playden_ps4_library_visible_count(0);
+        const std::size_t shelf_count = playden_ps4_home_shelf_count();
+        const std::size_t installed_count = shelf_count;
         const int queue_state = playden_ps4_queue_state();
         if (font_ready)
         {
-            list.text(font, 0, "CONTINUE PLAYING", 96, 250, 24, accent);
-            if (installed_count == 0)
+            if (shelf_count == 0)
             {
+                list.text(font, 0, "HOME", 96, 250, 24, accent);
                 list.rounded_rect({96, 278, 1728, 360}, 16, panel);
-                list.text(font, 0, "NO INSTALLED GAMES", 150, 425, 34, ink);
-                list.text(font, 0, "Install a game from your Steam library to see it here.",
+                list.text(font, 0, "NOTHING HERE YET", 150, 425, 34, ink);
+                list.text(font, 0, "Games you play, install or favorite show up here. Press Cross to browse the Library.",
                           150, 474, 21, secondary);
             }
             else
             {
-                constexpr std::size_t kHomePageSize = 7;
-                const std::size_t selected_index = game_focus
-                    ? static_cast<std::size_t>(std::max(game_selected, 0)) : 0;
-                const std::size_t first = selected_index >= kHomePageSize
-                    ? selected_index - kHomePageSize + 1 : 0;
-                const std::size_t visible = std::min(kHomePageSize, installed_count - first);
-                for (std::size_t i = 0; i < visible; ++i)
+                // Two shelves at a time; the focused one stays on screen.
+                constexpr std::size_t kShelfCovers = 9;
+                const std::size_t focus_shelf = game_focus
+                    ? std::min<std::size_t>(static_cast<std::size_t>(std::max(playden_ps4_home_shelf, 0)), shelf_count - 1) : 0;
+                const std::size_t first_shelf = focus_shelf > 0 ? focus_shelf - 1 : 0;
+                for (std::size_t s = first_shelf; s < shelf_count && s < first_shelf + 2; ++s)
                 {
-                    const std::size_t index = first + i;
-                    const float x = 96.0F + static_cast<float>(i) * 244.0F;
-                    const Rect cover{x, 278, 220, 310};
-                    const std::uint32_t app_id = playden_ps4_library_visible_app_id(0, index);
-                    const std::string title = playden_ps4_library_visible_title(0, index);
-                    const auto game_id = playden::GameId::Steam(app_id);
-                    const std::uint32_t texture = art.cache.TextureFor(
-                        game_id, playden::homebrew::CoverUrl(game_id));
-                    const bool focused = game_focus && index == selected_index;
-                    list.rounded_rect({cover.x - 4, cover.y - 4, cover.w + 8, cover.h + 8}, 11,
-                                      focused ? accent : Color::rgb(0x292521));
-                    list.rounded_rect(cover, 7, Color::rgb(0x292521));
-                    if (texture != 0)
-                        list.image(texture, cover, kFullUv, Color::rgb(0xffffff), 7);
-                    else
+                    const float top = 236.0F + static_cast<float>(s - first_shelf) * 352.0F;
+                    const int filter = 3000 + static_cast<int>(s);
+                    const std::size_t count = playden_ps4_library_visible_count(filter);
+                    const bool shelf_focused = game_focus && s == focus_shelf;
+                    std::string heading = playden_ps4_home_shelf_title(s);
+                    if (heading == "DOWNLOADING" && queue_state == 1)
+                        heading += std::string("  ·  ") + playden_ps4_queue_message();
+                    list.text(font, 0, font.fit(heading, 22, 1728), 96, top, 22, shelf_focused ? accent : secondary);
+                    const std::size_t selected_index = shelf_focused
+                        ? static_cast<std::size_t>(std::max(game_selected, 0)) : 0;
+                    const std::size_t first = selected_index >= kShelfCovers ? selected_index - kShelfCovers + 1 : 0;
+                    const std::size_t visible = std::min(kShelfCovers, count - std::min(first, count));
+                    for (std::size_t i = 0; i < visible; ++i)
                     {
-                        list.gradient_rect(cover, 7, Color::rgb(0x34302b), Color::rgb(0x1a1816));
-                        list.rounded_rect({cover.x + 86, cover.y + 152, 48, 4}, 2, accent);
+                        const std::size_t index = first + i;
+                        const float x = 96.0F + static_cast<float>(i) * 192.0F;
+                        const Rect cover{x, top + 22, 172, 242};
+                        const std::uint32_t app_id = playden_ps4_library_visible_app_id(filter, index);
+                        const std::string title = playden_ps4_library_visible_title(filter, index);
+                        const auto game_id = playden::GameId::Steam(app_id);
+                        const std::uint32_t texture = art.cache.TextureFor(
+                            game_id, playden::homebrew::CoverUrl(game_id));
+                        const bool focused = shelf_focused && index == selected_index;
+                        list.rounded_rect({cover.x - 4, cover.y - 4, cover.w + 8, cover.h + 8}, 11,
+                                          focused ? accent : Color::rgb(0x292521));
+                        list.rounded_rect(cover, 7, Color::rgb(0x292521));
+                        if (texture != 0)
+                            list.image(texture, cover, kFullUv, Color::rgb(0xffffff), 7);
+                        else
+                        {
+                            list.gradient_rect(cover, 7, Color::rgb(0x34302b), Color::rgb(0x1a1816));
+                            list.rounded_rect({cover.x + 62, cover.y + 119, 48, 4}, 2, accent);
+                        }
+                        list.gradient_rect({cover.x, cover.y + cover.h - 52, cover.w, 52}, 7,
+                                           Color::rgb(0x0a0908, 0.0F), Color::rgb(0x0a0908, 0.90F));
+                        list.text(font, 0, font.fit(title, 15, cover.w - 16), cover.x + 8,
+                                  cover.y + cover.h - 12, 15, ink);
+                        if (focused)
+                            list.bordered_rect({cover.x - 5, cover.y - 5, cover.w + 10, cover.h + 10},
+                                               12, Color::rgb(0, 0.0F), 3, accent);
                     }
-                    list.gradient_rect({cover.x, cover.y + cover.h - 58, cover.w, 58}, 7,
-                                       Color::rgb(0x0a0908, 0.0F), Color::rgb(0x0a0908, 0.90F));
-                    list.text(font, 0, font.fit(title, 17, cover.w - 20), cover.x + 10,
-                              cover.y + cover.h - 14, 17, ink);
-                    if (focused)
-                        list.bordered_rect({cover.x - 5, cover.y - 5, cover.w + 10, cover.h + 10},
-                                           12, Color::rgb(0, 0.0F), 3, accent);
                 }
             }
-            if (queue_state == 1)
-            {
-                const std::uint32_t queue_app = playden_ps4_queue_app_id();
-                const char *queue_title = playden_ps4_library_title_by_app_id(queue_app);
-                list.text(font, 0, "DOWNLOADING", 96, 700, 24, accent);
-                list.rounded_rect({96, 724, 1728, 112}, 12, panel);
-                list.text(font, 0, queue_title[0] ? queue_title : "Game download", 126, 770, 23, ink);
-                list.text(font, 0, playden_ps4_queue_message(), 126, 808, 18, secondary);
-            }
             if (game_focus && installed_count > 0)
-                hint_text(list, font, "LEFT / RIGHT  SELECT     CROSS  OPEN     SQUARE  FAVORITE     OPTIONS     CIRCLE  BACK",
+                hint_text(list, font, "ARROWS  SELECT     CROSS  OPEN     SQUARE  FAVORITE     OPTIONS     CIRCLE  BACK",
                           96, 970, 17, secondary);
             else
                 hint_text(list, font, installed_count > 0
-                              ? "CROSS  CONTINUE PLAYING     LEFT / RIGHT  SECTIONS"
+                              ? "CROSS  BROWSE HOME     LEFT / RIGHT  SECTIONS"
                               : "CROSS  BROWSE LIBRARY     LEFT / RIGHT  SECTIONS",
                           96, 970, 17, secondary);
         }

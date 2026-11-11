@@ -1257,11 +1257,18 @@ constexpr int kLibrarySortCount = static_cast<int>(sizeof(kLibrarySorts) / sizeo
 // Filter numbers: 0 is Home's installed list (no search, Steam's order). The Library tab passes
 // kLibraryView + its row: 0 Installed, 1 All games, 2 Favorites, 3 Hidden, then one row per collection.
 constexpr int kLibraryView = 1000;
+// Home: filter kHomeShelf + n is shelf n.
+constexpr int kHomeShelf = 3000;
 } // namespace
 
 std::vector<std::size_t> SteamQrAuth::visible_library_indices_locked(int filter) const
 {
     std::vector<std::size_t> indices;
+    if (filter >= kHomeShelf) {
+        auto shelves = home_shelves_locked();
+        const auto shelf = static_cast<std::size_t>(filter - kHomeShelf);
+        return shelf < shelves.size() ? std::move(shelves[shelf].indices) : indices;
+    }
     const bool library_view = filter >= kLibraryView;
     const int row = library_view ? filter - kLibraryView : filter;
     const std::size_t collections = organization_.collections.size();
@@ -1306,6 +1313,86 @@ std::vector<std::size_t> SteamQrAuth::visible_library_indices_locked(int filter)
         return a < b;
     });
     return indices;
+}
+
+std::vector<SteamQrAuth::HomeShelf> SteamQrAuth::home_shelves_locked() const
+{
+    std::vector<HomeShelf> shelves;
+    constexpr std::size_t kShelfLimit = 20;
+    const auto visible = [&](std::size_t i) {
+        const auto app = games_[i].id.steam_app();
+        return app && *app != 0 && !hidden_games_.contains(*app);
+    };
+    // Continue playing: anything played, latest first.
+    HomeShelf played{"CONTINUE PLAYING", {}};
+    for (std::size_t i = 0; i < games_.size(); ++i)
+        if (visible(i) && games_[i].playtime_minutes.value_or(0) > 0) played.indices.push_back(i);
+    std::stable_sort(played.indices.begin(), played.indices.end(), [&](std::size_t a, std::size_t b) {
+        return games_[a].last_played_unix_seconds.value_or(0) > games_[b].last_played_unix_seconds.value_or(0);
+    });
+    if (played.indices.size() > kShelfLimit) played.indices.resize(kShelfLimit);
+    if (!played.indices.empty()) shelves.push_back(std::move(played));
+    // Downloading: the one install job the PS4 runs.
+    if (const auto active = active_install_app_.load(); active != 0)
+        for (std::size_t i = 0; i < games_.size(); ++i)
+            if (games_[i].id.steam_app().value_or(0) == active) {
+                shelves.push_back({"DOWNLOADING", {i}});
+                break;
+            }
+    // Recently installed: newest install record first.
+    HomeShelf installed{"RECENTLY INSTALLED", {}};
+    std::vector<std::pair<std::int64_t, std::size_t>> dated;
+    for (const auto i : installed_games_) {
+        if (i >= games_.size() || !visible(i)) continue;
+        struct stat info {};
+        const auto record = GameInstallRoot(*games_[i].id.steam_app()) + "/" + playden::installs::kInstallRecordName;
+        dated.emplace_back(::stat(record.c_str(), &info) == 0 ? static_cast<std::int64_t>(info.st_mtime) : 0, i);
+    }
+    std::stable_sort(dated.begin(), dated.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    for (const auto &[when, i] : dated) installed.indices.push_back(i);
+    if (!installed.indices.empty()) shelves.push_back(std::move(installed));
+    HomeShelf favorites{"FAVORITES", {}};
+    for (std::size_t i = 0; i < games_.size(); ++i)
+        if (visible(i) && favorite_games_.contains(*games_[i].id.steam_app())) favorites.indices.push_back(i);
+    if (!favorites.indices.empty()) shelves.push_back(std::move(favorites));
+    for (const auto &collection : organization_.collections) {
+        if (!collection.pinned) continue;
+        HomeShelf shelf{collection.name, {}};
+        for (std::size_t i = 0; i < games_.size(); ++i)
+            if (visible(i) && collection.members.contains(games_[i].id)) shelf.indices.push_back(i);
+        if (!shelf.indices.empty()) shelves.push_back(std::move(shelf));
+    }
+    return shelves;
+}
+
+std::size_t SteamQrAuth::home_shelf_count() const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    return home_shelves_locked().size();
+}
+
+std::string SteamQrAuth::home_shelf_title(std::size_t shelf) const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    const auto shelves = home_shelves_locked();
+    return shelf < shelves.size() ? shelves[shelf].title : std::string();
+}
+
+bool SteamQrAuth::library_collection_pinned(std::size_t index) const
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    return index < organization_.collections.size() && organization_.collections[index].pinned;
+}
+
+bool SteamQrAuth::library_toggle_collection_pin(std::size_t index)
+{
+    const std::lock_guard<std::mutex> guard(library_mutex_);
+    if (!organization_ready_ || index >= organization_.collections.size()) return false;
+    auto &collection = organization_.collections[index];
+    collection.pinned = !collection.pinned;
+    if (persist_library_organization_locked()) return true;
+    collection.pinned = !collection.pinned;
+    return false;
 }
 
 std::string SteamQrAuth::library_query() const
@@ -1852,6 +1939,7 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
         install_app_id_ = app_id;
         install_state_ = 1;
         install_done_ = false;
+        active_install_app_.store(app_id);
         install_progress_bytes_ = 0;
         install_total_bytes_ = 0;
         install_message_ = "Checking Steam licenses…";
@@ -2049,6 +2137,7 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
             install_state_ = installed ? 2 : 3;
             install_message_ = std::move(message);
             install_done_ = true;
+            active_install_app_.store(0);
             ++install_version_;
         }
         LogNetworkLine("install app=" + std::to_string(app_id) +
@@ -2742,8 +2831,14 @@ bool SteamQrAuth::start_auth(bool cached_only)
         entitled_library_->SetFamilyDiagnostics("/app0/assets/cacert.pem", [](const std::string &line) {
             LogNetworkLine(line);
         });
+        // The cached library shows at start, before Steam answers (and offline). 01.82 aborted in the cache
+        // save, before Playden had its own heap (01.86); /data/PLDN10001/no-library-cache turns it off again.
+        struct stat no_cache {};
+        if (::stat("/data/PLDN10001/no-library-cache", &no_cache) != 0)
+            library_cache_ = std::make_unique<playden::LibraryCache>(*library_storage_);
+        LogNetworkLine(std::string("library cache=") + (library_cache_ ? "on" : "off (no-library-cache)"));
         library_service_ = std::make_unique<playden::LibraryService>(
-            *entitled_library_, *repository_, nullptr,
+            *entitled_library_, *repository_, library_cache_.get(),
             std::function<std::uint64_t()>{},
             [](const char *step) { LogNetworkLine(std::string("library worker step=") + step); });
     }
@@ -3191,6 +3286,21 @@ extern "C" int playden_ps4_library_collection_delete(std::size_t index)
 extern "C" int playden_ps4_library_in_collection(std::uint32_t app_id, std::size_t index)
 {
     return auth().library_in_collection(app_id, index) ? 1 : 0;
+}
+extern "C" std::size_t playden_ps4_home_shelf_count() { return auth().home_shelf_count(); }
+extern "C" const char *playden_ps4_home_shelf_title(std::size_t shelf)
+{
+    static std::string title;
+    title = auth().home_shelf_title(shelf);
+    return title.c_str();
+}
+extern "C" int playden_ps4_library_collection_pinned(std::size_t index)
+{
+    return auth().library_collection_pinned(index) ? 1 : 0;
+}
+extern "C" int playden_ps4_library_collection_pin_toggle(std::size_t index)
+{
+    return auth().library_toggle_collection_pin(index) ? 1 : 0;
 }
 extern "C" int playden_ps4_library_collection_toggle(std::uint32_t app_id, std::size_t index)
 {

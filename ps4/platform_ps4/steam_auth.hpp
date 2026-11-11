@@ -150,6 +150,16 @@ class SteamQrAuth
     playden::OrganizationSnapshot organization_;
     bool organization_ready_ = false;
     std::vector<std::size_t> visible_library_indices_locked(int filter) const;
+    // Home's shelves, Leo's order: Continue playing, Downloading, Recently installed, Favorites, pinned
+    // collections. Empty shelves are left out.
+    struct HomeShelf { std::string title; std::vector<std::size_t> indices; };
+    std::vector<HomeShelf> home_shelves_locked() const;
+public:
+    std::size_t home_shelf_count() const;
+    std::string home_shelf_title(std::size_t shelf) const;
+    bool library_collection_pinned(std::size_t index) const;
+    bool library_toggle_collection_pin(std::size_t index);
+private:
     bool persist_library_organization_locked();
     std::unique_ptr<playden::Storage> library_storage_;
     std::unique_ptr<playden::LibraryCache> library_cache_;
@@ -247,7 +257,8 @@ class SteamQrAuth
     std::string wine_debug_level_ = "profile";
     bool wait_watchdog_enabled_ = false;
     bool gpu_hang_dump_enabled_ = false;
-    bool download_fastest_ = false;   // race the CDN servers at download start (DownloadTuning::fastest)
+    bool download_fastest_ = false;
+    std::atomic<std::uint32_t> active_install_app_{0};   // the running install, for Home's Downloading shelf   // race the CDN servers at download start (DownloadTuning::fastest)
     bool persist_runtime_settings_locked();
     std::thread uninstall_worker_;
     mutable std::mutex uninstall_mutex_;

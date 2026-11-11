@@ -94,7 +94,11 @@ int playden_ps4_maintenance_armed = 0;
 /* The game the collection picker (page 9) is for; ui.cpp draws from it. */
 uint32_t playden_ps4_collection_app_id = 0;
 /* The Library tab's views (Home uses 0: the installed list, unsearched); ui.cpp has the same rule. */
-static int library_filter(int tab, int row) { return tab == 0 ? 0 : 1000 + row; }
+/* Home's focused shelf; Home's views are filters 3000 + shelf (steam_auth.cpp kHomeShelf). */
+int playden_ps4_home_shelf = 0;
+size_t playden_ps4_home_shelf_count(void);
+int playden_ps4_library_collection_pin_toggle(size_t index);
+static int library_filter(int tab, int row) { return tab == 0 ? 3000 + playden_ps4_home_shelf : 1000 + row; }
 const char *playden_ps4_auth_failure(void);
 
 enum { WIDTH = 1920, HEIGHT = 1080, BUFFERS = 3 };
@@ -578,6 +582,12 @@ int playden_ps4_main(int argc, char **argv) {
                 }
                 changed = 1;
             }
+            if ((pressed & ORBIS_PAD_BUTTON_TRIANGLE) && delete_choice < count) {
+                /* Pin to Home: the collection becomes a Home shelf. */
+                if (!playden_ps4_library_collection_pin_toggle((size_t)delete_choice))
+                    log_line("PLDN10001: could not save collection pin");
+                changed = 1;
+            }
             if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && delete_choice < count) {
                 if (playden_ps4_library_collection_delete((size_t)delete_choice)) {
                     /* The Library tab's row for it, or one after it, moves up. */
@@ -602,6 +612,17 @@ int playden_ps4_main(int argc, char **argv) {
                     changed = 1;
                 }
                 if (tab == 0) {
+                    /* Up / Down: the shelf above or below, keeping the column where it can. */
+                    const int shelves = (int)playden_ps4_home_shelf_count();
+                    const int before = playden_ps4_home_shelf;
+                    if ((pressed & ORBIS_PAD_BUTTON_UP) && playden_ps4_home_shelf > 0) --playden_ps4_home_shelf;
+                    if ((pressed & ORBIS_PAD_BUTTON_DOWN) && playden_ps4_home_shelf + 1 < shelves) ++playden_ps4_home_shelf;
+                    if (playden_ps4_home_shelf >= shelves) playden_ps4_home_shelf = shelves > 0 ? shelves - 1 : 0;
+                    if (playden_ps4_home_shelf != before) {
+                        const int size = (int)playden_ps4_library_visible_count(library_filter(tab, selected));
+                        if (game_selected >= size) game_selected = size > 0 ? size - 1 : 0;
+                        changed = 1;
+                    }
                     if ((pressed & ORBIS_PAD_BUTTON_LEFT) && game_selected > 0) {
                         --game_selected; changed = 1;
                     } else if ((pressed & ORBIS_PAD_BUTTON_LEFT) && game_selected == 0) {
@@ -690,7 +711,8 @@ int playden_ps4_main(int argc, char **argv) {
                     page = 1;
                     changed = 1;
                 } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && tab == 0) {
-                    if (playden_ps4_library_visible_count(0) > 0) {
+                    playden_ps4_home_shelf = 0;
+                    if (playden_ps4_home_shelf_count() > 0) {
                         game_focus = 1;
                         game_selected = 0;
                     } else {
