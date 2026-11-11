@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "as_of": "2026-11-09",
-  "hardware_build": "01.83 (library loads; Mafia manifest allocation fails before download)",
+  "as_of": "2026-11-10",
+  "hardware_build": "02.26 (2026-11-10 console run on a PS4 Pro; 02.27 built, not yet run)",
   "areas": [
     {
       "id": "navigation_and_ui_state",
@@ -20,29 +20,36 @@
       "reference": "Continue playing, recent/installed shelves, active work, notices",
       "target": "Project the shared Home shelves, status badges, notices, and details navigation",
       "host_evidence": [],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.19: Continue playing, Downloading, Recently installed, Favorites and pinned-collection shelves seen. Missing: notices"
+      ],
       "host_tests": []
     },
     {
       "id": "steam_sign_in",
       "area": "Steam sign-in",
-      "status": "partial",
+      "status": "present",
       "reference": "QR and password, Steam Guard approval/codes, restore, stay signed in, switch account, sign out, offline/error recovery",
       "target": "Wire the shared account service and complete every sign-in/account action",
       "host_evidence": [],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.11/02.16: QR, account name + password (Steam Guard approval), cached restore and sign-out seen working"
+      ],
       "host_tests": []
     },
     {
       "id": "library_cache",
       "area": "Library cache",
-      "status": "partial",
+      "status": "present",
       "reference": "Cached/offline library, refresh, license-change refresh",
       "target": "Use `LibraryService` and `LibraryController`, including stale/offline state and refresh",
       "host_evidence": [
         "PS4 links LibraryService, but 01.82 aborted in LibraryCache::Save; 01.83 temporarily passes no cache to the service"
       ],
-      "ps4_hardware_evidence": ["01.82 reached cache-write-start and then SIGABRT; cache path is disabled in 01.83 pending console test"],
+      "ps4_hardware_evidence": [
+        "01.82 reached cache-write-start and then SIGABRT; cache path is disabled in 01.83 pending console test",
+        "02.19: LibraryCache on; second start shows the cached library (event=1) before the Steam refresh"
+      ],
       "host_tests": []
     },
     {
@@ -54,7 +61,9 @@
       "host_evidence": [
         "PS4 loads and saves shared organization.v2; legacy favorites/hidden migrate; PS4 target compiled"
       ],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.14: favorites, hidden, search, sort, collections, durable selection; 02.19 pinned collections built. Missing: notes, compatibility rating, filters"
+      ],
       "host_tests": []
     },
     {
@@ -95,7 +104,9 @@
       "reference": "Storage, branch/version, content language, DLC, measured size, reservation/no-space behavior",
       "target": "Use the shared install sheet and size checks; keep PS4 volume reporting capability-aware",
       "host_evidence": [],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.05: install sheet (branch, language, sizes) seen; the choice survives a restart (02.13). Single internal volume"
+      ],
       "host_tests": []
     },
     {
@@ -107,7 +118,9 @@
       "host_evidence": [
         "PS4 uses one supported connection; parallel selector removed; depot write/create failures preserve errno for no-space reporting; PS4 target compiled"
       ],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "One download at a time by decision (2026-11-10: a second download overloads the PS4); connections 1/2/4 and Fastest server. No queue"
+      ],
       "host_tests": [
         "steam_depot_chunk"
       ]
@@ -115,13 +128,15 @@
     {
       "id": "interrupted_installs",
       "area": "Interrupted installs",
-      "status": "partial",
+      "status": "present",
       "reference": "Resume journal, truthful incomplete state, repair/update of stale records",
       "target": "Validate selected depots against the record; never show Play for incomplete content",
       "host_evidence": [
         "PS4 details compare selected base depot IDs with the record and check the launch executable; PS4 target compiled"
       ],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.13: a cut-short first install resumes as an install with the saved branch/language (seen on 02.17 and 02.25)"
+      ],
       "host_tests": [
         "steam_app_info (depot selection fixtures)"
       ]
@@ -129,11 +144,13 @@
     {
       "id": "game_updates",
       "area": "Game updates",
-      "status": "missing",
+      "status": "partial",
       "reference": "Installed-game check, changed-file sizing, DLC changes, per-game and batch updates",
       "target": "Wire `AppDetailsService`, update-check persistence, details update, and Manage games > Updates",
       "host_evidence": [],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "UPDATE mark and update via UpdateApp built; not yet seen with a real update"
+      ],
       "host_tests": []
     },
     {
@@ -166,7 +183,9 @@
       "reference": "Prepared globally as part of game setup",
       "target": "Make it shared setup behavior for every applicable game; no app-specific branch",
       "host_evidence": [],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.17: steam_api.dll found from .playden-files (opendir EPERM); 02.27 adds owned DLC and Source SDK base apps. Isaac Rebirth still exits early; steam_features/steam_input rows not applied"
+      ],
       "host_tests": []
     },
     {
@@ -178,7 +197,9 @@
       "host_evidence": [
         "Generated profiles use an installed PE header or Steam osarch for architecture; pe_architecture test passed; new generic installs get a private prefix; PS4 target compiled"
       ],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.21: whole catalogue listed with shared availability; dxvk.conf written. Missing: presets, community recipes, reset/export"
+      ],
       "host_tests": [
         "pe_architecture"
       ]
@@ -186,33 +207,39 @@
     {
       "id": "maintenance",
       "area": "Maintenance",
-      "status": "missing",
+      "status": "partial",
       "reference": "Apply settings, verify/repair, clear shader cache, back up saves, recreate bottle, update runtime kit",
       "target": "Implement PS4 equivalents and gate only genuinely unsupported actions",
       "host_evidence": [],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.15-02.18: back up, restore, prefix reset, clear shader cache seen; check and repair built, not run to the end. Missing: runtime kit update"
+      ],
       "host_tests": []
     },
     {
       "id": "steam_cloud",
       "area": "Steam Cloud",
-      "status": "partial",
+      "status": "present",
       "reference": "Quick check, Sync all, per-game details, conflicts, use-local/use-Cloud, automatic pre/post-play sync, leftover data",
       "target": "Use `CloudService` and shared controller lifecycle with generic prefix/save locations",
       "host_evidence": [
         "PS4 Cloud uses the game profile prefix when available; PS4 target compiled"
       ],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "Pre/post-play sync, conflict choice and Saves tab check seen (Half-Life 2, 67 saves downloaded)"
+      ],
       "host_tests": []
     },
     {
       "id": "uninstall",
       "area": "Uninstall",
-      "status": "partial",
+      "status": "present",
       "reference": "Cloud gate, runtime removal, files, keep/delete saves, queued/batch flow, truthful stopped states",
       "target": "Use the shared uninstall flow adapted to the single PS4 title",
       "host_evidence": [],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.10: keep/remove prefix choice with Cloud gate seen"
+      ],
       "host_tests": []
     },
     {
@@ -270,13 +297,15 @@
     {
       "id": "self_update",
       "area": "Self-update",
-      "status": "missing",
+      "status": "partial",
       "reference": "Check/download/stage/relaunch/rollback and release notes",
       "target": "Point to `plastikman/playden-ps4`, use PS4 package install/relaunch mechanics, and preserve the shared state model",
       "host_evidence": [
         "Native PS4 HTTP rejects cleartext URLs unless explicitly allowed; GitHub response-header and update workflow remain missing; PS4 target compiled"
       ],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "Wired to plastikman/playden-ps4 releases; no release published yet (update check 404)"
+      ],
       "host_tests": []
     },
     {
@@ -303,11 +332,13 @@
     {
       "id": "download_server_selection",
       "area": "Download-server selection",
-      "status": "missing",
+      "status": "partial",
       "reference": "List/test/prefer Steam CDN server",
       "target": "Wire `DownloadServerService`; do not expose raw concurrency as the normal player control",
       "host_evidence": [],
-      "ps4_hardware_evidence": [],
+      "ps4_hardware_evidence": [
+        "02.18: Steam order or Fastest; no per-server list/test"
+      ],
       "host_tests": []
     },
     {

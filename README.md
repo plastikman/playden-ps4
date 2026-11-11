@@ -24,41 +24,51 @@ Discord.**
 
 Seen working on the test console:
 
-- **Steam sign-in** with a QR code, cached between runs.
-- **Your Steam library** with cover art, store details, favorites and hidden games.
-- **Downloads from Steam**, one game at a time, with resume after an interruption.
-- **Steam Cloud saves** from the Saves tab: check a game, and choose which saves to keep when the PS4 and the Cloud
-  disagree.
-- **Per-game settings** (Triangle on a game): the program that starts, Wine log detail, and for games without full
-  controller support the controller mode, preset and button mapping.
+- **Steam sign-in** with a QR code, or account name and password (with Steam Guard), cached between runs; **sign
+  out** from Settings to switch accounts.
+- **Your Steam library** with cover art, store details, favorites, hidden games, **search, sort and collections**,
+  and **games shared by a Steam family member** (marked FAMILY) that you can install.
+- The library **shows at once from a cache** at start, then refreshes from Steam.
+- **Home** with shelves: Continue playing, Downloading, Recently installed, Favorites.
+- **Downloads from Steam**, **one game at a time**: an install sheet first (version, language and sizes), and resume
+  after Playden is closed, with the same choices.
+- **Steam Cloud saves** before a game starts and after it ends, and from the Saves tab, with a choice when the PS4
+  and the Cloud disagree.
+- **Maintenance** per game (Options on its page): back up and restore saves, reset the Wine prefix, clear shader
+  caches.
+- **Uninstall that asks** what to keep, with a Cloud sync first.
+- **Steam emulation** for games that ship `steam_api.dll` (needed since the PS4 can't list a game's folder; fixed in
+  02.17), and legacy Steam for older games.
+- **Per-game settings** (Triangle on a game): the program that starts, Wine log detail, and controller mode, preset
+  and button mapping.
+- Settings: **download server** (Steam's order or the fastest) and **download connections** (1, 2 or 4).
 
 ### In testing
 
 Built and packaged, not yet confirmed on the console:
 
-- An **install sheet** before a download: the version (public, or a beta without a password), the content language
-  and the download size.
-- **Game updates**: an **UPDATE** mark on installed games Steam has a newer version of; Cross downloads only the
-  changed files.
-- **Steam Cloud sync** before a game starts and after it ends.
-- More **Game settings**: resolution (including 4:3) and scaling, mouse-look controls (pointer and movement
-  sticks), and library (DLL) overrides chosen from a list.
-- **Playden updates**: Settings checks this repository's releases and downloads a newer package to `/data/pkg`, to
-  install with GoldHEN's package installer.
-- Library **search, sort and collections**.
-- **Maintenance** per game: check and repair files, back up and restore saves, reset the Wine prefix.
-- **Uninstall that asks**: keep the Wine prefix and saves, or remove them too (saves backed up first), with a Steam
-  Cloud sync first.
-- **Account name and password sign-in** with Steam Guard codes, and **signing out** to switch accounts.
-- **Games shared by a Steam family member**, listed and installable.
+- **Check and repair files** (Maintenance), with a status that says it is reading every file.
+- **Game updates**: an **UPDATE** mark on installed games Steam has a newer version of.
+- **Pinning a collection to Home** (Triangle in the collection picker).
+- The **full Game settings list** as on the PS5: window view, performance overlay, graphics, extra arguments, and DXVK
+  frame limit, latency and reported GPU/VRAM through a `dxvk.conf` Playden writes; rows the PS4 runtime can't
+  take yet are shown greyed out with the reason.
+- **Owned DLC and Source SDK base apps** passed to the Steam emulator (for Half-Life: Source's "A Source engine game
+  is required to run mods").
+- **Playden updates**: Settings checks this repository's releases (none published yet).
+
+### Known problems
+
+- **The Binding of Isaac: Rebirth** quits about three seconds after it starts.
 
 ### Not on the PS4 (yet)
 
 - Games don't get their own Home screen tile: start them from Playden.
-- One download at a time; no queue.
+- One download at a time, by design: a second download at once is too much for the PS4.
 - No USB or external drives, and no importing games from elsewhere.
-- Not yet ported from the PS5: community recipes, player presets, and the newer Game settings rows (graphics,
-  Steam Input, network).
+- Not yet ported from the PS5: community recipes and player presets, per-game notes and ratings, Library filters, the
+  download server test, and web access.
+- Settings that need a newer Orbis-Win: 120 Hz, per-game volume, rumble, Windows version and language, the CPU mode.
 - The PS4 is much slower than a PS5: heavier games may be CPU-bound (Grand Theft Auto IV runs at about 8–9 fps).
 
 ### Install
