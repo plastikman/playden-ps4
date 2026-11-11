@@ -1082,7 +1082,20 @@ SteamQrAuth::SteamQrAuth()
             }
         }
         playden::OrganizationStore shared_organization(storage);
-        const auto saved_organization = shared_organization.Load(playden::kDeviceOrganization);
+        auto saved_organization = shared_organization.Load(playden::kDeviceOrganization);
+        if (!saved_organization.ok()) {
+            // With no organization.v2 yet, Load lists /data/PLDN10001 for the PS5's per-account .v1
+            // files, and the title may not list /data (opendir EPERM). The PS4 never wrote .v1 files,
+            // so a missing organization.v2 is a first start: begin a new one from favorites and hidden.
+            struct stat snapshot_info {};
+            const bool first_start = ::lstat("/data/PLDN10001/organization.v2", &snapshot_info) != 0 &&
+                                     errno == ENOENT;
+            LogNetworkLine(std::string("library organization load failed: ") + saved_organization.message() +
+                           (first_start ? " (no organization.v2: starting a new one)" : ""));
+            if (first_start)
+                saved_organization =
+                    playden::Result<std::optional<playden::OrganizationSnapshot>>::Success(std::nullopt);
+        }
         if (saved_organization.ok()) {
             if (saved_organization.value()) {
                 organization_ = *saved_organization.value();
@@ -1098,10 +1111,13 @@ SteamQrAuth::SteamQrAuth()
                     organization_.favorites.insert(playden::GameId::Steam(id));
                 for (const auto id : hidden_games_)
                     organization_.hidden.insert(playden::GameId::Steam(id));
-                organization_ready_ = shared_organization.Save(
-                    playden::kDeviceOrganization, organization_).ok();
+                const auto saved = shared_organization.Save(playden::kDeviceOrganization, organization_);
+                organization_ready_ = saved.ok();
+                if (!saved.ok()) LogNetworkLine("library organization save failed: " + saved.message());
             }
         }
+        LogNetworkLine(std::string("library organization ready=") + (organization_ready_ ? "yes" : "no") +
+                       " collections=" + std::to_string(organization_.collections.size()));
     }
     orbis_set_log(OrbisCompatLog);
     orbis_set_log_fatal(OrbisCompatFatalLog);
@@ -3109,7 +3125,9 @@ extern "C" int playden_ps4_library_collection_create(int user_id)
 {
     std::string name;
     if (EditTextWithSystemKeyboard(user_id, "New collection", "Collection name", "", 48, &name) != 1) return -1;
-    return auth().library_create_collection(name);
+    const int made = auth().library_create_collection(name);
+    if (made < 0) LogNetworkLine("library collection create failed (name length " + std::to_string(name.size()) + ")");
+    return made;
 }
 extern "C" int playden_ps4_library_collection_delete(std::size_t index)
 {
