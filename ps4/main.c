@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <orbis/libkernel.h>
@@ -113,13 +114,82 @@ static void log_line(const char *text) {
     sceKernelDebugOutText(0, "\n");
 }
 
+/* The PS4's Display Area setting (SceSystemServiceDisplaySafeAreaInfo): 1.0 at the console's default,
+ * smaller when the player shrank the picture for a TV that cuts its edges. */
+typedef struct { float ratio; uint8_t reserved[128]; } PlaydenSafeAreaInfo;
+static float safe_area_ratio(void) {
+    static float ratio = 0.0f;
+    if (ratio == 0.0f) {
+        PlaydenSafeAreaInfo info;
+        memset(&info, 0, sizeof(info));
+        info.ratio = 1.0f;
+        sceSystemServiceGetDisplaySafeAreaInfo(&info);
+        ratio = info.ratio >= 0.85f && info.ratio <= 1.0f ? info.ratio : 1.0f;
+        char line[96];
+        snprintf(line, sizeof(line), "PLDN10001: display area %.3f (console %.3f)", ratio, info.ratio);
+        log_line(line);
+    }
+    return ratio;
+}
+
+/* A cached buffer the UI draws into when the frame is shrunk (video memory is slow to read back). */
+static uint32_t *safe_area_canvas(void) {
+    static uint32_t *canvas = NULL;
+    static int failed = 0;
+    if (canvas == NULL && !failed) {
+        void *memory = mmap(NULL, FRAME_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (memory == MAP_FAILED) failed = 1;
+        else canvas = (uint32_t *)memory;
+    }
+    return canvas;
+}
+
+/* Shrinks the drawn picture into the centred safe area of the video frame (bilinear), with the
+ * picture's corner colour around it. */
+static void fit_safe_area(const uint32_t *source, uint32_t *frame, float ratio) {
+    const int inner_w = (int)(WIDTH * ratio), inner_h = (int)(HEIGHT * ratio);
+    const int left = (WIDTH - inner_w) / 2, top = (HEIGHT - inner_h) / 2;
+    const uint32_t edge = source[0];
+    const uint32_t step_x = (uint32_t)(((uint64_t)WIDTH << 16) / (uint32_t)inner_w);
+    const uint32_t step_y = (uint32_t)(((uint64_t)HEIGHT << 16) / (uint32_t)inner_h);
+    for (int y = 0; y < HEIGHT; ++y) {
+        uint32_t *out = frame + (size_t)y * WIDTH;
+        if (y < top || y >= top + inner_h) {
+            for (int x = 0; x < WIDTH; ++x) out[x] = edge;
+            continue;
+        }
+        const uint32_t sy = (uint32_t)(y - top) * step_y;
+        const int y0 = (int)(sy >> 16), y1 = y0 + 1 < HEIGHT ? y0 + 1 : y0;
+        const uint32_t fy = (sy >> 8) & 0xff;
+        const uint32_t *row0 = source + (size_t)y0 * WIDTH, *row1 = source + (size_t)y1 * WIDTH;
+        for (int x = 0; x < left; ++x) out[x] = edge;
+        for (int x = left + inner_w; x < WIDTH; ++x) out[x] = edge;
+        for (int x = 0; x < inner_w; ++x) {
+            const uint32_t sx = (uint32_t)x * step_x;
+            const int x0 = (int)(sx >> 16), x1 = x0 + 1 < WIDTH ? x0 + 1 : x0;
+            const uint32_t fx = (sx >> 8) & 0xff;
+            const uint32_t a = row0[x0], b = row0[x1], c = row1[x0], d = row1[x1];
+            uint32_t pixel = 0;
+            for (int shift = 0; shift < 32; shift += 8) {
+                const uint32_t upper = (((a >> shift) & 0xff) * (256 - fx) + ((b >> shift) & 0xff) * fx) >> 8;
+                const uint32_t lower = (((c >> shift) & 0xff) * (256 - fx) + ((d >> shift) & 0xff) * fx) >> 8;
+                pixel |= (((upper * (256 - fy) + lower * fy) >> 8) & 0xff) << shift;
+            }
+            out[left + x] = pixel;
+        }
+    }
+}
+
 static void draw_screen(uint32_t *frame, int tab, int selected, int page, int controller_ready,
                         int auth_state, int game_focus, int game_selected,
                         int delete_choice, const char *challenge_url, const char *auth_failure,
                         const char *runtime_status) {
-    playden_ps4_draw_ui(frame, tab, selected, page, controller_ready,
+    const float ratio = safe_area_ratio();
+    uint32_t *canvas = ratio < 0.999f ? safe_area_canvas() : NULL;
+    playden_ps4_draw_ui(canvas ? canvas : frame, tab, selected, page, controller_ready,
                         auth_state, game_focus, game_selected, delete_choice, challenge_url, auth_failure,
                         runtime_status);
+    if (canvas) fit_safe_area(canvas, frame, ratio);
 }
 
 int playden_ps4_main(int argc, char **argv) {

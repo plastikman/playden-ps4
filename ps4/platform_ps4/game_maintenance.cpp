@@ -245,6 +245,16 @@ bool BackUp(std::uint32_t app_id, const std::string &prefix, std::string *messag
         *message = "Backup failed: " + stats.error;
         return false;
     }
+    // Nothing to keep (a fresh prefix, or a game that saves in its own folder): an empty backup would become
+    // the "last backup" and Restore would put back nothing.
+    if (stats.files == 0) {
+        TreeStats cleanup;
+        bool kept = false;
+        RemoveTree(folder, "", {}, &cleanup, &kept);
+        *message = "No save files in the Wine prefix to back up (this game may save in its own folder).";
+        Log("backup app=" + std::to_string(app_id) + " empty: not kept");
+        return true;
+    }
     auto index = ReadIndex(app_id);
     index.push_back(std::string(stamp) + "\t" + std::to_string(stats.files) + "\t" + std::to_string(stats.bytes));
     while (index.size() > static_cast<std::size_t>(kKeptBackups)) {
