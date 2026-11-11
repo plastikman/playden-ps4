@@ -516,6 +516,43 @@ bool HasIncompleteInstall(std::uint32_t app_id)
            lstat((root + "/" + playden::steam::DepotInstaller::kFileTree).c_str(), &info) == 0;
 }
 
+// The install sheet's version and language for a first install, kept until that install finishes.
+constexpr const char *kInstallChoiceDir = "/data/PLDN10001/install-choices";
+
+std::string InstallChoicePath(std::uint32_t app_id)
+{
+    return std::string(kInstallChoiceDir) + "/" + std::to_string(app_id);
+}
+
+void SaveInstallChoice(std::uint32_t app_id, const playden::steam::InstallOptions &options)
+{
+    if (mkdir(kInstallChoiceDir, 0777) != 0 && errno != EEXIST) return;
+    std::FILE *file = std::fopen(InstallChoicePath(app_id).c_str(), "w");
+    if (!file) return;
+    std::fprintf(file, "%s\n%s\n", options.branch.c_str(), options.language.c_str());
+    std::fclose(file);
+}
+
+bool LoadInstallChoice(std::uint32_t app_id, playden::steam::InstallOptions *options)
+{
+    std::FILE *file = std::fopen(InstallChoicePath(app_id).c_str(), "r");
+    if (!file) return false;
+    char branch[128] = {}, language[128] = {};
+    const bool read = std::fgets(branch, sizeof(branch), file) && std::fgets(language, sizeof(language), file);
+    std::fclose(file);
+    if (!read) return false;
+    branch[std::strcspn(branch, "\r\n")] = '\0';
+    language[std::strcspn(language, "\r\n")] = '\0';
+    options->branch = branch;
+    options->language = language;
+    return true;
+}
+
+void ForgetInstallChoice(std::uint32_t app_id)
+{
+    std::remove(InstallChoicePath(app_id).c_str());
+}
+
 std::string InstalledMessage(std::uint32_t app_id)
 {
     (void)app_id;
@@ -1522,7 +1559,10 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
     {
         const std::lock_guard<std::mutex> guard(details_mutex_);
         // An update downloads the changed files beside the game, then swaps them in (the shared UpdateApp).
-        repair = details_app_id_ == app_id && (details_incomplete_ || details_update_);
+        // Only a game with an install record can be updated or repaired: a first download cut short has
+        // none yet, and resumes as an install (UpdateApp refuses it: "update without install").
+        repair = details_app_id_ == app_id && (details_incomplete_ || details_update_) &&
+                 HasInstalledRecord(app_id);
     }
     if (HasInstalledRecord(app_id) && !repair)
     {
@@ -1649,13 +1689,22 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
             };
             // The install sheet's choice, when one was made for this game.
             playden::steam::InstallOptions options;
+            bool from_sheet = false;
             {
                 const std::lock_guard<std::mutex> sheet_guard(details_mutex_);
                 if (!repair && sheet_.app_id == app_id) {
                     if (!sheet_.offers.empty() && sheet_.offers[sheet_.branch].name != "public")
                         options.branch = sheet_.offers[sheet_.branch].name;
                     if (!sheet_.languages.empty()) options.language = sheet_.languages[sheet_.language];
+                    from_sheet = true;
                 }
+            }
+            // A first install keeps the sheet's choice until it finishes, so a download resumed after a
+            // restart (no sheet then) fetches the same depots.
+            if (!repair) {
+                if (from_sheet) SaveInstallChoice(app_id, options);
+                else if (LoadInstallChoice(app_id, &options))
+                    LogNetworkLine("install app=" + std::to_string(app_id) + " step=resume choice=saved");
             }
             // An update keeps what the install recorded (a beta stays a beta).
             if (repair) {
@@ -1684,6 +1733,7 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
                 outcome.failure = "Install stopped unexpectedly. Progress is saved; try again to resume.";
             }
             installed = outcome.ok;
+            if (installed && !repair) ForgetInstallChoice(app_id);
             message = installed ? InstalledMessage(app_id) : outcome.canceled
                 ? "Download canceled. Completed files are saved; Cross resumes the install."
                 : (outcome.failure.empty() ? "Install failed. See the console network log." : outcome.failure);
