@@ -833,6 +833,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                 ? (details[0] ? details : "Checking Steam install options…")
                 : install_state == 3 ? install
                 : install_state == 1 ? install
+                : install_state == 5 && installed ? "INSTALLED  ·  PLAY AFTER THE CURRENT DOWNLOAD FINISHES"
                 : install_state == 5 ? "ONE DOWNLOAD AT A TIME  ·  WAIT FOR THE CURRENT ONE TO FINISH"
                 : incomplete ? "INCOMPLETE  ·  CROSS TO RESUME"
                 : !installed ? "NOT INSTALLED  ·  CROSS TO INSTALL"
@@ -915,7 +916,8 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             const char *detail_hint = details_state != 2 ? "CIRCLE  BACK TO LIBRARY" :
                 uninstall_for_game && uninstall_state == 1 ? "REMOVING GAME FILES…" :
                 install_state == 1 ? "INSTALL IN PROGRESS     LEFT / RIGHT  SECTIONS" :
-                install_state == 5 ? "ANOTHER GAME IS DOWNLOADING     CIRCLE  BACK TO LIBRARY" :
+                install_state == 5 ? (installed ? "ANOTHER GAME IS DOWNLOADING     OPTIONS  MAINTENANCE     CIRCLE  BACK"
+                                                : "ANOTHER GAME IS DOWNLOADING     CIRCLE  BACK TO LIBRARY") :
                 !installed ? "CROSS  INSTALL     CIRCLE  BACK TO LIBRARY" :
                 installed && playden_ps4_game_details_update()
                     ? "CROSS  UPDATE     TRIANGLE  SETTINGS     OPTIONS  MAINTENANCE     SQUARE  DELETE     CIRCLE  BACK" :
@@ -1184,7 +1186,9 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
             const char *choices[] = {"CHECK AND REPAIR FILES", "BACK UP SAVES", "RESTORE LAST BACKUP",
                                      playden_ps4_maintenance_armed ? "PRESS CROSS AGAIN TO RESET THE PREFIX"
                                                                    : "RESET WINE PREFIX", "CLEAR SHADER CACHE", "CLOSE"};
-            const char *notes[] = {"Hashes every file; downloads only what is missing or changed.",
+            const bool downloading = playden_ps4_queue_state() == 1;
+            const char *notes[] = {downloading ? "Waits for the current download: one download at a time."
+                                               : "Hashes every file; downloads only what is missing or changed.",
                                    "Copies the Wine prefix's user folders (Documents, AppData, Saved Games).",
                                    "Copies the newest backup back over the prefix's user folders.",
                                    "Backs up, then rebuilds Windows and the registry at the next launch. Saves stay.",

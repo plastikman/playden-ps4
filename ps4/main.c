@@ -333,7 +333,8 @@ int playden_ps4_main(int argc, char **argv) {
             }
             /* Maintenance: check and repair, save backups, prefix reset. */
             if ((pressed & ORBIS_PAD_BUTTON_OPTIONS) && playden_ps4_game_details_installed() &&
-                playden_ps4_game_details_state() == 2 && playden_ps4_game_install_state() != 1 && playden_ps4_game_install_state() != 5) {
+                playden_ps4_game_details_state() == 2 && playden_ps4_game_install_state() != 1) {
+                /* Open during another game's download too: only Check files needs the downloader. */
                 page = 10;
                 delete_choice = 0;
                 playden_ps4_maintenance_armed = 0;
@@ -605,7 +606,9 @@ int playden_ps4_main(int argc, char **argv) {
                 ++delete_choice; playden_ps4_maintenance_armed = 0; changed = 1;
             }
             if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !working) {
-                if (delete_choice == 0) {
+                if (delete_choice == 0 && playden_ps4_queue_state() == 1) {
+                    /* One download at a time: the check waits for the running download. */
+                } else if (delete_choice == 0) {
                     /* The check runs as an install job: its progress shows on the details screen. */
                     playden_ps4_game_verify_start(detail_app_id);
                     page = 2;
