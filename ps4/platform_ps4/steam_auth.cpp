@@ -2727,11 +2727,15 @@ void SteamQrAuth::request_game_details(std::uint32_t app_id)
     const bool already_installed = HasInstalledRecord(app_id);
     const bool already_incomplete = !already_installed && HasIncompleteInstall(app_id);
     {
+        // A running download keeps its state: details_install_state() tells each page whose job it is. (02.20 reset
+        // it here, so Cross on a second game started a second install that waited on the first, freezing the UI.)
         const std::lock_guard<std::mutex> guard(install_mutex_);
-        install_app_id_ = app_id;
-        install_state_ = already_installed ? 2 : 0;
-        install_message_ = already_installed
-            ? InstalledMessage(app_id) : std::string();
+        if (install_state_ != 1) {
+            install_app_id_ = app_id;
+            install_state_ = already_installed ? 2 : 0;
+            install_message_ = already_installed
+                ? InstalledMessage(app_id) : std::string();
+        }
     }
     auto loaded = repository_ ? repository_->Load() :
         playden::Result<std::optional<playden::StoredSession>>::Failure(
