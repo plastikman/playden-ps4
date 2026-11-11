@@ -177,9 +177,12 @@ target_link_libraries(playden_ps4_steam_install PUBLIC
 target_link_libraries(playden_ps4_shell PRIVATE playden_ps4_steam_install)
 
 # Playden's own update: Orbis-Win's PS4 updater (libSceHttp, streamed to /data/pkg, SHA-256 checked),
-# pointed at this repository's releases. Tags are Playden's version (v<project version>).
-file(STRINGS "${PLAYDEN_ROOT}/CMakeLists.txt" playden_project_line REGEX "^project\\(PlaydenLauncher VERSION ")
-string(REGEX REPLACE ".*VERSION ([0-9]+\\.[0-9]+\\.[0-9]+).*" "\\1" PLAYDEN_RELEASE_VERSION "${playden_project_line}")
+# pointed at this repository's releases. Tags are the PS4 port's own version, v<ps4/VERSION> (0.0.1 and up),
+# not upstream's project version: a release named after Leo's (0.11.0) would never look newer to the port.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" PLAYDEN_RELEASE_VERSION LIMIT_COUNT 1)
+if(NOT PLAYDEN_RELEASE_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "ps4/VERSION must be MAJOR.MINOR.PATCH, not '${PLAYDEN_RELEASE_VERSION}'")
+endif()
 add_library(playden_ps4_update STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/orbis-win/native/pw_update_ps4.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/orbis-win/src/pw_update_check.c"

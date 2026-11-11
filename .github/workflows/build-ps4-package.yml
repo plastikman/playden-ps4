@@ -20,9 +20,15 @@ on:
           Orbis-Win release to build on (e.g. v0.0.5). Empty: the package pinned in the
           runner cache (Orbis-Win 01.62), until a release has run-time title detection.
         default: ""
+      publish_release:
+        description: >-
+          Also publish a GitHub release tagged v<ps4/VERSION> (title: the tag) with the package
+          and its manifest. Off: build only. Refuses a version that already has a release.
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write   # publish_release creates a release; otherwise only read
 
 concurrency:
   group: playden-ps4-package
@@ -119,6 +125,26 @@ jobs:
             echo "run_id=${GITHUB_RUN_ID}"
             echo "ref=${GITHUB_REF}"
           } >> "$OUT/BUILD-MANIFEST.txt"
+
+      - name: Publish the release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUT: ${{ runner.temp }}/playden-artifacts
+          APP_VER: ${{ inputs.version }}
+          ORBIS_WIN_TAG: ${{ inputs.orbis_win_tag }}
+        run: |
+          set -euo pipefail
+          tag="v$(head -n1 playden/ps4/VERSION)"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$tag already has a release; raise ps4/VERSION first" >&2; exit 1
+          fi
+          pkg=("$OUT"/IV0000-PLDN10001_00-PLDN100010000000.pkg)
+          [[ -f "${pkg[0]}" ]] || { echo "no IV0000-PLDN10001_00-PLDN100010000000.pkg in $OUT" >&2; exit 1; }
+          cp "$OUT/BUILD-MANIFEST.txt" "$OUT/BUILD-MANIFEST-$APP_VER.txt"
+          notes="Playden for PS4 package $APP_VER on Orbis-Win ${ORBIS_WIN_TAG:-01.62 (runner cache)}. Install with GoldHEN's package installer; Settings > Playden update finds later releases."
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes "$notes" \
+            "${pkg[0]}" "$OUT/BUILD-MANIFEST-$APP_VER.txt"
 
       - uses: actions/upload-artifact@v4
         with:

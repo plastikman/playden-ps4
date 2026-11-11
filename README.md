@@ -95,7 +95,9 @@ The Orbis-Win release must have run-time title detection (after `v0.0.4`; `ORBIS
 package and its `BUILD-MANIFEST` until one is published). `scripts/ci/build-package.sh` checks the Orbis-Win package
 against its manifest, extracts it, downloads DXVK 2.6.2 and the PS4 network libraries (pinned hashes), then runs
 `scripts/build-ps4-runtime.sh`. The **Build PS4 package**
-workflow does the same on a self-hosted runner. Orbis-Win's own build needs its private toolchain cache, so building
+workflow does the same on a self-hosted runner; with **publish release** on, it also publishes a GitHub release tagged
+`v<ps4/VERSION>` (the port's own version, from `0.0.1`, separate from upstream's) with the package, which Settings >
+Playden update then offers. The package version (`NN.NN`) is the PS4's install number and rises with every build. Orbis-Win's own build needs its private toolchain cache, so building
 from scratch is not yet possible without it.
 
 ### Credits
