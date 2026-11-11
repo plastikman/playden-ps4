@@ -10,7 +10,8 @@ constexpr std::size_t kMaximumGames = 100000;
 // Schema 5 names each game by store and value; 4 and older hold Steam app IDs only. 6 marks demos.
 constexpr unsigned kLatestSchema = 7;
 constexpr std::size_t kMaximumGameValue = 48;
-const Bytes kMagic = {'P','D','L','I','B',0,1,0};
+// A function-local static: the PS4 UI module never runs namespace-scope constructors.
+const Bytes& Magic() { static const Bytes magic = {'P','D','L','I','B',0,1,0}; return magic; }
 bool ValidAccount(const std::string& account) {
     return !account.empty() && account.size() <= 20 && account[0] != '0' &&
         std::all_of(account.begin(),account.end(),[](char c){return c>='0'&&c<='9';});
@@ -59,7 +60,7 @@ Result<void> LibraryCache::Save(const std::string& account,const LibrarySnapshot
     if((snapshot.schema_version<1||snapshot.schema_version>kLatestSchema)||snapshot.games.size()>kMaximumGames||
         snapshot.retrieved_at_unix_seconds>static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))return Invalid("Unsupported library cache schema or size.");
     if(snapshot.schema_version<3&&snapshot.metadata_partial)return Invalid("Cache schema cannot preserve metadata state.");
-    Bytes encoded=kMagic;
+    Bytes encoded=Magic();
     encoded[6]=static_cast<std::uint8_t>(snapshot.schema_version);
     String(encoded,account);Number(encoded,snapshot.retrieved_at_unix_seconds,8);
     if(snapshot.schema_version>=3)Number(encoded,snapshot.metadata_partial?1u:0u,1);
@@ -91,11 +92,11 @@ Result<LibrarySnapshot> LibraryCache::Load(const std::string& account) const {
     const auto read=storage_.Read(Path(account),kMaximumCacheBytes);
     if(!read.ok())return Result<LibrarySnapshot>::Failure(read.error(),read.message());
     const auto& bytes=read.value();
-    if(bytes.size()<kMagic.size()+4||!std::equal(kMagic.begin(),kMagic.begin()+6,bytes.begin())||
+    if(bytes.size()<Magic().size()+4||!std::equal(Magic().begin(),Magic().begin()+6,bytes.begin())||
         (bytes[6]<1||bytes[6]>kLatestSchema)||bytes[7]!=0)return invalid();
     Reader tail{bytes,bytes.size()-4,bytes.size()};
     if(tail.Number(4)!=Checksum(bytes,bytes.size()-4))return invalid();
-    Reader reader{bytes,kMagic.size(),bytes.size()-4};
+    Reader reader{bytes,Magic().size(),bytes.size()-4};
     if(reader.String(20)!=account)return invalid();
     LibrarySnapshot snapshot;
     snapshot.schema_version=bytes[6];
