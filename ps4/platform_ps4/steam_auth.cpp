@@ -1887,8 +1887,12 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id)
                     ++install_version_;
                 };
             const auto stage = [this](playden::steam::InstallStep step) {
-                const char *message = step == playden::steam::InstallStep::kCheckingLicenses
-                    ? "Checking Steam licenses…" : "Preparing game download…";
+                const char *message =
+                    step == playden::steam::InstallStep::kCheckingLicenses ? "Checking Steam licenses…"
+                    : step == playden::steam::InstallStep::kCheckingFiles
+                        ? "Checking every installed file against Steam. Large games take several minutes…"
+                    : step == playden::steam::InstallStep::kApplying ? "Putting the new files in place…"
+                    : "Preparing game download…";
                 const std::lock_guard<std::mutex> guard(install_mutex_);
                 install_message_ = message;
                 ++install_version_;
@@ -2435,6 +2439,18 @@ bool SteamQrAuth::saves_poll()
 void SteamQrAuth::request_game_details(std::uint32_t app_id)
 {
     if (app_id == 0) return;
+    // A file check that never finished (Playden closed or crashed) left the file list set aside; put
+    // it back unless an install job is running for this game.
+    {
+        const std::lock_guard<std::mutex> guard(install_mutex_);
+        if (!(install_state_ == 1 && install_app_id_ == app_id)) {
+            const std::string tree = GameInstallRoot(app_id) + "/" + playden::steam::DepotInstaller::kFileTree;
+            struct stat info {};
+            if (::lstat(tree.c_str(), &info) != 0 && ::lstat((tree + ".before-check").c_str(), &info) == 0 &&
+                std::rename((tree + ".before-check").c_str(), tree.c_str()) == 0)
+                LogNetworkLine("install app=" + std::to_string(app_id) + " step=verify tree=restored-after-stop");
+        }
+    }
     {
         const std::lock_guard<std::mutex> guard(details_mutex_);
         if (details_app_id_ == app_id && (details_state_ == 1 || details_state_ == 2)) return;

@@ -230,7 +230,10 @@ bool BackUp(std::uint32_t app_id, const std::string &prefix, std::string *messag
     const std::time_t now = std::time(nullptr);
     std::tm utc {};
     gmtime_r(&now, &utc);
-    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &utc);
+    // Not strftime: the UI PRX's libc reads its locale from thread-local storage that is never set up
+    // here (02.09 crashed on the first backup: SIGSEGV at address 0x10 inside strftime).
+    std::snprintf(stamp, sizeof(stamp), "%04d%02d%02d-%02d%02d%02d", utc.tm_year + 1900, utc.tm_mon + 1,
+                  utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec);
     const std::string folder = AppFolder(app_id) + "/" + stamp;
     TreeStats stats;
     if (!CopyTree(users, folder + "/users", &stats)) {
