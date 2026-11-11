@@ -407,13 +407,49 @@ std::string InstalledGameRoot(std::uint32_t app_id)
 }
 
 std::string PrepareSteamworksForGame(const std::string &root, std::uint32_t app_id,
-                                     std::uint64_t steam_id, const std::string &account_name)
+                                     std::uint64_t steam_id, const std::string &account_name,
+                                     const playden::steam::LicensedDepots *licenses = nullptr,
+                                     playden::steam::EntitledLibraryBackend *library = nullptr)
 {
     playden::runtime::SteamworksIdentity identity;
     identity.app_id = app_id;
     identity.steam_id = steam_id;
     identity.account_name = account_name;
-    (void)playden::runtime::ReadSteamworksFacts(root, &identity);
+    const bool facts = playden::runtime::ReadSteamworksFacts(root, &identity);
+    // As the PS5's RuntimeHost does at each prepare: DLC the account owns (past what the download recorded),
+    // and the Source SDK Base apps its licenses grant, which the emulator then reports as owned (a Source game
+    // that checks one before it starts: "A Source engine game is required to run mods").
+    if (const auto grant = licenses && steam_id ? licenses->Get(steam_id) : std::nullopt) {
+        const auto listed = [](const std::vector<std::uint32_t> &list, std::uint32_t app) {
+            return std::find(list.begin(), list.end(), app) != list.end();
+        };
+        std::size_t added_dlc = 0;
+        if (library)
+            for (const auto dlc : library->DlcOf(app_id))
+                if (dlc != app_id && grant->apps.count(dlc) && !listed(identity.owned_dlc, dlc) &&
+                    !listed(identity.excluded_dlc, dlc)) {
+                    identity.owned_dlc.push_back(dlc);
+                    ++added_dlc;
+                }
+        std::vector<std::uint32_t> sdk;
+        for (const auto app : playden::runtime::kSourceSdkBaseApps)
+            if (app != app_id && grant->apps.count(app)) sdk.push_back(app);
+        auto saved = identity.owned_apps;
+        std::sort(saved.begin(), saved.end());
+        const bool apps_changed = saved != sdk || identity.owned_apps_account != (sdk.empty() ? 0 : steam_id);
+        identity.owned_apps = sdk;
+        identity.owned_apps_account = sdk.empty() ? 0 : steam_id;
+        if ((added_dlc || apps_changed) && facts)
+            (void)playden::runtime::WriteSteamworksFacts(root, identity.depots, identity.owned_dlc, identity.language,
+                                                        identity.excluded_dlc, identity.owned_apps,
+                                                        identity.owned_apps_account);
+        std::string ids;
+        for (const auto app : identity.owned_apps) ids += (ids.empty() ? "" : ",") + std::to_string(app);
+        LogNetworkLine("steamworks app=" + std::to_string(app_id) + " owned dlc added=" + std::to_string(added_dlc) +
+                       " sdk apps=" + (ids.empty() ? "-" : ids));
+    } else {
+        LogNetworkLine("steamworks app=" + std::to_string(app_id) + " licenses=not-read (sdk apps as saved)");
+    }
 
     constexpr const char *emulator = "/app0/runtime/steamworks";
     const auto result = playden::runtime::EmulateSteamworks(root, emulator, identity);
@@ -2218,7 +2254,8 @@ void SteamQrAuth::start_game_install(std::uint32_t app_id, int mode)
                     message = std::string("Game files installed, but runtime setup failed: ") +
                               playden_ps4_wine_status();
                 const auto steamworks_error = PrepareSteamworksForGame(
-                    install_root, app_id, session.steam_id, session.account_name);
+                    install_root, app_id, session.steam_id, session.account_name, &licensed_depots_,
+                    entitled_library_.get());
                 if (!steamworks_error.empty())
                     message = "Game files installed, but Steamworks setup failed: " + steamworks_error;
             }
@@ -2278,7 +2315,8 @@ bool SteamQrAuth::prepare_game_steamworks(std::uint32_t app_id)
         return false;
     }
     const auto &session = *loaded.value();
-    const auto error = PrepareSteamworksForGame(root, app_id, session.steam_id, session.account_name);
+    const auto error = PrepareSteamworksForGame(root, app_id, session.steam_id, session.account_name,
+                                                &licensed_depots_, entitled_library_.get());
     playden::steam::ZeroizeSecret(loaded.value()->refresh_token);
     playden::steam::ZeroizeSecret(loaded.value()->access_token);
     if (error.empty()) return true;
