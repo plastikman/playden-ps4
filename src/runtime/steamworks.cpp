@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -156,7 +157,9 @@ bool RemoveStaleActionSets(const fs::path& controller, const std::vector<std::pa
     if (std::none_of(sets.begin(), sets.end(), [&](const auto& kept) { return kept.first == set; }))
       stale.push_back(it->path());
   }
-  if (error) return false;
+  // A folder that can't be listed (the PS4 title on /data: EPERM) keeps its old files; the sets written next
+  // still replace theirs.
+  if (error) return error == std::errc::operation_not_permitted || error == std::errc::permission_denied;
   for (const auto& path : stale)
     if (::unlink(path.c_str()) != 0 && errno != ENOENT) return false;
   ::rmdir(controller.c_str());  // only when empty
@@ -274,9 +277,33 @@ std::vector<std::string> RetiredSteamApiSha256() {
           "70d9826a402d3a78b0c07e9f7ea7c6832468a1113013f31ea570fccaa5445ea9"};  // release-2026_09_27, 64-bit
 }
 
+// The installer's list of the files it wrote (".playden-files": "f<TAB>path" lines). Used where the game folder
+// can't be listed: the PS4 title is refused opendir on /data (EPERM).
+static void FromFileList(const std::string& install_root, std::vector<std::string>* found) {
+  FILE* file = std::fopen((install_root + "/.playden-files").c_str(), "r");
+  if (!file) return;
+  char line[4096];
+  while (std::fgets(line, sizeof(line), file)) {
+    std::string entry(line);
+    while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r')) entry.pop_back();
+    if (entry.size() < 3 || entry[0] != 'f' || entry[1] != '\t') continue;
+    const std::string path = entry.substr(2);
+    if (std::count(path.begin(), path.end(), '/') > kMaxDepth) continue;
+    const auto slash = path.rfind('/');
+    const auto lower = Lower(slash == std::string::npos ? path : path.substr(slash + 1));
+    if (lower != "steam_api.dll" && lower != "steam_api64.dll") continue;
+    struct stat info {};
+    if (::lstat((install_root + "/" + path).c_str(), &info) == 0 && S_ISREG(info.st_mode)) found->push_back(path);
+  }
+  std::fclose(file);
+}
+
 std::vector<std::string> FindSteamApi(const std::string& install_root) {
   std::vector<std::string> found;
-  Walk(fs::path(install_root), "", 0, &found);
+  std::error_code error;
+  fs::directory_iterator probe(fs::path(install_root), error);
+  if (error) FromFileList(install_root, &found);
+  else Walk(fs::path(install_root), "", 0, &found);
   std::sort(found.begin(), found.end());
   return found;
 }
