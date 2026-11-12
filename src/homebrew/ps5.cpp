@@ -571,7 +571,8 @@ int main() {
                     return std::nullopt;
                 }
                 return playden::homebrew::RuntimeKit{*admitted.view, admitted.capabilities, admitted.manifest_sha256,
-                                                     admission.expected_manifest_sha256, revision, admitted.source_dirty};
+                                                     admission.expected_manifest_sha256, revision, admitted.source_dirty,
+                                                     admitted.view->root / "manifest.json"};
             };
             config.package_operations.hash_file = rt::HashArtifactFile;
             config.package_operations.hash_bytes = rt::HashArtifactBytes;

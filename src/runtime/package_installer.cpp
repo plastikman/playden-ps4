@@ -1,4 +1,5 @@
 #include "runtime/package_installer.h"
+#include "runtime/title_root.h"
 #include "runtime/prospero_profile.h"
 #include "runtime/kit_trust.h"
 #include "runtime/private_directories.h"
@@ -394,7 +395,7 @@ bool DescriptorMatches(const RuntimeInstall& record, std::string_view bytes) {
   const auto version = schema->AsUint64();
   if (version == 1) {
     if (parsed->object().size() != 11 ||
-        record.install_path != "/data/homebrew/" + record.title_id + "/games/" + std::to_string(record.runtime_number))
+        record.install_path != std::string(kManagedTitleRoot) + "/" + record.title_id + "/games/" + std::to_string(record.runtime_number))
       return false;
   } else if (version == 2 || version == 3) {
     const auto* game_root = Required(*parsed, "game_root", Type::kString);
@@ -581,7 +582,9 @@ FilesystemPackageInstaller::Resolve(const RuntimeInstall& record) const {
       !RecipeAccepted(record))
     return std::nullopt;
   const fs::path game = paths_.host_data_root / "playden/games" / record.install_id;
-  const fs::path title = paths_.host_data_root / "homebrew" / record.title_id;
+  // host_data_root stands for the console's /data: the title root is named relative to it
+  // ("homebrew" on the PS5, "PLDN10001" on the PS4), not relative to /.
+  const fs::path title = paths_.host_data_root / fs::path(kManagedTitleRoot).lexically_relative("/data") / record.title_id;
   const fs::path library = game / "library";
   ResolvedPaths resolved;
   resolved.title = title;
@@ -876,7 +879,7 @@ std::string FilesystemPackageInstaller::AdmissionDiagnostic(const RuntimeInstall
     return ::flock(descriptor, LOCK_SH | LOCK_NB);
 #endif
   };
-  const auto canonical = "/data/homebrew/" + record.title_id + "/game-launch.json";
+  const auto canonical = std::string(kManagedTitleRoot) + "/" + record.title_id + "/game-launch.json";
   PwTitlePublicationDescriptor descriptor{}; char error[256]{};
   if (pw_title_publication_read_descriptor(canonical.c_str(), record.title_id.c_str(), &platform,
       &descriptor, error, sizeof(error)) != PW_OK) return std::string("descriptor: ") + error;
@@ -979,6 +982,24 @@ PackageActionResult FilesystemPackageInstaller::SettleBottleModes(const RuntimeI
   for (const auto& folder : folders)
     if (!SetTraversableMode(folder, traversal.created_mode))
       return Failed("repair-mode", "the permissions of " + folder.string() + " could not be set: " + strerror(errno));
+  // chmod is not implemented on the PS4 data filesystem. Rewrite malformed Wine registry
+  // hives through a private temporary file so existing bottles get the same 0600 mode as new ones.
+  for (const char* hive : {"user.reg", "system.reg", "userdef.reg"}) {
+    const auto path = paths->bottle / hive;
+    bool inspected = false;
+    const auto mode = FileMode(path, &inspected);
+    if (!inspected) return Failed("repair-registry", std::string("cannot inspect bottle registry ") + hive);
+    if (mode == 0600 || mode == 0644) continue;
+    const auto bytes = ReadBounded(path, 32u * 1024u * 1024u);
+    if (!bytes) return Failed("repair-registry", std::string("cannot read bottle registry ") + hive);
+    const auto temporary = paths->bottle / (std::string(".") + hive + ".mode-fix");
+    ::unlink(temporary.c_str());
+    if (!WriteFile(temporary, *bytes, 0600) || !SyncPath(temporary, false) ||
+        ::rename(temporary.c_str(), path.c_str()) != 0 || !SyncPath(paths->bottle, true)) {
+      ::unlink(temporary.c_str());
+      return Failed("repair-registry", std::string("cannot normalize bottle registry ") + hive);
+    }
+  }
   // The profile only matters to FTP: what can't be opened is logged, never a failure of the game.
   SharedTreeResult opened;
   if (shared) opened = OpenTreeToEveryone(paths->bottle / "drive_c/users/prospero", {operations_.private_profile_paths, {}});
@@ -1004,7 +1025,7 @@ bool FilesystemPackageInstaller::PublicationMatches(
     return ::flock(descriptor, LOCK_SH | LOCK_NB);
 #endif
   };
-  const auto canonical = "/data/homebrew/" + record.title_id + "/game-launch.json";
+  const auto canonical = std::string(kManagedTitleRoot) + "/" + record.title_id + "/game-launch.json";
   PwTitlePublicationDescriptor descriptor{}; char error[256]{};
   if (pw_title_publication_read_descriptor(canonical.c_str(), record.title_id.c_str(), &platform,
       &descriptor, error, sizeof(error)) != PW_OK) return false;
@@ -1323,7 +1344,11 @@ PackageActionResult FilesystemPackageInstaller::CopyMappings(
             profile_relative.end();
     const bool private_profile_file = profile_file &&
         IsPrivateProfilePath(relative.lexically_relative(profile_relative), operations_.private_profile_paths);
-    const unsigned mode = private_profile_file ? 0600 : profile_file ? (0666 | (mapping.file->mode & 0111))
+    const bool registry_hive = template_stage &&
+        (mapping.destination_relative == "user.reg" || mapping.destination_relative == "system.reg" ||
+         mapping.destination_relative == "userdef.reg");
+    const unsigned mode = private_profile_file || registry_hive ? 0600
+                          : profile_file ? (0666 | (mapping.file->mode & 0111))
                           : template_stage ? (0600 | (mapping.file->mode & 0100)) : mapping.file->mode;
     const int output = ::open(destination.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode);
     if (input < 0 || output < 0) {
@@ -1825,6 +1850,10 @@ PackageActionResult FilesystemPackageInstaller::CopyTemplate(
     if (!BottleOwned(record, *paths)) return Failed("bottle-collision", "mutable bottle exists without matching ownership");
     if (!SyncTree(paths->bottle) || !SyncAncestors(paths->bottle.parent_path()))
       return Failed("sync-failed", "owned mutable bottle durability could not be established");
+    if (operations_.migrate_legacy_bottle) {
+      const auto migrated = operations_.migrate_legacy_bottle(record, paths->bottle);
+      if (migrated.state != PackageActionState::kComplete) return migrated;
+    }
     return profile_shared_ ? SettleBottleModes(record) : Complete();
   }
   auto result = CopyMappings(record, TemplateMappings(), paths->bottle_staging,
@@ -1834,6 +1863,10 @@ PackageActionResult FilesystemPackageInstaller::CopyTemplate(
   const bool owned = BottleOwned(record, *paths);
   if (operations_.log) operations_.log("template check " + PartTimes{}.Summary(started));
   if (!owned) return Failed("template-validation", "published bottle failed semantic validation");
+  if (operations_.migrate_legacy_bottle) {
+    const auto migrated = operations_.migrate_legacy_bottle(record, paths->bottle);
+    if (migrated.state != PackageActionState::kComplete) return migrated;
+  }
   // Folders made before this bottle (its data root for the title metadata) get the kit's mode too.
   return profile_shared_ ? SettleBottleModes(record) : result;
 }

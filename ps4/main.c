@@ -60,6 +60,10 @@ int playden_ps4_controls_step(size_t row, int direction);
 int playden_ps4_controls_reset(size_t row);
 int playden_ps4_controls_edit(size_t row, int user_id);
 void playden_ps4_log_text(const char *line);
+/* Weak: the UI PRX links ps4/homebrew_preview.cpp; the bring-up shell executable does not. */
+__attribute__((weak)) int playden_ps4_preview_wanted(void);
+__attribute__((weak)) void playden_ps4_preview_run(int video, void **buffers, int buffer_count, int frame_width,
+                                                    int frame_height);
 int playden_ps4_saves_state(void);
 void playden_ps4_saves_start(uint32_t app_id, int resolution);
 size_t playden_ps4_overrides_open(size_t row);
@@ -235,7 +239,9 @@ int playden_ps4_main(int argc, char **argv) {
     int override_count = 0;    /* the picker's choices; "Type your own" follows them */
     // Restore a saved Steam session silently. With no cached credentials the
     // launcher remains on Connect Steam and does not start a QR flow.
-    if (playden_ps4_auth_restore_cached()) page = 1;
+    /* Playden's own UI (the preview switch file) brings its own services: no second session restore here. */
+    const int preview = playden_ps4_preview_wanted && playden_ps4_preview_run && playden_ps4_preview_wanted();
+    if (!preview && playden_ps4_auth_restore_cached()) page = 1;
     selected = 4;
     for (int i = 0; i < BUFFERS; ++i) {
         buffers[i] = (uint8_t *)memory + (size_t)i * FRAME_BYTES;
@@ -254,6 +260,9 @@ int playden_ps4_main(int argc, char **argv) {
     sceSystemServiceHideSplashScreen();
     sceVideoOutSubmitFlip(handle, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
     log_line("PLDN10001: interactive launcher shell displayed");
+    /* /data/PLDN10001/ui-preview: Playden's own UI on the CPU renderer, for measuring (ps4/homebrew_preview.cpp). */
+    if (preview)
+        playden_ps4_preview_run(handle, buffers, BUFFERS, WIDTH, HEIGHT);
 
     int user = -1, pad = -1, pad_ready = 0;
     if (sceUserServiceInitialize(NULL) >= 0 &&

@@ -11,7 +11,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#if defined(__PROSPERO__) || (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5)
+#if defined(__PROSPERO__) || (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
 // A PS5 title can't open relative to a directory descriptor: its openat/mkdirat take only
 // AT_FDCWD (any real descriptor is EINVAL), and fchdir crashes it. Each step opens the absolute
 // path without following its last component, then checks that what it opened is the entry the

@@ -1,4 +1,5 @@
 #include "runtime/settings_publication.h"
+#include "runtime/title_root.h"
 
 #include "platform/usb_mount.h"
 #include "runtime/publication_contract.h"
@@ -32,7 +33,7 @@ bool PathsMatch(const SettingsPublicationOperation& o, const PublicationPaths& p
   return p.profile == Map(prefix, profiles + o.plan.profile_id + ".profile") &&
       p.catalog == Map(prefix, profiles + "profiles.lst") &&
       p.input_directory == Map(prefix, o.install.data_root + "/library/input") &&
-      p.descriptor == Map(prefix, "/data/homebrew/" + o.install.title_id + "/game-launch.json") &&
+      p.descriptor == Map(prefix, std::string(kManagedTitleRoot) + "/" + o.install.title_id + "/game-launch.json") &&
       p.metadata == Map(prefix, profiles + ".playden-publication");
 }
 // The publisher still holds its lease: the descriptor is open and is the file the
@@ -139,7 +140,7 @@ std::optional<std::string> LiveGameRoot(const std::string& title_id, const std::
   const auto host = prefix.string(); PwTitlePublicationPlatform platform{};
   platform.host_root = host.empty() ? nullptr : host.c_str(); platform.owner_uid = geteuid();
   PwTitlePublicationDescriptor descriptor{}; char error[256]{};
-  if (pw_title_publication_read_descriptor(("/data/homebrew/" + title_id + "/game-launch.json").c_str(), title_id.c_str(),
+  if (pw_title_publication_read_descriptor((std::string(kManagedTitleRoot) + "/" + title_id + "/game-launch.json").c_str(), title_id.c_str(),
         &platform, &descriptor, error, sizeof(error)) != PW_OK)
     return std::nullopt;
   return std::string(descriptor.launch.game_root);
@@ -237,7 +238,7 @@ PackageActionResult VerifyMovedPublication(const RuntimeInstall& r, const GameRo
   const auto descriptor_digest = [&] {
     return HashArtifactBytes(std::string_view(reinterpret_cast<const char*>(descriptor.bytes), descriptor.length));
   };
-  if (pw_title_publication_read_descriptor(("/data/homebrew/" + r.title_id + "/game-launch.json").c_str(), r.title_id.c_str(),
+  if (pw_title_publication_read_descriptor((std::string(kManagedTitleRoot) + "/" + r.title_id + "/game-launch.json").c_str(), r.title_id.c_str(),
         &platform, &descriptor, error, sizeof(error)) != PW_OK ||
       descriptor.launch.app_id != r.runtime_number || descriptor.launch.install_id != r.install_id ||
       descriptor.launch.data_root != r.data_root || descriptor.launch.game_root != published_from ||
@@ -308,7 +309,7 @@ PackageActionResult PublishSettingsOperation(const SettingsPublicationOperation&
         Map(deps.host_namespace_prefix, profile_root + previous.plan.profile_id + ".profile"),
         Map(deps.host_namespace_prefix, profile_root + "profiles.lst"),
         Map(deps.host_namespace_prefix, previous.install.data_root + "/library/input"),
-        Map(deps.host_namespace_prefix, "/data/homebrew/" + previous.install.title_id + "/game-launch.json"),
+        Map(deps.host_namespace_prefix, std::string(kManagedTitleRoot) + "/" + previous.install.title_id + "/game-launch.json"),
         Map(deps.host_namespace_prefix, profile_root + ".playden-publication")};
       // A journal left by a game folder that moved names the old folder, which no longer exists.
       // Compared without the USB mount's number: published naming no mount, the drive may have changed places first.
@@ -671,7 +672,7 @@ PackageActionResult PreflightSettingsPublication(const SettingsPublicationOperat
     auto hash = HashArtifactBytes(o.previous_metadata_bytes);
     if (!hash || pw_title_publication_metadata_parse(reinterpret_cast<const uint8_t*>(o.previous_metadata_bytes.data()),
         o.previous_metadata_bytes.size(), &previous) != PW_OK ||
-        pw_title_publication_read_descriptor(("/data/homebrew/" + o.install.title_id + "/game-launch.json").c_str(),
+        pw_title_publication_read_descriptor((std::string(kManagedTitleRoot) + "/" + o.install.title_id + "/game-launch.json").c_str(),
         o.install.title_id.c_str(), &platform, &descriptor, error, sizeof(error)) != PW_OK ||
         descriptor.launch.app_id != o.install.runtime_number ||
         pw_title_publication_verify_locked(&descriptor, &platform, borrowed,
@@ -843,7 +844,7 @@ Result<SettingsPublicationOperation> CaptureSettingsPublicationOperation(const R
     } else if (const auto known_mount = platform::UsbMountOf(r.install_path);
         pw_title_publication_parse(reinterpret_cast<const uint8_t*>(receipt.bytes.data()), receipt.bytes.size(), &parsed) != PW_OK ||
         parsed.phase != PW_TITLE_PUBLICATION_COMMITTED || !prior || !prior->present ||
-        pw_title_publication_read_descriptor(("/data/homebrew/" + r.title_id + "/game-launch.json").c_str(), r.title_id.c_str(),
+        pw_title_publication_read_descriptor((std::string(kManagedTitleRoot) + "/" + r.title_id + "/game-launch.json").c_str(), r.title_id.c_str(),
         &platform, &descriptor, error, sizeof(error)) != PW_OK || descriptor.launch.app_id != r.runtime_number ||
         (platform.known_game_mount = known_mount.empty() ? nullptr : known_mount.c_str(), false) ||
         pw_title_publication_verify_locked(&descriptor, &platform, borrowed,
@@ -890,7 +891,7 @@ Result<SettingsPublicationOperation> CaptureSettingsPublicationOperation(const R
   }
   const auto profiles = r.data_root + "/library/profiles/";
   PublicationPaths paths{Map(prefix, profiles + plan.profile_id + ".profile"), Map(prefix, profiles + "profiles.lst"),
-      Map(prefix, r.data_root + "/library/input"), Map(prefix, "/data/homebrew/" + r.title_id + "/game-launch.json"),
+      Map(prefix, r.data_root + "/library/input"), Map(prefix, std::string(kManagedTitleRoot) + "/" + r.title_id + "/game-launch.json"),
       Map(prefix, profiles + ".playden-publication")};
   auto preflight = PreflightSettingsPublication(*frozen, paths, borrowed, prefix, moved);
   if (!Complete(preflight) || !held()) return fail(preflight.message.empty() ? "Captured operation preflight failed." : preflight.message);

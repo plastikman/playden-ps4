@@ -660,3 +660,28 @@ int playden_ps4_wine_dispatch(int argc, char **argv)
     statusf("Runtime failed: Wine entry returned unexpectedly.");
     return 1;
 }
+
+int playden_ps4_wine_launch_descriptor(const char *title_id, const char *session_id)
+{
+    char descriptor[96], session[48], line[192];
+    if (!title_id || strlen(title_id) != 9 || strncmp(title_id, "FAKE78", 6) ||
+        !session_id || strlen(session_id) != 36) return -1;
+    for (int i = 6; i < 9; ++i)
+        if (title_id[i] < '0' || title_id[i] > '9') return -1;
+    for (int i = 0; i < 36; ++i) {
+        const char c = session_id[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-') return -1;
+        } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return -1;
+    }
+    snprintf(descriptor, sizeof(descriptor), "descriptor=/data/PLDN10001/%s/game-launch.json", title_id);
+    snprintf(session, sizeof(session), "session=%s", session_id);
+    const char *arguments[] = {"pldn-runtime=wine", descriptor, session, NULL};
+    snprintf(line, sizeof(line), "PLDN10001 runtime: handoff title=%s session=%s", title_id, session_id);
+    log_line(line);
+    const int result = sceSystemServiceLoadExec("/app0/eboot.bin", arguments);
+    snprintf(line, sizeof(line), "PLDN10001 runtime: descriptor LoadExec returned rc=%d", result);
+    log_line(line);
+    statusf("Runtime handoff failed (rc=%d).", result);
+    return result ? result : -1;
+}

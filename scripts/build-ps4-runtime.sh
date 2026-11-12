@@ -104,7 +104,7 @@ cmake -S "$ROOT/ps4" -B "$CMAKE_BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$COMPAT/cmake/ps4-openorbis.cmake" \
     -DOO_PS4_TOOLCHAIN="$SDK" -DORBIS_COMPAT_DIR="$COMPAT" \
     -DCMAKE_BUILD_TYPE=Release
-cmake --build "$CMAKE_BUILD" --target playden_ps4_shell -j"${JOBS:-4}"
+cmake --build "$CMAKE_BUILD" --target playden_ps4_shell playden_ps4_homebrew_preview playden_ps4_homebrew_live playden_ps4_publication playden_ps4_ui_platform -j"${JOBS:-4}"
 
 mkdir -p "$BUILD/obj" "$BUILD/prx" "$BUILD/stub" "$PKG_OUT"
 PRX_BUILD="$BUILD/prx"
@@ -127,13 +127,27 @@ echo "== link Playden UI into a relocatable PRX"
 "$CC" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
     -c "$ROOT/ps4/playden_heap.c" -o "$BUILD/obj/playden_heap.o"
 HEAP_WRAPS="-Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=posix_memalign"
+# opendir fails with EPERM for every folder in this title (02.34 probe) while
+# sceKernelGetdents lists them, so the module's folder listing, std::filesystem's
+# included, goes through ps4/dir_wrap.c.
+"$CC" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
+    -c "$ROOT/ps4/dir_wrap.c" -o "$BUILD/obj/dir_wrap.o"
+HEAP_WRAPS="$HEAP_WRAPS -Wl,--wrap=opendir -Wl,--wrap=fdopendir -Wl,--wrap=readdir -Wl,--wrap=closedir"
+# The SDK's stat leaves st_dev/st_ino/st_uid/st_gid zero (sceKernelStat, 02.38 probe), which
+# Playden's ManagedDirectory reads as a replaced folder (ESTALE): ps4/stat_wrap.c fills them from fstat.
+"$CC" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
+    -c "$ROOT/ps4/stat_wrap.c" -o "$BUILD/obj/stat_wrap.o"
+HEAP_WRAPS="$HEAP_WRAPS -Wl,--wrap=stat -Wl,--wrap=lstat -Wl,--wrap=fstatat"
 "$CC" -shared -Wl,-Bsymbolic -Wl,--eh-frame-hdr -Wl,-soname,playden_ui.prx \
     -Wl,--warn-unresolved-symbols $HEAP_WRAPS -o "$PRX_BUILD/playden_ui.shared.elf" \
+    -Wl,-u,playden_ps4_preview_wanted -Wl,-u,playden_ps4_preview_run \
     "$CMAKE_BUILD/CMakeFiles/playden_ps4_app_objects.dir/main.c.obj" \
     "$CMAKE_BUILD/CMakeFiles/playden_ps4_app_objects.dir/wine_runtime.c.obj" \
     "$BUILD/obj/runtime_entry.o" \
     "$BUILD/obj/orbis_bigheap.o" \
     "$BUILD/obj/playden_heap.o" \
+    "$BUILD/obj/dir_wrap.o" \
+    "$BUILD/obj/stat_wrap.o" \
     "$CMAKE_BUILD/libplayden_ps4_hui.a" \
     -Wl,--start-group \
     "$CMAKE_BUILD/libplayden_ps4_steam_auth.a" \
@@ -143,6 +157,10 @@ HEAP_WRAPS="-Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=fr
     "$CMAKE_BUILD/libplayden_ps4_game_settings.a" \
     "$CMAKE_BUILD/libplayden_ps4_miniz.a" \
     "$CMAKE_BUILD/libplayden_ps4_update.a" \
+    "$CMAKE_BUILD/libplayden_ps4_homebrew_preview.a" \
+    "$CMAKE_BUILD/libplayden_ps4_homebrew_live.a" \
+    "$CMAKE_BUILD/libplayden_ps4_publication.a" \
+    "$CMAKE_BUILD/libplayden_ps4_ui_platform.a" \
     -Wl,--end-group \
     "$ROOT/scripts/network-deps/.deps/ps4/lib/libcurl.a" \
     "$ROOT/scripts/network-deps/.deps/ps4/lib/libmbedtls.a" \
@@ -156,20 +174,27 @@ HEAP_WRAPS="-Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=fr
         tail -40 "$PRX_BUILD/playden_ui.link.log" >&2
         die "Playden UI PRX link failed"
     }
-# The UI PRX is entered through its descriptor (ps4/runtime_entry.c); its .init_array does not
-# run, so a namespace-scope object with a constructor stays all-zero (a std::map crashed 01.91).
-# These four only hold objects that are valid when zeroed; anything new must use function-local
-# statics instead.
-static_inits="$(nm "$PRX_BUILD/playden_ui.shared.elf" | awk '$3 ~ /^_GLOBAL__sub_I_/ {sub(/^_GLOBAL__sub_I_/, "", $3); print $3}' |
-    grep -vxE 'cm_client\.cpp|glyphs\.cpp|orbis_paths\.cpp|steam_auth\.cpp' || true)"
-[[ -z "$static_inits" ]] ||
-    die "UI PRX has static initializers that never run: $static_inits (use function-local statics)"
+# The UI PRX runs its own .init_array at entry (ps4/runtime_entry.c, playden_ps4_start): the system
+# loader runs a module's init only through Sony's C runtime, which this module has none of. Check the
+# bounds it walks are this module's .init_array, so namespace-scope objects with constructors are fine.
+init_array_section="$(readelf -SW "$PRX_BUILD/playden_ui.shared.elf" | sed -E 's/^ *\[ *[0-9]+\] *//' |
+    awk '$1 == ".init_array" {print $3, $5}')"
+read -r init_array_addr init_array_size <<<"$init_array_section"
+init_bounds="$(nm "$PRX_BUILD/playden_ui.shared.elf" | awk '$3 == "__init_array_start" || $3 == "__init_array_end" {print $3, $1}' | sort)"
+[[ -n "$init_array_addr" ]] || die "UI PRX has no .init_array"
+init_start="$(awk '$1 == "__init_array_start" {print $2}' <<<"$init_bounds")"
+init_end="$(awk '$1 == "__init_array_end" {print $2}' <<<"$init_bounds")"
+[[ -n "$init_start" && -n "$init_end" ]] || die "UI PRX does not define __init_array_start/__init_array_end"
+(( 16#$init_start == 16#$init_array_addr && 16#$init_end == 16#$init_array_addr + 16#$init_array_size )) ||
+    die "UI PRX init_array bounds $init_start-$init_end do not match .init_array $init_array_addr+$init_array_size"
 heap_exports="$(nm -D "$PRX_BUILD/playden_ui.shared.elf")"
 # Nothing in the module may still call libc's allocator directly, except the heap's own
 # fallback for memory libc allocated.
 direct_alloc="$(nm "$PRX_BUILD/playden_ui.shared.elf" | awk '$1 == "U" && $2 ~ /^(malloc|calloc|realloc|posix_memalign|aligned_alloc|memalign)$/ {print $2}')"
 [[ "$direct_alloc" == "realloc" || -z "$direct_alloc" ]] ||
     die "UI PRX still imports libc allocators directly: $direct_alloc"
+direct_dir="$(nm "$PRX_BUILD/playden_ui.shared.elf" | awk '$1 == "U" && $2 ~ /^(opendir|fdopendir|readdir|closedir)$/ {print $2}' | tr '\n' ' ')"
+[[ -z "$direct_dir" ]] || die "UI PRX still imports libc directory calls directly: $direct_dir"
 for heap_symbol in sceLibcHeapSize sceLibcHeapExtendedAlloc; do
     grep -Eq " [DB] ${heap_symbol}\$" <<<"$heap_exports" ||
         die "UI PRX does not export $heap_symbol"
@@ -263,7 +288,43 @@ printf '%s\n' "$TEMPLATE_STAMP" >"$STAGE/runtime-template/hl2-prefix.stamp"
 mkdir -p "$STAGE/runtime/input"
 cp "$ROOT/runtime/input/"*.input "$STAGE/runtime/input/"
 cp "$ROOT/third_party/ps5-homebrew-ui/assets/fonts/inter-regular.huifont" "$STAGE/assets/inter-regular.huifont"
+# PS4_DEV_CONF=<host>[:<port>] stages /app0/dev.conf, which the bundled Orbis-Win reads at the top of
+# main() (before the /data grant, when its own settings.conf is not readable yet) to send its log to
+# that PC. Test builds only; a release build leaves it out, as Orbis-Win's own packager does.
+if [[ -n "${PS4_DEV_CONF:-}" ]]; then
+    printf 'DEV_ENABLED=1\nDEV_SERVER=%s\nDEV_PORT=%s\n' "${PS4_DEV_CONF%%:*}" \
+        "$([[ $PS4_DEV_CONF == *:* ]] && printf '%s' "${PS4_DEV_CONF##*:}" || printf 9300)" >"$STAGE/dev.conf"
+    echo "== staged /app0/dev.conf -> ${PS4_DEV_CONF}"
+fi
+# Playden's own UI for the CPU-renderer preview (ps4/homebrew_preview.cpp): its simulation catalog,
+# fixture art, glyphs, presets and the Barlow/Noto atlases, baked as the desktop build bakes them.
+HUI_BAKER="$BUILD/host/hui-bake-font"
+mkdir -p "$BUILD/host" "$BUILD/homebrew-fonts"
+[[ -x "$HUI_BAKER" ]] || g++ -std=c++20 -O2 -I"$ROOT/third_party/ps5-homebrew-ui/third_party/stb" \
+    "$ROOT/third_party/ps5-homebrew-ui/tools/font-baker/bake_font.cpp" -o "$HUI_BAKER"
+FIXTURE_FONTS="$ROOT/fixtures/ui-comparison/assets/fonts"
+FIXTURE_CATALOG="$ROOT/fixtures/ui-comparison/catalog.json"
+bake() { [[ -s "$BUILD/homebrew-fonts/$2" ]] || "$HUI_BAKER" "$1" "$BUILD/homebrew-fonts/$2" 56 8 2048 "$3" >/dev/null 2>&1 ||
+    die "could not bake $2"; }
+bake "$FIXTURE_FONTS/Barlow-Regular.ttf" barlow-regular.huifont european
+bake "$FIXTURE_FONTS/Barlow-Medium.ttf" barlow-medium.huifont european
+bake "$FIXTURE_FONTS/Barlow-SemiBold.ttf" barlow-semibold.huifont european
+bake "$FIXTURE_FONTS/BarlowCondensed-Medium.ttf" barlow-condensed-medium.huifont european
+bake "$FIXTURE_FONTS/BarlowCondensed-SemiBold.ttf" barlow-condensed-semibold.huifont european
+bake "$FIXTURE_FONTS/NotoSansCJKsc-Regular.otf" noto-cjk-fallback.huifont "european,text=$FIXTURE_CATALOG"
+bake "$FIXTURE_FONTS/NotoSansArabic.ttf" noto-arabic-fallback.huifont "basic,text=$FIXTURE_CATALOG"
+bake "$ROOT/assets/fonts/NotoSans-Regular.ttf" noto-greek-fallback.huifont "european,text=$FIXTURE_CATALOG"
+mkdir -p "$STAGE/homebrew/assets" "$STAGE/homebrew/fixtures"
+cp -r "$ROOT/fixtures/ui-comparison/assets/art" "$ROOT/fixtures/ui-comparison/assets/glyphs" "$STAGE/homebrew/assets/"
+mkdir -p "$STAGE/homebrew/assets/fonts"
+cp "$BUILD"/homebrew-fonts/*.huifont "$STAGE/homebrew/assets/fonts/"
+cp "$FIXTURE_FONTS"/*.txt "$ROOT/assets/fonts/NotoSans-OFL.txt" "$STAGE/homebrew/assets/fonts/"
+cp -r "$ROOT/runtime" "$STAGE/homebrew/assets/runtime"
+cp "$FIXTURE_CATALOG" "$ROOT/fixtures/ui-comparison/scenarios.json" "$STAGE/homebrew/fixtures/"
 cp "$ROOT/scripts/network-deps/.deps/ps4/cacert.pem" "$STAGE/assets/cacert.pem"
+KIT_ID="orbis-win-ps4-${PW_SOURCE_COMMIT:0:12}-${TEMPLATE_STAMP:0:12}"
+python3 "$ROOT/scripts/ps4-kit-view.py" "$STAGE" "$KIT_ID" \
+    "$PW_SOURCE_COMMIT" "$WINE_VERSION"
 cp "$STEAMWORKS_DIR/steam_api.dll" "$STEAMWORKS_DIR/steam_api64.dll" \
     "$STEAMWORKS_DIR/steam.dll" "$STEAMWORKS_DIR/LICENSE" "$STEAMWORKS_DIR/README.md" \
     "$STAGE/runtime/steamworks/"

@@ -11,6 +11,7 @@
 #include "homebrew/queue_layout.hpp"
 #include "homebrew/simulation.hpp"
 #include "homebrew/store_art.hpp"
+#include "homebrew/time_text.hpp"
 #include "homebrew/title_icon.hpp"
 #include <ctime>
 
@@ -1031,10 +1032,8 @@ class Render::Impl
         std::string clock_label = "21:42";
         if (!current_state_->simulation_mode) {
             const std::time_t wall_time = static_cast<std::time_t>(current_state_->clock_ticks);
-            char formatted[6]{};
             const auto* local = std::localtime(&wall_time);
-            clock_label = local != nullptr && std::strftime(formatted, sizeof(formatted), "%H:%M", local)
-                ? formatted : "--:--";
+            clock_label = local != nullptr ? ClockText(*local) : "--:--";
         }
         ui::text(scene_, fonts_.regular, clock_label, 1824.0F, 91.0F, 22.0F, kSecondary,
                  gfx::Align::right);
@@ -3176,15 +3175,13 @@ class Render::Impl
         const auto when = [&](std::int64_t time) -> std::string {
             if (time <= 0) return "—";
             const std::time_t value = static_cast<std::time_t>(time);
-            char text[32]{};
             const auto *found = std::localtime(&value);
             if (found == nullptr) return "—";
             const std::tm local = *found;  // localtime reuses one buffer
             const std::time_t now = std::time(nullptr);
             const auto *today = std::localtime(&now);
             // Another year shows the year instead of the time: "31 Aug 2024" next to "770 days ago" (#50).
-            const char *format = today != nullptr && today->tm_year != local.tm_year ? "%d %b %Y" : "%d %b %H:%M";
-            return std::strftime(text, sizeof(text), format, &local) ? text : "—";
+            return DayText(local, today != nullptr && today->tm_year != local.tm_year);
         };
         const auto size = [](std::uint64_t bytes) {
             char text[32];

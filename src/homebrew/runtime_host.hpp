@@ -43,6 +43,7 @@ struct RuntimeKit {
   std::string expected_manifest_sha256;  // the kit this build was tested with
   std::string prospero_win_revision;     // what its PS5 titles were built from
   bool source_dirty = false;
+  std::filesystem::path manifest_path;   // empty uses <view.root>/manifest.json
 };
 
 // A game's private bottle kept after its PS5 title was removed: its saves and

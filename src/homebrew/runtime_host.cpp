@@ -2,6 +2,9 @@
 // Copyright (c) 2026 Playden contributors
 // SPDX-License-Identifier: MIT
 #include "homebrew/runtime_host.hpp"
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+#include "runtime_ps4/native_coordinator_ps4.hpp"
+#endif
 
 #include "homebrew/gog_icon.hpp"
 #include "pw_app_profile.h"
@@ -317,6 +320,14 @@ std::optional<std::string> RandomUuid() { return playden::RandomUuid(); }
 // run after the whole composition exists. The installer's publication callback and
 // the service's driver dereference the owner at call time. Members are destroyed
 // in reverse order, so no collaborator outlives what it references.
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+// The PS4 runs every game inside Playden's own title, which restarts into its bundled runtime: a
+// game's title is a name for its profile, never running while Playden is up (ps4/runtime_ps4).
+using NativeCoordinatorImpl = playden::ps4::Ps4NativeCoordinator;
+#else
+using NativeCoordinatorImpl = ps5::Ps5NativeCoordinator;
+#endif
+
 struct RuntimeHost::Composition {
   explicit Composition(const RuntimeHostConfig& config)
       : storage(config.state_root.string()),
@@ -339,7 +350,7 @@ struct RuntimeHost::Composition {
   std::optional<RuntimeKit> kit;
   std::unique_ptr<rt::PackageInstaller> installer;
   ps5::TitleRegistry registry;
-  std::unique_ptr<ps5::Ps5NativeCoordinator> coordinator;
+  std::unique_ptr<NativeCoordinatorImpl> coordinator;
   std::unique_ptr<rt::SettingsPublicationOwner> owner;
   std::unique_ptr<rt::RuntimeInstallService> service;
   std::filesystem::path request_directory;
@@ -728,7 +739,8 @@ void RuntimeHost::SetSteamAccount(std::string account_name, std::uint64_t steam_
 // which are gone: say so instead of failing on the first missing file.
 std::string RuntimeHost::KitReplaced(const Composition& c) const {
   if (!c.kit || c.kit->manifest_sha256.empty() || !config_.package_operations.hash_file) return {};
-  const auto current = config_.package_operations.hash_file(c.kit->view.root / "manifest.json");
+  const auto path = c.kit->manifest_path.empty() ? c.kit->view.root / "manifest.json" : c.kit->manifest_path;
+  const auto current = config_.package_operations.hash_file(path);
   if (current && *current == c.kit->manifest_sha256) return {};
   return "The runtime kit changed while Playden was running. Quit Playden and start it again.";
 }
@@ -5467,8 +5479,13 @@ bool RuntimeHost::RunServices() {
     }
     auto native = config_.native;
     if (!native.log) native.log = [this](const std::string& line) { Log(line); };
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+    (void)native;
+    c.coordinator = std::make_unique<NativeCoordinatorImpl>(*c.installer);
+#else
     c.coordinator = std::make_unique<ps5::Ps5NativeCoordinator>(
         c.records, *c.installer, c.registry, config_.homebrew_root, std::move(native));
+#endif
     c.owner = std::make_unique<rt::SettingsPublicationOwner>(
         c.records, *c.installer, *c.coordinator,
         c.kit && rt::KitCapabilitiesFromManifest(c.kit->capabilities, true).game_root_unowned,

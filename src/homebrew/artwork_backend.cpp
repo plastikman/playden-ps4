@@ -34,7 +34,30 @@ struct alignas(std::max_align_t) AllocationHeader {
   DecodeBudget* owner = nullptr;
 };
 
+#if defined(PLAYDEN_PLATFORM_PS4)
+// The PS4 UI module is loaded without dynamic TLS support for its worker threads (where artwork is
+// decoded), so the budget lives in a pthread key there; reads and writes go through the same name.
+}  // namespace
+#include <pthread.h>
+namespace {
+pthread_key_t DecodeBudgetKey() {
+  static pthread_key_t key = [] {
+    pthread_key_t made{};
+    pthread_key_create(&made, nullptr);
+    return made;
+  }();
+  return key;
+}
+struct DecodeBudgetSlot {
+  operator DecodeBudget*() const { return static_cast<DecodeBudget*>(pthread_getspecific(DecodeBudgetKey())); }
+  DecodeBudgetSlot& operator=(DecodeBudget* budget) {
+    pthread_setspecific(DecodeBudgetKey(), budget);
+    return *this;
+  }
+} g_decode_budget;
+#else
 thread_local DecodeBudget* g_decode_budget = nullptr;
+#endif
 
 void* ArtworkAllocate(std::size_t size) {
   DecodeBudget* budget = g_decode_budget;

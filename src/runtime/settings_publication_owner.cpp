@@ -1,4 +1,5 @@
 #include "runtime/settings_publication_owner.h"
+#include "runtime/title_root.h"
 #include "platform/usb_mount.h"
 #include "runtime/publication_contract.h"
 #include "runtime/artifact_hash.h"
@@ -44,7 +45,7 @@ PublicationPaths OperationPaths(const SettingsPublicationOperation& operation, c
   const auto profiles = operation.install.data_root + "/library/profiles/";
   return {map(profiles + operation.plan.profile_id + ".profile"), map(profiles + "profiles.lst"),
           map(operation.install.data_root + "/library/input"),
-          map("/data/homebrew/" + operation.install.title_id + "/game-launch.json"),
+          map(std::string(kManagedTitleRoot) + "/" + operation.install.title_id + "/game-launch.json"),
           map(profiles + ".playden-publication")};
 }
 // A Ready update publishes a newer revision, or the same one again when the game folder
@@ -453,7 +454,7 @@ PackageActionResult SettingsPublicationOwner::Resume(const RuntimeInstall& recor
   const auto profiles = operation->install.data_root + "/library/profiles/";
   const PublicationPaths paths{map(profiles + operation->plan.profile_id + ".profile"), map(profiles + "profiles.lst"),
       map(operation->install.data_root + "/library/input"),
-      map("/data/homebrew/" + operation->install.title_id + "/game-launch.json"), map(profiles + ".playden-publication")};
+      map(std::string(kManagedTitleRoot) + "/" + operation->install.title_id + "/game-launch.json"), map(profiles + ".playden-publication")};
   auto dependencies = Dependencies(prefix, GameRootMoveOf(*current));
   return PublishSettingsOperation(*operation, paths, dependencies);
 }

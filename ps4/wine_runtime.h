@@ -22,6 +22,9 @@ int playden_ps4_wine_prepare_game_prefix(uint32_t app_id);
 int playden_ps4_wine_prefix_path(uint32_t app_id, char *out, size_t capacity);
 int playden_ps4_wine_launch_hl2(void);
 int playden_ps4_wine_launch_game(uint32_t app_id);
+/* Relaunch this title into the bundled Wine module for a prepared Playden game.
+ * A successful LoadExec does not return. */
+int playden_ps4_wine_launch_descriptor(const char *title_id, const char *session_id);
 const char *playden_ps4_wine_status(void);
 /* 1 when this start is Wine handing back after a game (launcher=1). */
 int playden_ps4_wine_returned(void);

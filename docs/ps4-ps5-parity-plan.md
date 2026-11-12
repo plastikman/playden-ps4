@@ -1,5 +1,58 @@
 # Plan: PS4 parity with Playden for PS5
 
+## Runtime layout decision (2026-11-11)
+
+Use the PS5 runtime's on-disk contract on PS4. Playden's game data root is
+`/data/playden/games/<install_id>`; its bottle is
+`library/prefixes/game`, its profile is under `library/profiles`, and a small
+`/data/homebrew/FAKE78xxx/game-launch.json` names the game. The PS4 still runs
+Wine inside `PLDN10001`; these folders are descriptors, not separately
+registered PS4 titles. A Play request must pass a session ID to Orbis-Win, and
+Orbis-Win must write the result under that game's `logs/sessions` folder.
+
+The PS4 package generates a bundled kit view from its Wine prefix and runtime
+identity. The shared `FilesystemPackageInstaller` consumes that view, and the
+PS4 live composition builds a `RuntimeHost` with the shared controller. The
+Orbis-Win PS4 module on branch `playden-ps4-0170` now reads descriptors
+and writes session records; Playden hands a session to it with `LoadExec`. That
+branch starts from the hardware-tested 01.70 code and resumes the same session
+when Wine runs the next program in an execution chain.
+The package build requires a clean Orbis-Win manifest and copies its module
+unchanged. Hardware has not yet verified this path, so launch parity remains
+open.
+
+The new bottle is made from the matching Wine template. On first preparation,
+Playden copies the old prefix's `drive_c/users`, `user.reg` and `userdef.reg`
+into that bottle, flushes the files, then writes a completion marker. The old
+prefix is retained for recovery. Other changes in an old `system.reg` are not
+yet imported; verify a game with an existing save before considering this
+migration complete.
+
+Finish in this order:
+
+1. Confirm from a PS4 app process that `/data/playden` and `/data/homebrew`
+   can be created and written. FTP success does not prove app access. Stop
+   preparation with a clear reason if either root is unavailable.
+2. Port descriptor admission and session recording into the Orbis-Win PS4
+   Wine module. Select `data_root/library`, the published profile and its
+   `prefixes/game`; validate the descriptor, launch argument and publication
+   before Wine starts. Report start, exit and failure, including a failed
+   setup. The PS4 stat omission is handled through `fstat`; test the owner and
+   mode checks on hardware. Validate the profile and publication against the
+   descriptor before marking the runtime path ready for general use.
+3. Test the wired `RuntimeHostConfig::launch_title` same-title Wine handoff.
+   Check that the session record appears and that an abnormal exit reconciles
+   on the next Playden start.
+4. Migrate each old `/data/PLDN10001/prefixes/steam-<app>` and the special
+   Half-Life 2 prefix into that game's new bottle without discarding registry
+   or saves. A new template must be staged and owned before user data is
+   merged. Journal and verify each move. Existing Steam game files may stay
+   at `/data/PLDN10001/games/<app>`: the shared runtime records their
+   `install_path` separately from `data_root`.
+5. Test a prepared game, normal return, a runtime failure, an interrupted
+   preparation, and an existing save on hardware. Only then make the shared
+   runtime path the default player flow.
+
 ## Goal
 
 Bring the PS4 port to product-feature parity with Playden for PS5 while keeping

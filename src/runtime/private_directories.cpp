@@ -89,7 +89,8 @@ bool EnsurePrivateDirectories(const fs::path& boundary, const fs::path& private_
   return current->Validate();
 }
 namespace {
-#if defined(__PROSPERO__) || (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5)
+#if defined(__PROSPERO__) || (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
 constexpr bool kDescriptorRelative = false;  // as ManagedDirectory: no *at calls on the console
 #else
 constexpr bool kDescriptorRelative = true;

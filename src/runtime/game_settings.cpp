@@ -2764,25 +2764,35 @@ enum class RelativeRead { kMissing, kPresent, kError };
 
 RelativeRead ReadRegularAt(const ManagedDirectory& directory, const char* name,
                            std::size_t maximum, std::string* text,
-                           mode_t* mode = nullptr, bool private_file = false) {
+                           mode_t* mode = nullptr, bool private_file = false,
+                           std::string* failure = nullptr) {
+  const auto failed = [&](const char* stage, int error) {
+    if (failure) *failure = std::string(stage) + " (errno=" + std::to_string(error) + ")";
+    errno = error;
+    return RelativeRead::kError;
+  };
   const int file = directory.OpenRegularFile(name, private_file);
-  if (file < 0) return errno == ENOENT ? RelativeRead::kMissing : RelativeRead::kError;
+  if (file < 0) return errno == ENOENT ? RelativeRead::kMissing : failed("open", errno);
   struct stat status {}, after {};
-  if (::fstat(file, &status) != 0 || !S_ISREG(status.st_mode) ||
-      (private_file && (status.st_mode & 07777) != 0600 &&
-       (status.st_mode & 07777) != 0644)) {
-    ::close(file); return RelativeRead::kError;
+  if (::fstat(file, &status) != 0) { const int error = errno; ::close(file); return failed("fstat", error); }
+  if (!S_ISREG(status.st_mode)) { ::close(file); return failed("file type", EINVAL); }
+  if (private_file && (status.st_mode & 07777) != 0600 && (status.st_mode & 07777) != 0644) {
+    const int actual_mode = status.st_mode & 07777;
+    ::close(file);
+    if (failure) *failure = "mode=" + std::to_string(actual_mode);
+    errno = EACCES;
+    return RelativeRead::kError;
   }
   if (mode) *mode = status.st_mode & 0777;
   text->clear();
   char buffer[4096];
   while (true) {
     const auto count = ::read(file, buffer, sizeof(buffer));
-    if (count < 0) { ::close(file); return RelativeRead::kError; }
+    if (count < 0) { const int error = errno; ::close(file); return failed("read", error); }
     if (count == 0) break;
     if (text->size() + static_cast<std::size_t>(count) > maximum) {
       ::close(file);
-      return RelativeRead::kError;
+      return failed("size limit", EFBIG);
     }
     text->append(buffer, static_cast<std::size_t>(count));
   }
@@ -2791,8 +2801,10 @@ RelativeRead ReadRegularAt(const ManagedDirectory& directory, const char* name,
       status.st_uid == after.st_uid && status.st_mode == after.st_mode &&
       status.st_size == after.st_size && status.st_mtime == after.st_mtime &&
       status.st_ctime == after.st_ctime;
-  if (::close(file) != 0 || !unchanged || !directory.Validate())
-    return RelativeRead::kError;
+  const int close_result = ::close(file);
+  if (close_result != 0) return failed("close", errno);
+  if (!unchanged) return failed("changed while reading", ESTALE);
+  if (!directory.Validate()) return failed("directory validation", errno);
   return RelativeRead::kPresent;
 }
 
@@ -3372,13 +3384,14 @@ static bool ApplyRegistryFileValues(const std::vector<RegistryValue>& values, co
   if (values.empty()) return true;
   // The bottle may be 0711 (bottle-profile-shared).
   auto directory = ManagedDirectory::Open(prefix_dir, DirectoryPolicy::kPrivateTraversable);
-  if (!directory) return fail("cannot read the bottle's " + hive);
+  if (!directory) return fail("cannot open bottle for " + hive + " (errno=" + std::to_string(errno) + ")");
   std::string original;
   constexpr std::size_t kMaxRegistryBytes = 32u * 1024u * 1024u;
   mode_t original_mode = 0600;
+  std::string read_failure;
   if (ReadRegularAt(*directory, hive.c_str(), kMaxRegistryBytes, &original,
-                    &original_mode, true) != RelativeRead::kPresent) {
-    return fail("cannot read the bottle's " + hive);
+                    &original_mode, true, &read_failure) != RelativeRead::kPresent) {
+    return fail("cannot read the bottle's " + hive + ": " + read_failure);
   }
   std::string edited = original;
   if (!ApplyRegistryValues(&edited, values, unix_time, reason)) return false;
@@ -3570,11 +3583,13 @@ bool PointBottleAtKitMono(const std::string& template_dir, const std::string& pr
   constexpr const char* kName = "RuntimePath";
   constexpr std::size_t kMaxRegistryBytes = 32u * 1024u * 1024u;
   auto bottle = ManagedDirectory::Open(prefix_dir, DirectoryPolicy::kPrivateTraversable);
-  if (!bottle) return errno == ENOENT ? true : fail("cannot open the bottle");
+  if (!bottle) return errno == ENOENT ? true : fail("cannot open the bottle (errno=" + std::to_string(errno) + ")");
   std::string bottle_reg;
-  const auto state = ReadRegularAt(*bottle, "user.reg", kMaxRegistryBytes, &bottle_reg, nullptr, true);
+  std::string read_failure;
+  const auto state = ReadRegularAt(*bottle, "user.reg", kMaxRegistryBytes, &bottle_reg, nullptr, true,
+                                   &read_failure);
   if (state == RelativeRead::kMissing) return true;  // the bottle comes later
-  if (state != RelativeRead::kPresent) return fail("cannot read the bottle's user.reg");
+  if (state != RelativeRead::kPresent) return fail("cannot read the bottle's user.reg: " + read_failure);
   const auto current = RegistryData(bottle_reg, kKey, kName);
   // The packaged template writes Z:\data\playden\kits\<kit id>\mono\wine-mono-<version>, escaped.
   static constexpr std::string_view kKitsFolder = R"("Z:\\data\\playden\\kits\\)";

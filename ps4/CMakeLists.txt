@@ -255,6 +255,139 @@ target_link_libraries(playden_ps4_shell PRIVATE playden_ps4_steam_cloud)
 target_include_directories(playden_ps4_hui PRIVATE
     "${PLAYDEN_ROOT}/src" "${PLAYDEN_ROOT}/third_party/qrcodegen")
 
+# Playden's own UI (src/homebrew) with Hui's renderer replaced by a CPU one (hui_cpu/, whose gfx/
+# headers shadow hui's OpenGL ones): a measurement mode behind /data/PLDN10001/ui-preview.
+file(GLOB PLAYDEN_PS4_HUI_WIDGETS CONFIGURE_DEPENDS "${HUI_ROOT}/src/ui/*.cpp" "${HUI_ROOT}/src/ui/components/*.cpp")
+list(REMOVE_ITEM PLAYDEN_PS4_HUI_WIDGETS "${HUI_ROOT}/src/ui/glyphs.cpp")  # in playden_ps4_hui
+file(GLOB PLAYDEN_PS4_COMMUNITY CONFIGURE_DEPENDS "${PLAYDEN_ROOT}/src/community/*.cpp")
+add_library(playden_ps4_homebrew_preview STATIC
+    homebrew_preview.cpp
+    hui_cpu/cpu_renderer.cpp
+    ${PLAYDEN_PS4_HUI_WIDGETS}
+    "${HUI_ROOT}/src/core/input.cpp"
+    "${PLAYDEN_ROOT}/src/homebrew/simulation.cpp"
+    "${PLAYDEN_ROOT}/src/homebrew/storage_sim.cpp"
+    "${PLAYDEN_ROOT}/src/homebrew/queue_layout.cpp"
+    "${PLAYDEN_ROOT}/src/homebrew/browse.cpp"
+    "${PLAYDEN_ROOT}/src/homebrew/view.cpp"
+    "${PLAYDEN_ROOT}/src/homebrew/title_icon.cpp"
+    "${PLAYDEN_ROOT}/src/app/diagnostic_log.cpp"
+    "${PLAYDEN_ROOT}/src/app/preferences.cpp"
+    "${PLAYDEN_ROOT}/src/diagnostics/redaction.cpp"
+    "${PLAYDEN_ROOT}/src/platform/random_id.cpp"
+    "${PLAYDEN_ROOT}/src/platform/durable_storage.cpp"
+    "${PLAYDEN_ROOT}/src/runtime/my_presets.cpp"
+    "${PLAYDEN_ROOT}/src/runtime/community_rules.cpp"
+    "${PLAYDEN_ROOT}/src/runtime/recipe_choice.cpp"
+    "${PLAYDEN_ROOT}/src/runtime/private_directories.cpp"
+    "${PLAYDEN_ROOT}/src/runtime/kit_version.cpp"
+    "${PLAYDEN_ROOT}/src/update/asset_download.cpp"
+    "${PLAYDEN_ROOT}/src/update/release.cpp"
+    "${PLAYDEN_ROOT}/src/update/version.cpp"
+    "${PLAYDEN_ROOT}/src/update/zip_extract.cpp"
+    "${PLAYDEN_ROOT}/src/update/file_ops.cpp"
+    ${PLAYDEN_PS4_COMMUNITY})
+target_include_directories(playden_ps4_homebrew_preview BEFORE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/hui_cpu")
+target_include_directories(playden_ps4_homebrew_preview PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${HUI_ROOT}/src" "${PLAYDEN_ROOT}/src" "${PLAYDEN_ROOT}/third_party"
+    "${PLAYDEN_ROOT}/third_party/stb" "${HUI_ROOT}/third_party/stb" "${PLAYDEN_ROOT}/third_party/qrcodegen"
+    "${PLAYDEN_ROOT}/third_party/miniz" "${PS4_NETWORK_PREFIX}/include")
+target_compile_features(playden_ps4_homebrew_preview PRIVATE cxx_std_20)
+# No thread-local storage in stb_image: the PRX loader does not resolve dynamic TLS on worker threads.
+# update/version.cpp: the PS4 port's own version (ps4/VERSION) and the commit, as the desktop build
+# writes them (cmake/WriteBuildCommit.cmake).
+find_package(Git QUIET)
+set(PLAYDEN_PS4_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated")
+execute_process(COMMAND "${CMAKE_COMMAND}" "-DSOURCE_DIR=${PLAYDEN_ROOT}" "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+    "-DOUTPUT=${PLAYDEN_PS4_GENERATED}/playden_build_commit.h" -P "${PLAYDEN_ROOT}/cmake/WriteBuildCommit.cmake")
+target_include_directories(playden_ps4_homebrew_preview PRIVATE "${PLAYDEN_PS4_GENERATED}")
+target_compile_definitions(playden_ps4_homebrew_preview PRIVATE PLAYDEN_VERSION="${PLAYDEN_RELEASE_VERSION}")
+# The SDK's dirent names the inode d_fileno, without FreeBSD's d_ino alias.
+target_compile_definitions(playden_ps4_homebrew_preview PRIVATE PLAYDEN_PLATFORM_PS4=1 STBI_NO_THREAD_LOCALS
+    d_ino=d_fileno)
+target_compile_options(playden_ps4_homebrew_preview PRIVATE -O2 -fno-exceptions -fno-rtti)
+set_target_properties(playden_ps4_homebrew_preview PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(playden_ps4_homebrew_preview PUBLIC playden_ps4_ui_platform playden_ps4_game_settings)
+
+# Step 3: the rest of the service graph Playden's desktop host (src/homebrew/host.cpp) links in live mode,
+# so Leo's Controller and services run unchanged on the PS4. Lists follow cmake/HomebrewUI.cmake,
+# PlaydenCore.cmake, Web.cmake and ProsperoRuntime.cmake; third-party code already built for the
+# PS4 (zstd, lzma, miniz, qrcodegen, utf8proc, pw_app_profile, pw_profile_catalog) is not repeated.
+set(PLAYDEN_PS4_WEB_ASSETS_CPP "${CMAKE_CURRENT_BINARY_DIR}/generated/web_assets.cpp")
+set(PLAYDEN_PS4_WEB_FONTS "${PLAYDEN_ROOT}/fixtures/ui-comparison/assets/fonts")
+set(PLAYDEN_PS4_WEB_ASSETS
+    "/|html|${PLAYDEN_ROOT}/src/web/page/index.html"
+    "/assets/barlow-regular.ttf|ttf|${PLAYDEN_PS4_WEB_FONTS}/Barlow-Regular.ttf"
+    "/assets/barlow-semibold.ttf|ttf|${PLAYDEN_PS4_WEB_FONTS}/Barlow-SemiBold.ttf"
+    "/assets/barlow-OFL.txt|text|${PLAYDEN_PS4_WEB_FONTS}/barlow-OFL.txt")
+add_custom_command(OUTPUT "${PLAYDEN_PS4_WEB_ASSETS_CPP}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND "${CMAKE_COMMAND}" "-DOUTPUT=${PLAYDEN_PS4_WEB_ASSETS_CPP}" "-DASSETS=${PLAYDEN_PS4_WEB_ASSETS}"
+        -P "${PLAYDEN_ROOT}/cmake/EmbedWebAssets.cmake"
+    DEPENDS "${PLAYDEN_ROOT}/src/web/page/index.html" "${PLAYDEN_ROOT}/cmake/EmbedWebAssets.cmake"
+    VERBATIM)
+set(PW_SRC "${PLAYDEN_ROOT}/third_party/prospero-win")
+add_library(playden_ps4_publication STATIC
+    "${PW_SRC}/native/pw_title_publication_native.c"
+    "${PW_SRC}/src/pw_title_publication.c"
+    "${PW_SRC}/src/pw_title_launch.c"
+    "${PW_SRC}/src/pw_game_profile.c"
+    "${PW_SRC}/src/pw_wine_launch.c"
+    "${PW_SRC}/src/pw_publication_sha256.c"
+    "${PW_SRC}/third_party/mbedtls-publication/library/sha256.c"
+    "${PLAYDEN_ROOT}/third_party/sqlite3/sqlite3.c")
+target_include_directories(playden_ps4_publication PRIVATE "${PW_SRC}/native" "${PW_SRC}/src"
+    "${PW_SRC}/third_party/mbedtls-publication" "${PW_SRC}/third_party/mbedtls-publication/include"
+    "${PLAYDEN_ROOT}/third_party/sqlite3")
+target_compile_definitions(playden_ps4_publication PRIVATE _DEFAULT_SOURCE PLAYDEN_PLATFORM_PS4=1
+    MBEDTLS_CONFIG_FILE="pw_publication_config.h"
+    SQLITE_OMIT_LOAD_EXTENSION=1 SQLITE_THREADSAFE=0 SQLITE_TEMP_STORE=3 SQLITE_MAX_MMAP_SIZE=0 SQLITE_USE_URI=0)
+target_compile_options(playden_ps4_publication PRIVATE -O2)
+set_target_properties(playden_ps4_publication PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+set(PLAYDEN_PS4_LIVE_SOURCES
+    app/experimental_features.cpp app/library_controller.cpp app/persistence_controller.cpp app/persistence_service.cpp
+    homebrew/artwork_backend.cpp homebrew/controller.cpp homebrew/gog_icon.cpp homebrew/program_icon.cpp
+    homebrew/runtime_host.cpp homebrew/sharing_service.cpp homebrew/uninstall_flow.cpp
+    installs/game_move.cpp library/update_check.cpp
+    platform/ps5/native_coordinator.cpp platform/ps5/title_activity.cpp platform/ps5/title_allow_list.cpp
+    platform/ps5/title_database.cpp platform/ps5/title_registry.cpp platform/ps5/title_remover.cpp
+    platform/ps5/title_runtime.cpp
+    runtime/dotnet_heap.cpp runtime/game_install.cpp runtime/install_service.cpp runtime/launch_service.cpp
+    runtime/layout_migration.cpp runtime/leftover_titles.cpp runtime/package_installer.cpp
+    runtime/publication_backup.cpp runtime/publication_contract.cpp runtime/publication_transaction.cpp
+    runtime/self_heal.cpp runtime/session_reconciler.cpp runtime/session_storage.cpp runtime/settings_publication.cpp
+    runtime/settings_publication_journal.cpp runtime/settings_publication_owner.cpp runtime/settings_storage.cpp
+    runtime/steam_input.cpp runtime/title_parameters.cpp runtime/writable_folders.cpp
+    steam/app_details_service.cpp steam/backend/download_server_source.cpp steam/cloud_service.cpp
+    steam/download_server_service.cpp steam/local_session_repository.cpp
+    stores/local/copy_plan.cpp stores/local/copy_runner.cpp stores/local/drop_folder_access.cpp
+    stores/local/import_store.cpp stores/local/library_source.cpp stores/local/scanner.cpp stores/registry.cpp
+    update/app_swap.cpp update/update_service.cpp
+    web/address.cpp web/file_policy.cpp web/files_api.cpp web/file_store.cpp web/http.cpp web/logs_source.cpp
+    web/pairing.cpp web/router.cpp web/server.cpp web/service.cpp web/zip.cpp)
+list(TRANSFORM PLAYDEN_PS4_LIVE_SOURCES PREPEND "${PLAYDEN_ROOT}/src/")
+add_library(playden_ps4_homebrew_live STATIC homebrew_live.cpp runtime_ps4/kit_ps4.cpp
+    runtime_ps4/legacy_bottle.cpp
+    ${PLAYDEN_PS4_LIVE_SOURCES} "${PLAYDEN_PS4_WEB_ASSETS_CPP}")
+target_include_directories(playden_ps4_homebrew_live PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${HUI_ROOT}/src" "${PLAYDEN_ROOT}/src" "${PLAYDEN_ROOT}/third_party"
+    "${PLAYDEN_ROOT}/third_party/stb" "${HUI_ROOT}/third_party/stb" "${PLAYDEN_ROOT}/third_party/miniz"
+    "${PLAYDEN_ROOT}/third_party/sqlite3" "${PLAYDEN_ROOT}/third_party/utf8proc"
+    "${PW_SRC}/src" "${PW_SRC}/native" "${PW_SRC}/third_party/mbedtls-publication"
+    "${PW_SRC}/third_party/mbedtls-publication/include" "${PS4_NETWORK_PREFIX}/include" "${PLAYDEN_PS4_GENERATED}")
+target_compile_features(playden_ps4_homebrew_live PRIVATE cxx_std_20)
+target_compile_definitions(playden_ps4_homebrew_live PRIVATE PLAYDEN_PLATFORM_PS4=1 STBI_NO_THREAD_LOCALS
+    MBEDTLS_CONFIG_FILE="pw_publication_config.h" PLAYDEN_VERSION="${PLAYDEN_RELEASE_VERSION}")
+target_compile_options(playden_ps4_homebrew_live PRIVATE -O2 -fno-exceptions -fno-rtti
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/compat/dirent_ino.h")
+# These two catch exceptions (std::filesystem / parsing), as on the PS5.
+set_source_files_properties("${PLAYDEN_ROOT}/src/app/persistence_service.cpp"
+    "${PLAYDEN_ROOT}/src/runtime/package_installer.cpp" TARGET_DIRECTORY playden_ps4_homebrew_live
+    PROPERTIES COMPILE_OPTIONS "-fexceptions")
+set_target_properties(playden_ps4_homebrew_live PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(playden_ps4_homebrew_live PUBLIC playden_ps4_publication playden_ps4_homebrew_preview)
+
 # The shipped title uses a tiny low-address eboot and keeps Playden's UI in a
 # high-address PRX. The Wine PRX can then release the stub's low mapping before
 # reserving the Windows guest address space, following orbis-win's tested path.

@@ -7,7 +7,9 @@
 #include <string>
 #include <utility>
 
-#if defined(__PROSPERO__) || (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5)
+// The PS4 is a console too: its *at calls fail with EPERM, so it opens by path like the PS5.
+#if defined(__PROSPERO__) || (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
+    (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
 #define PLAYDEN_MANAGED_NATIVE 1
 #else
 #define PLAYDEN_MANAGED_NATIVE 0

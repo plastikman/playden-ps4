@@ -147,6 +147,10 @@ struct PackageInstallerOperations {
   // Validates immutable template provenance requirements that are semantic rather
   // than file-level (including the required core registry entries).
   std::function<bool(const std::filesystem::path&)> validate_bottle;
+  // Platform migration after the verified template is present. Runs on retries too;
+  // implementations must leave their own durable completion marker.
+  std::function<PackageActionResult(const RuntimeInstall&, const std::filesystem::path&)>
+      migrate_legacy_bottle;
   std::function<std::optional<ProfilePublication>(const RuntimeInstall&)>
       provide_publication;
   // Complete OWNER driver: owns control setup, pending receipt, frozen operation,

@@ -14,8 +14,13 @@
 // resolution to a worker thread. Artwork has exactly one decoder worker, so
 // stb_image's process-global load flags are safe and avoid its TLS access.
 #define STBI_NO_THREAD_LOCALS
+// Private: Playden's view.cpp (the UI preview) links its own stb_image.
+#define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
 #include "stb_image.h"
+#pragma clang diagnostic pop
 
 #include <algorithm>
 #include <cmath>
