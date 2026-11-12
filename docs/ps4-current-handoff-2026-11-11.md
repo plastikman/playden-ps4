@@ -179,22 +179,35 @@ In the order I would take it:
 Not ours: Isaac (250900) faults in the guest with the Steam emulator, and
 Portal 2 shows a black screen for ~40 s while loading.
 
-## Leftovers on the console -- cleared 2026-11-12
+## Console leftovers -- cleared 2026-11-12
+
+Both are gone. Nothing is left awaiting a decision.
 
 **The GoldHEN FTP server supports `SITE CHMOD`, and that is the key to every
-"550 Requested action not taken" under `/data`.** FTP runs as a user that has no
+"550 Requested action not taken" under `/data`.** FTP runs as a user with no
 write permission on an owner-only tree, so `DELE`, `RMD` and even `RNFR` all
-fail there -- and the names make no difference, a plain `.txt` fails the same way
-as a dotfile. `SITE CHMOD 777 <path>` on the directory *and* each entry inside it
-makes the tree writable, after which ordinary FTP deletes work. PS4-Xplorer 2.0's
-root-mode Delete is not an alternative: it hangs with an empty progress bar, its
-Cancel stops responding, and the app exits on its own.
+fail there -- and the filename makes no difference, a plain `.txt` fails exactly
+like a dotfile. `SITE CHMOD 777 <path>` on the directory *and* each entry inside
+it returns 250, after which ordinary FTP deletes work. `HELP` and `SITE HELP`
+are not implemented, so the command is undiscoverable; just use it.
 
-- The stray `/data/data/PLDN10001/FAKE78xxx` tree from the doubled-path bug is
+**A sticky parent is a second, separate gate.** `/data/playden/games` is
+`drwxrwxrwt`, so even a 0777 child directory cannot be unlinked by a non-owner.
+Chmod the parent to 777, remove the entries, then **restore it to 1777**.
+
+PS4-Xplorer 2.0 is not an alternative. Its root-mode Delete hangs with an empty
+progress bar, its Cancel stops responding, the system UI stops taking the PS
+button, and the console heats up until you close the app from the Quick Menu.
+Nothing is partially deleted.
+
+- The stray `/data/data/PLDN10001/FAKE78xxx` tree from the doubled-path bug:
   **deleted** (24 files, 18 directories). The real titles at
-  `/data/PLDN10001/FAKE78xxx` are untouched and keep their original modes; they
-  are the ones carrying `game-launch.json`, which the strays never had.
-- The five `steam-6300.set-aside-*` bottles measure **971 MB**, not the ~1.6 GB
-  guessed earlier. They have been chmodded to 0777 so they can be deleted over
-  FTP; the live bottles beside them were left `drwx------` and must stay that
-  way -- widening a live bottle is what caused `session-owner-invalid`.
+  `/data/PLDN10001/FAKE78xxx` keep their original modes and are the ones that
+  carry `game-launch.json`.
+- The five `steam-6300.set-aside-*` bottles: **deleted** (5,481 files, 454
+  directories, **971 MB** -- not the ~1.6 GB guessed earlier). Only those five
+  subtrees were widened; the live bottles were left `drwx------` throughout, and
+  `games` was restored to `drwxrwxrwt`. Verified afterwards: Playden launches
+  with its full library and no kit prompt, and Half-Life: Source (`steam-6300`,
+  the app those set-asides belonged to) still reads 6.5 GB, Cloud saves Synced,
+  and offers Play.
