@@ -7,6 +7,12 @@
 int pw_update_parse_version(const char *text, unsigned v[3])
 {
     if (!text || !v) return -1;
+    /* An optional name before the version, as a repository that releases more than one title
+     * needs ("ps4-v0.1.0"): letters or digits, then one '-'. */
+    for (const char *p = text; p < text + 16 && *p; p++) {
+        if (*p == '-') { text = p + 1; break; }
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9'))) break;
+    }
     if (*text == 'v' || *text == 'V') text++;
     for (int part = 0; part < 3; part++) {
         unsigned long value = 0;
