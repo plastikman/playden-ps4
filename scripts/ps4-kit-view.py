@@ -26,10 +26,28 @@ TITLE_ICON = TITLE + "/sce_sys/playden-icon.png"
 RUNTIME = "runtime-template/kit/runtime"
 RECIPE = "runtime-template/kit/recipes/orbis-win-ps4.json"
 AUDIO_DRIVER = "sce_module/wineps5.prx"
+# The WGL/Zink OpenGL provider, built by Orbis-Win's build_mesa_zink.sh and staged for
+# "graphics = opengl" games. Both architectures must be present to claim the capability.
+ZINK_PROVIDERS = ("win/mesa-zink/i386-windows/opengl32.dll", "win/mesa-zink/x86_64-windows/opengl32.dll")
 VIEW = "runtime-template/playden-kit-view.json"
 # What Orbis-Win does that Playden's settings ask a kit about (ps4/platform_ps4/game_controls.cpp Ps4Kit),
 # and the any-title slots that stand for each game's profile.
 CAPABILITIES = sorted(["input-keyboard-stick", "input-touchpad", "settings-dxvk-config", "title-any-id"])
+
+
+def capabilities(stage) -> list:
+    """CAPABILITIES plus the ones whose provider is actually staged.
+
+    opengl-zink: Playden routes a "graphics = opengl" game through Mesa's Zink only when the kit
+    says it can (kKitOpenGLZink, game_settings.h). PS4 ships that provider -- win/mesa-zink's
+    opengl32.dll for both architectures, built by Orbis-Win -- but the kit never claimed it, so an
+    OpenGL game got a window and no rendering (The Binding of Isaac, 2026-11-12), because Playden
+    fell back to a PS5 OpenGL SDK path this console does not have.
+    """
+    found = list(CAPABILITIES)
+    if all((stage / p).is_file() for p in ZINK_PROVIDERS):
+        found.append("opengl-zink")
+    return sorted(found)
 
 
 def sha256(path: Path) -> str:
@@ -91,7 +109,7 @@ def main() -> int:
         "schema": "playden-ps4-kit-view/1",
         "kit_id": kit_id,
         "files_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
-        "capabilities": CAPABILITIES,
+        "capabilities": capabilities(stage),
         "runtime": {"bundle_id": "wine-wow64", "artifact_revision": runtime_revision, "path": RUNTIME,
                     "wine_revision": wine_revision},
         # mmdevapi loads Wine's audio driver by name, and a recipe may require the "ps5" one --
