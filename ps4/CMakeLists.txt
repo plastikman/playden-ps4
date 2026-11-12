@@ -328,7 +328,10 @@ add_custom_command(OUTPUT "${PLAYDEN_PS4_WEB_ASSETS_CPP}"
     VERBATIM)
 set(PW_SRC "${PLAYDEN_ROOT}/third_party/prospero-win")
 add_library(playden_ps4_publication STATIC
-    "${PW_SRC}/native/pw_title_publication_native.c"
+    # The PS4's managed title folders live under /data/PLDN10001, so this one file is the
+    # vendored copy (ps4/vendor/orbis-win/README.md): the submodule is upstream's and cannot
+    # carry a PS4 change.
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/orbis-win/native/pw_title_publication_native.c"
     "${PW_SRC}/src/pw_title_publication.c"
     "${PW_SRC}/src/pw_title_launch.c"
     "${PW_SRC}/src/pw_game_profile.c"

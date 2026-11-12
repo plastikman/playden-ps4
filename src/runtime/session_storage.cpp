@@ -1,4 +1,5 @@
 #include "runtime/session_storage.h"
+#include "platform/directory_walk.h"
 
 #include "platform/managed_directory.h"
 #include "steam/backend/json.h"
@@ -264,13 +265,8 @@ std::optional<std::vector<std::string>> ListSessionFiles(
   if (!limit || limit > SessionReconciler::kMaxSessionsPerInstall ||
       !directory.Validate())
     return std::nullopt;
-  const int duplicate = ::dup(directory.fd());
-  if (duplicate < 0) return std::nullopt;
-  DIR *stream = ::fdopendir(duplicate);
-  if (!stream) {
-    ::close(duplicate);
-    return std::nullopt;
-  }
+  DIR *stream = platform::OpenHeldListing(directory.fd(), directory.path());
+  if (!stream) return std::nullopt;
   std::vector<std::string> names;
   std::size_t entries = 0;
   bool valid = true;

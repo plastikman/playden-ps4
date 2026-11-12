@@ -15,10 +15,15 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 int32_t sceKernelOpen(const char *, int32_t, uint16_t);
 int32_t sceKernelClose(int32_t);
 int32_t sceKernelGetdents(int32_t, char *, int);
+/* libc's own call, for a descriptor libc opened (fdopendir): sceKernelGetdents only reads the
+ * kernel's own descriptors, and reading the wrong kind returns nothing, which callers that
+ * cross-check a child against its parent's listing read as a swapped entry (ESTALE). */
+int getdents(int, struct dirent *, size_t);
 
 enum {
     kDirectoryFlag = 0x00020000,    // FreeBSD O_DIRECTORY (O_RDONLY is 0)
@@ -29,6 +34,7 @@ enum {
 struct PlaydenDir {
     uint32_t magic;
     int fd;
+    int libc_fd;   /* the descriptor came from the caller (fdopendir), not sceKernelOpen */
     int length;
     int offset;
     char block[kBlock];
@@ -41,7 +47,18 @@ static int kernel_errno(int32_t result)
     return (code & 0xffff0000u) == 0x80020000u ? (int)(code & 0xffffu) : EIO;
 }
 
-static DIR *wrap_fd(int fd)
+static int read_block(struct PlaydenDir *directory)
+{
+    if (!directory->libc_fd) {
+        const int32_t got = sceKernelGetdents(directory->fd, directory->block, kBlock);
+        if (got != 0)
+            return got;
+        return 0;
+    }
+    return getdents(directory->fd, (struct dirent *)directory->block, kBlock);
+}
+
+static DIR *wrap_fd(int fd, int libc_fd)
 {
     struct PlaydenDir *directory = malloc(sizeof *directory);
     if (!directory) {
@@ -50,6 +67,7 @@ static DIR *wrap_fd(int fd)
     }
     directory->magic = kMagic;
     directory->fd = fd;
+    directory->libc_fd = libc_fd;
     directory->length = 0;
     directory->offset = 0;
     return (DIR *)directory;
@@ -66,7 +84,7 @@ DIR *__wrap_opendir(const char *path)
         errno = kernel_errno(fd);
         return NULL;
     }
-    DIR *directory = wrap_fd(fd);
+    DIR *directory = wrap_fd(fd, 0);
     if (!directory)
         sceKernelClose(fd);
     return directory;
@@ -78,7 +96,7 @@ DIR *__wrap_fdopendir(int fd)
         errno = EBADF;
         return NULL;
     }
-    return wrap_fd(fd);
+    return wrap_fd(fd, 1);
 }
 
 struct dirent *__wrap_readdir(DIR *handle)
@@ -90,10 +108,10 @@ struct dirent *__wrap_readdir(DIR *handle)
     }
     for (;;) {
         if (directory->offset >= directory->length) {
-            const int32_t got = sceKernelGetdents(directory->fd, directory->block, kBlock);
+            const int got = read_block(directory);
             if (got <= 0) {
-                if (got < 0)
-                    errno = kernel_errno(got);
+                if (got < 0 && !directory->libc_fd)
+                    errno = kernel_errno(got);  // getdents sets errno itself
                 directory->length = directory->offset = 0;
                 return NULL;  // end of folder: errno untouched, as readdir does
             }
@@ -124,9 +142,13 @@ int __wrap_closedir(DIR *handle)
         errno = EBADF;
         return -1;
     }
-    const int32_t result = sceKernelClose(directory->fd);
+    const int libc_fd = directory->libc_fd;
+    const int fd = directory->fd;
     directory->magic = 0;
     free(directory);
+    if (libc_fd)
+        return close(fd);
+    const int32_t result = sceKernelClose(fd);
     if (result < 0) {
         errno = kernel_errno(result);
         return -1;

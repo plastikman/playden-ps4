@@ -1,4 +1,5 @@
 #include "runtime/package_installer.h"
+#include "platform/directory_walk.h"
 #include "runtime/title_root.h"
 #include "runtime/prospero_profile.h"
 #include "runtime/kit_trust.h"
@@ -251,10 +252,8 @@ void CleanInitialStage(const fs::path& staging, const struct stat& created) {
   struct stat current{};
   if (::fstat(directory->fd(), &current) != 0 || current.st_dev != created.st_dev ||
       current.st_ino != created.st_ino || current.st_uid != ::geteuid()) return;
-  const int listing_fd = ::dup(directory->fd());
-  if (listing_fd < 0) return;
-  DIR* listing = ::fdopendir(listing_fd);
-  if (!listing) { ::close(listing_fd); return; }
+  DIR* listing = platform::OpenHeldListing(directory->fd(), staging);
+  if (!listing) return;
   bool safe = true;
   errno = 0;
   while (const auto* entry = ::readdir(listing)) {

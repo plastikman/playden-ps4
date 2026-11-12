@@ -63,6 +63,18 @@ inline bool PathOf(int fd, std::filesystem::path* path) {
   *path = found->second.path;
   return true;
 }
+// The same, from the folder's path. On the PS4 a title may not list a folder through a descriptor
+// it already holds (fdopendir, and the getdents behind it, are refused), while listing the path
+// works; with no listing every child read as a swapped entry and the walk refused it (ESTALE).
+inline std::uint64_t ListedInodeAtPath(const std::filesystem::path& parent_path, const char* name) {
+  DIR* listing = ::opendir(parent_path.c_str());  // the parent's own path; see OpenHeldListing
+  if (!listing) return 0;
+  std::uint64_t inode = 0;
+  while (const auto* entry = ::readdir(listing))
+    if (std::string(entry->d_name) == name) { inode = entry->d_fileno; break; }
+  ::closedir(listing);
+  return inode;
+}
 // The inode the parent's listing gives `name`, or 0 when it has none.
 inline std::uint64_t ListedInode(int parent, const char* name) {
   const int listing_fd = ::dup(parent);
@@ -98,7 +110,8 @@ inline int OpenChildByPath(int parent, const char* name, int flags, std::uint64_
   // system folders (firmlinks on macOS): O_NOFOLLOW still refused a link there, and the app user
   // can't plant a mount or replace an entry of /.
   if (same && opened.st_dev == parent_info.st_dev && parent_path != "/") {
-    const std::uint64_t listed = listed_inode ? listed_inode : walk_detail::ListedInode(parent, name);
+    const std::uint64_t listed = listed_inode ? listed_inode
+                                              : walk_detail::ListedInodeAtPath(parent_path, name);
     same = listed != 0 && listed == static_cast<std::uint64_t>(opened.st_ino);
   }
   // Opened without following links and on the parent's device, so a regular file is accepted.
@@ -146,6 +159,28 @@ inline int MakeWalkChild(int parent, const char* name, mode_t mode) {
   return ::mkdirat(parent, name, mode);
 }
 #endif
+// A listing of a folder already held open and checked. By descriptor where that works, so the
+// names come from the very folder the caller holds; a PS4 title cannot dup a directory descriptor
+// (EPERM, measured on PLDN10001 02.66), so there it lists the path, which the caller has already
+// walked without following links. Null on failure, with errno set; close it with closedir.
+inline DIR* OpenHeldListing(int fd, const std::filesystem::path& path) {
+#if defined(PLAYDEN_WALK_BY_PATH)
+  (void)fd;
+  return ::opendir(path.c_str());
+#else
+  (void)path;
+  const int duplicate = ::dup(fd);
+  if (duplicate < 0) return nullptr;
+  DIR* listing = ::fdopendir(duplicate);
+  if (!listing) {
+    const int error = errno;
+    ::close(duplicate);
+    errno = error;
+  }
+  return listing;
+#endif
+}
+
 // Starts at the filesystem root, opening each component without following links.
 inline int OpenDirectoryWalk(const std::filesystem::path& path) {
   if (!path.is_absolute() || path.string().find('\0') != std::string::npos) { errno = EINVAL; return -1; }

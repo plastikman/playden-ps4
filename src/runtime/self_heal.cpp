@@ -72,10 +72,8 @@ void TightenFolder(const fs::path& path, bool folder, bool files, const Log& log
     ::close(fd);
     return;
   }
-  const int listing_fd = files ? ::dup(fd) : -1;
-  DIR* listing = listing_fd >= 0 ? ::fdopendir(listing_fd) : nullptr;
+  DIR* listing = files ? platform::OpenHeldListing(fd, path) : nullptr;
   if (files && !listing) {
-    if (listing_fd >= 0) ::close(listing_fd);
     ++result->failed;
     Note(log, "self-heal failed path=" + path.string() + " list=" + std::strerror(errno));
   }

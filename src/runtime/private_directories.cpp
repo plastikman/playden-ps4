@@ -144,10 +144,8 @@ bool ShareFolder(int fd, const fs::path& path, int depth, Walk& walk) {
     if (::fchmod(fd, folder_mode) != 0) { ::close(fd); ++result->skipped; return true; }
     ++result->changed;
   }
-  const int listing_fd = ::dup(fd);
-  DIR* listing = listing_fd >= 0 ? ::fdopendir(listing_fd) : nullptr;
+  DIR* listing = platform::OpenHeldListing(fd, path);
   if (!listing) {
-    if (listing_fd >= 0) ::close(listing_fd);
     ::close(fd);
     return false;
   }

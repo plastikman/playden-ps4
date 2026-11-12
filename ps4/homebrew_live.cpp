@@ -44,7 +44,9 @@
 #include <atomic>
 #include <cstring>
 #include <set>
+#include <dirent.h>
 #include <fcntl.h>
+#include <orbis/libkernel.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -57,6 +59,10 @@
 #ifndef PLAYDEN_DEV_BUILD
 #define PLAYDEN_DEV_BUILD 0
 #endif
+
+extern "C" {
+int getdents(int, struct dirent *, size_t);
+}
 
 extern "C" void playden_ps4_log_text(const char *line);
 
@@ -136,6 +142,107 @@ void adopt_launcher_installs(const std::filesystem::path &games)
 // ManagedDirectory (src/platform/managed_directory.cpp) opens each folder from / down and refuses
 // with ESTALE when lstat(path) and fstat(the opened folder) disagree; private folders must be 0700
 // and the app's. On the PS4 the settings storage failed that way (02.37): log what each side says.
+// Why Playden refuses to read a finished session: its evidence reader opens
+// <game>/library/prefixes/game as a private folder (0700, or 0711 when the kit shares bottle
+// profiles) owned by this title, and the bottle's .playden-template-owner must name the install.
+// Log the chain's mode and owner for each game so a refusal names the folder that disagrees.
+// What this console actually allows for listing a folder, measured rather than assumed:
+// libc opendir by path, the kernel's own open+getdents, libc's getdents on a descriptor libc
+// opened, and fdopendir on a duplicate of a held descriptor (what the directory walk and the
+// self-heal use). Logged once per start for one folder we know exists.
+void probe_listing_methods()
+{
+    const char *path = "/data/playden/games";
+    char line[480];
+    int n = 0;
+
+    DIR *by_path = ::opendir(path);
+    int by_path_entries = -1;
+    if (by_path) {
+        by_path_entries = 0;
+        while (::readdir(by_path))
+            ++by_path_entries;
+        ::closedir(by_path);
+    }
+    const int by_path_errno = by_path ? 0 : errno;
+
+    // The kernel's own descriptor and call.
+    static char block[64 * 1024];
+    int kernel_fd = sceKernelOpen(path, 0x00020000 /* O_DIRECTORY */, 0);
+    int kernel_bytes = kernel_fd >= 0 ? sceKernelGetdents(kernel_fd, block, (int)sizeof(block)) : -1;
+    if (kernel_fd >= 0)
+        sceKernelClose(kernel_fd);
+
+    // A descriptor libc opened, read with libc's getdents, then with the kernel's.
+    const int libc_fd = ::open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const int libc_open_errno = libc_fd < 0 ? errno : 0;
+    errno = 0;
+    const int libc_getdents = libc_fd >= 0 ? getdents(libc_fd, (struct dirent *)block, sizeof(block)) : -1;
+    const int libc_getdents_errno = errno;
+    int kernel_on_libc = -1;
+    if (libc_fd >= 0) {
+        ::lseek(libc_fd, 0, SEEK_SET);
+        kernel_on_libc = sceKernelGetdents(libc_fd, block, (int)sizeof(block));
+    }
+    // fdopendir on a duplicate, as the directory walk and the self-heal do.
+    int fdopen_entries = -1, duplicate = -1, dup_errno = 0, fdopendir_errno = 0;
+    if (libc_fd >= 0) {
+        ::lseek(libc_fd, 0, SEEK_SET);
+        errno = 0;
+        duplicate = ::dup(libc_fd);
+        dup_errno = duplicate < 0 ? errno : 0;
+        errno = 0;
+        DIR *held = duplicate >= 0 ? ::fdopendir(duplicate) : nullptr;
+        fdopendir_errno = held ? 0 : errno;
+        if (held) {
+            fdopen_entries = 0;
+            while (::readdir(held))
+                ++fdopen_entries;
+            ::closedir(held);
+        } else if (duplicate >= 0) {
+            ::close(duplicate);
+        }
+    }
+    if (libc_fd >= 0)
+        ::close(libc_fd);
+
+    n = std::snprintf(line, sizeof(line),
+                      "listing methods %s: opendir=%s/entries=%d | sceKernelOpen=%d getdents=%d | "
+                      "libc open=%s getdents=%d/errno=%d sceKernelGetdents_on_libc_fd=%d | dup=%d/errno=%d "
+                      "fdopendir_errno=%d entries=%d",
+                      path, by_path ? "ok" : std::to_string(by_path_errno).c_str(), by_path_entries,
+                      kernel_fd, kernel_bytes, libc_fd >= 0 ? "ok" : std::to_string(libc_open_errno).c_str(),
+                      libc_getdents, libc_getdents_errno, kernel_on_libc, duplicate, dup_errno,
+                      fdopendir_errno, fdopen_entries);
+    (void)n;
+    log_line(line);
+}
+
+void probe_bottle_chain()
+{
+    const std::filesystem::path games = "/data/playden/games";
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(games, error), end; !error && it != end; it.increment(error)) {
+        const auto install = it->path().filename().string();
+        if (install.rfind("steam-", 0) != 0 || install.find(".set-aside-") != std::string::npos)
+            continue;
+        std::string line = "bottle chain " + install + ":";
+        for (const char *part : {"", "library", "library/prefixes", "library/prefixes/game"}) {
+            const auto path = part[0] ? it->path() / part : it->path();
+            struct stat info {};
+            if (::lstat(path.c_str(), &info) != 0)
+                line += std::string(" ") + (part[0] ? part : ".") + "=missing";
+            else
+                line += " " + std::string(part[0] ? part : ".") + "=" +
+                        std::to_string(info.st_mode & 07777) + "/uid" + std::to_string(info.st_uid);
+        }
+        struct stat marker {};
+        const auto marker_path = it->path() / "library/prefixes/game/.playden-template-owner";
+        line += std::string(" marker=") + (::lstat(marker_path.c_str(), &marker) == 0 ? "present" : "missing");
+        log_line(line);
+    }
+}
+
 void probe_directory_identity()
 {
     const uid_t uid = ::geteuid();
@@ -263,6 +370,8 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     simulation.SetCommunityRecipesEnabled(s.features.community_recipes);
 
     probe_directory_identity();
+    probe_listing_methods();
+    probe_bottle_chain();
     std::string settings_reason;
     const auto settings_file = playden::runtime::PrepareGameSettingsStorage(data, &settings_reason);
     if (!settings_file)

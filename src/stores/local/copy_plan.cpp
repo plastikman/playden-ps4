@@ -75,13 +75,11 @@ void Close(Frame& frame) {
   frame.fd = -1;
 }
 
-// Takes `fd`.
-bool OpenFrame(int fd, std::string relative, Frame* frame) {
-  const int listing_fd = ::dup(fd);
-  DIR* listing = listing_fd >= 0 ? ::fdopendir(listing_fd) : nullptr;
+// Takes `fd`. `absolute` is the folder fd names, for platforms whose listing goes by path.
+bool OpenFrame(int fd, std::string relative, const std::filesystem::path& absolute, Frame* frame) {
+  DIR* listing = platform::OpenHeldListing(fd, absolute);
   if (!listing) {
     const int error = errno;
-    if (listing_fd >= 0) ::close(listing_fd);
     ::close(fd);
     errno = error;
     return false;
@@ -191,7 +189,7 @@ CopyPlanBuild BuildCopyPlan(const std::string& source_path, std::size_t max_file
   // One frame per level below the folder, on the heap: no depth limit and no recursion.
   std::vector<Frame> stack;
   Frame first;
-  if (!OpenFrame(root, {}, &first)) return Failed("Playden can't read the game's folder.", errno);
+  if (!OpenFrame(root, {}, source, &first)) return Failed("Playden can't read the game's folder.", errno);
   stack.push_back(std::move(first));
   const auto fail = [&](std::string failure, int error) {
     for (auto& frame : stack) Close(frame);
@@ -239,7 +237,8 @@ CopyPlanBuild BuildCopyPlan(const std::string& source_path, std::size_t max_file
         return fail("The game has more than " + WithThousands(max_files) + " folders. Playden can't copy it.", 0);
       build.plan.dirs.push_back(relative);
       Frame next;
-      if (!OpenFrame(child, relative, &next)) return fail(UnreadableWords(relative), errno);
+      if (!OpenFrame(child, relative, std::filesystem::path(source) / relative, &next))
+        return fail(UnreadableWords(relative), errno);
       stack.push_back(std::move(next));  // `frame` is not used after this
       continue;
     }

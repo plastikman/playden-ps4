@@ -32,6 +32,7 @@ class SourceWalk {
     if (root_.fd < 0) {
       root_.fd = platform::OpenDirectoryWalk(source_);
       if (root_.fd < 0) return -1;
+      root_.path = source_;
     }
     const auto parts = Split(relative);
     std::size_t common = 0;
@@ -44,7 +45,7 @@ class SourceWalk {
       Level& parent = chain_.empty() ? root_ : chain_.back();
       const int fd = platform::OpenWalkChild(parent.fd, parts[index].c_str(), kOpenFolder, Listed(parent, parts[index]));
       if (fd < 0) return -1;
-      chain_.push_back(Level{parts[index], fd, {}, false});
+      chain_.push_back(Level{parts[index], parent.path + "/" + parts[index], fd, {}, false});
     }
     Level& folder = chain_.empty() ? root_ : chain_.back();
     return platform::OpenWalkChildUnprivileged(folder.fd, parts.back().c_str(), kOpenFile, Listed(folder, parts.back()));
@@ -55,6 +56,7 @@ class SourceWalk {
   static constexpr int kOpenFile = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
   struct Level {
     std::string name;
+    std::string path;  // the folder this level holds, for a listing that goes by path
     int fd = -1;
     std::unordered_map<std::string, std::uint64_t> listed;
     bool listed_read = false;
@@ -75,9 +77,7 @@ class SourceWalk {
 #if defined(PLAYDEN_WALK_BY_PATH)
     if (!level.listed_read) {
       level.listed_read = true;
-      const int listing_fd = ::dup(level.fd);
-      DIR* listing = listing_fd >= 0 ? ::fdopendir(listing_fd) : nullptr;
-      if (!listing && listing_fd >= 0) ::close(listing_fd);
+      DIR* listing = platform::OpenHeldListing(level.fd, level.path);
       if (listing) {
         while (const auto* entry = ::readdir(listing)) level.listed[entry->d_name] = entry->d_fileno;
         ::closedir(listing);
