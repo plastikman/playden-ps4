@@ -166,7 +166,20 @@ In the order I would take it:
 2. **Wire web access and self-update** into the PS4 composition; they are the
    only shared services not constructed.
 3. **Recover from a kit change without Recreate bottle**, and stop
-   `.set-aside-*` bottles accumulating.
+   `.set-aside-*` bottles accumulating. One cause is found and fixed
+   (`6db3930`): "Update games to the new runtime kit" could never succeed for a
+   Source-engine game, because the recipe `steam-220-hl2-v1` requires
+   `audio=ps5` and the PS4 kit view never declared it. PS4 ships that driver
+   (`sce_module/wineps5.prx`); PS5 derives the flag by reading the template's
+   registry in `kit_manifest.cpp ValidateRegistry`, which **this console never
+   runs** -- `AdmitPs4Kit` builds the `VerifiedKitView` straight from
+   `playden-kit-view.json`. The simulation hardcodes the flag true, so the
+   fixtures UI could never show it. Worth remembering as a shape: anything
+   PS5 derives inside that verifier is absent on PS4 unless the kit view says
+   it. Not yet confirmed on hardware -- needs a build and an update attempt on
+   HL: Source. Also unverified: the PS4 template registers
+   `Software\Microsoft\Wow64\x86` as `wow64cpu.dll`, not `wowprospero.dll`,
+   which is what that same verifier would demand.
 4. **Finish the Local store test** — find why the import store cannot load on
    PS4, then verify Add/remove and copy/move behavior with a controlled folder.
    After that, exercise the other parity gates: Cloud sync before and after play,
@@ -207,7 +220,7 @@ Nothing is partially deleted.
 - The five `steam-6300.set-aside-*` bottles: **deleted** (5,481 files, 454
   directories, **971 MB** -- not the ~1.6 GB guessed earlier). Only those five
   subtrees were widened; the live bottles were left `drwx------` throughout, and
-  `games` was restored to `drwxrwxrwt`. Verified afterwards: Playden launches
-  with its full library and no kit prompt, and Half-Life: Source (`steam-6300`,
-  the app those set-asides belonged to) still reads 6.5 GB, Cloud saves Synced,
-  and offers Play.
+  `games` was restored to `drwxrwxrwt`. Note `steam-6300` is **Dreamfall: The
+  Longest Journey**, not Half-Life: Source (which is app `280`); its live bottle
+  was left untouched. Verified afterwards: Playden launches with its full
+  library and Half-Life: Source still reads 6.5 GB with Cloud saves synced.
