@@ -253,6 +253,12 @@ done
     ls -l "$PREFIX/system.reg" "$PREFIX/drive_c/windows/syswow64/d3d9.dll" >&2 || true
     die "HL2 Wine prefix template is incomplete"
 }
+# wineboot stamps every registry key with the wall clock and invents per-boot GUIDs, so the kit's
+# files_sha256 (which covers system.reg and user.reg) changed on every build. That hash goes into
+# every prepared game's owner marker, so TitleCurrent() was false for all of them and Playden
+# offered "Update games to the new runtime kit" after every package install, forever, with Play
+# gated behind it. Canonicalizing makes two builds of the same runtime produce the same kit.
+python3 "$ROOT/scripts/canonicalize-prefix-registry.py" "$PREFIX"
 for dll in $DXVK_DLLS; do
     cmp -s "$DXVK_262_X64_DIR/$dll.dll" "$PREFIX/drive_c/windows/system32/$dll.dll" ||
         die "Wine replaced DXVK's x64 $dll.dll in the template"
