@@ -25,6 +25,7 @@ TITLE = "runtime-template/kit/title"
 TITLE_ICON = TITLE + "/sce_sys/playden-icon.png"
 RUNTIME = "runtime-template/kit/runtime"
 RECIPE = "runtime-template/kit/recipes/orbis-win-ps4.json"
+AUDIO_DRIVER = "sce_module/wineps5.prx"
 VIEW = "runtime-template/playden-kit-view.json"
 # What Orbis-Win does that Playden's settings ask a kit about (ps4/platform_ps4/game_controls.cpp Ps4Kit),
 # and the any-title slots that stand for each game's profile.
@@ -93,7 +94,17 @@ def main() -> int:
         "capabilities": CAPABILITIES,
         "runtime": {"bundle_id": "wine-wow64", "artifact_revision": runtime_revision, "path": RUNTIME,
                     "wine_revision": wine_revision},
-        "template": {"path": TEMPLATE, "drive_table": TEMPLATE + "/dosdevices/.pw-symlinks"},
+        # mmdevapi loads Wine's audio driver by name, and a recipe may require the "ps5" one --
+        # the Source-engine recipe steam-220-hl2-v1 (HL2, HL:Source, L4D2, Portal) does. PS4 ships
+        # that same driver as sce_module/wineps5.prx, built by Orbis-Win's wineps5-prx-ps4.sh, so
+        # say so when it is actually in the stage. The console admits this kit from this file
+        # (ps4/runtime_ps4/kit_ps4.cpp) instead of re-deriving it from the template's registry the
+        # way kit_manifest.cpp does on PS5, so without this the capability reads as absent and
+        # every such recipe is refused with "The installed runtime kit lacks what this game needs
+        # (PS5 audio)" -- which made "Update games to the new runtime kit" fail permanently and
+        # left Recreate bottle as the only recovery.
+        "template": {"path": TEMPLATE, "drive_table": TEMPLATE + "/dosdevices/.pw-symlinks",
+                     "audio_ps5": (stage / AUDIO_DRIVER).is_file()},
         "recipe": {"id": "orbis-win-ps4", "version": "1", "path": RECIPE, "sha256": recipe_sha},
         "variants": [{"id": "ps4", "title_id": "FAKE78000", "path": TITLE, "any_title": True}],
         "files": files,

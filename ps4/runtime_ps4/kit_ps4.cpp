@@ -127,6 +127,11 @@ std::optional<playden::homebrew::RuntimeKit> AdmitPs4Kit(std::string *reason)
     view.runtime = {bundle->text(), revision->text(), runtime_path->text()};
     view.template_path = template_path->text();
     view.template_drive_table = drive_table->text();
+    // Optional, and false when absent: an older view predates it. scripts/ps4-kit-view.py sets it
+    // when sce_module/wineps5.prx is in the stage. PS5 derives the same flag from the template's
+    // registry (kit_manifest.cpp ValidateRegistry), which this console's admission does not run.
+    const auto *audio_ps5 = bottle->Find("audio_ps5");
+    view.template_audio_ps5 = audio_ps5 && audio_ps5->is_bool() && audio_ps5->boolean();
     view.recipe = {recipe_id->text(), recipe_version->text(), recipe_path->text(), recipe_sha->text()};
     for (const auto &item : variants->array()) {
         const auto *id = item.is_object() ? Text(item, "id") : nullptr;
