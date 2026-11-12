@@ -134,11 +134,14 @@ The Local store test exposed and fixed three separate issues:
    shrank from 286 to 228 bytes. Scan, load, add, move and uninstall all pass on
    hardware; the Local store gate is done.
 
-   02.74's `/app0/dev.conf` network logging did **not** connect: the package was
-   built with `PS4_DEV_CONF=10.168.2.188:9300` and `ps5logd` was listening, but
-   no connection arrived, so the `durable root private/traversable` probe lines
-   could not be read. The fix is confirmed by behavior instead. Worth chasing
-   before the next run that depends on the network log.
+   **`PS4_DEV_CONF` logging writes a file, it does not only stream over TCP.**
+   Nothing ever connected to `ps5logd` on 9300, but the same lines are in
+   `/data/PLDN10001-network.log` (39 MB on 2026-11-12), which FTP can read.
+   Look there first; do not conclude the diagnostics are missing because the
+   listener stayed silent. The probe in that file measures the cause exactly:
+
+       durable root private:     open=13   fsync=-1/0     <- EACCES
+       durable root traversable: open=ok   fsync=0/0
 
 The installed test build is Playden 02.74,
 `IV0000-PLDN10001_00-PLDN100010000000-0274.pkg`, SHA-256
@@ -178,7 +181,20 @@ Portal 2 shows a black screen for ~40 s while loading.
 
 ## Leftovers on the console
 
-Five `steam-6300.set-aside-*` bottles (~1.6 GB) and the stray
-`/data/data/PLDN10001/FAKE78xxx` folders from the doubled-path bug, both
-awaiting a decision. `/data/playden-ui-preview` was deleted to test the new
+Both leftovers resisted removal on 2026-11-12, and neither is reachable the
+obvious way:
+
+- The five `steam-6300.set-aside-*` bottles cannot even be **listed** over FTP.
+  `pw_diagnostics_private_modes` made `/data/playden/games` owner-only, so FTP
+  returns 550 and the "~1.6 GB" figure here is unverified. They would have to go
+  through Playden's own Maintenance screen.
+- The stray `/data/data/PLDN10001/FAKE78xxx` folders (4 of them, ~1.1 MB of
+  duplicate icons, no `game-launch.json` -- the real ones at
+  `/data/PLDN10001/FAKE78xxx` have it and are intact) cannot be deleted by FTP:
+  every `DELE` and `RMD` under `/data/data` returns 550, because the FTP server
+  has no write permission on that tree, unlike 0777 `/data/pkg`. PS4-Xplorer
+  2.0 in Root Access mode shows them and offers Delete, but the operation hangs
+  with an empty progress bar and its Cancel stops responding too; the app exits
+  on its own and nothing is partially deleted. A GoldHEN payload or shell is
+  probably the only route left. Low stakes either way. `/data/playden-ui-preview` was deleted to test the new
 default; it said `1280x720 6 live`.
