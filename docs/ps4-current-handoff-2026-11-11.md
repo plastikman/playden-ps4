@@ -179,22 +179,22 @@ In the order I would take it:
 Not ours: Isaac (250900) faults in the guest with the Steam emulator, and
 Portal 2 shows a black screen for ~40 s while loading.
 
-## Leftovers on the console
+## Leftovers on the console -- cleared 2026-11-12
 
-Both leftovers resisted removal on 2026-11-12, and neither is reachable the
-obvious way:
+**The GoldHEN FTP server supports `SITE CHMOD`, and that is the key to every
+"550 Requested action not taken" under `/data`.** FTP runs as a user that has no
+write permission on an owner-only tree, so `DELE`, `RMD` and even `RNFR` all
+fail there -- and the names make no difference, a plain `.txt` fails the same way
+as a dotfile. `SITE CHMOD 777 <path>` on the directory *and* each entry inside it
+makes the tree writable, after which ordinary FTP deletes work. PS4-Xplorer 2.0's
+root-mode Delete is not an alternative: it hangs with an empty progress bar, its
+Cancel stops responding, and the app exits on its own.
 
-- The five `steam-6300.set-aside-*` bottles cannot even be **listed** over FTP.
-  `pw_diagnostics_private_modes` made `/data/playden/games` owner-only, so FTP
-  returns 550 and the "~1.6 GB" figure here is unverified. They would have to go
-  through Playden's own Maintenance screen.
-- The stray `/data/data/PLDN10001/FAKE78xxx` folders (4 of them, ~1.1 MB of
-  duplicate icons, no `game-launch.json` -- the real ones at
-  `/data/PLDN10001/FAKE78xxx` have it and are intact) cannot be deleted by FTP:
-  every `DELE` and `RMD` under `/data/data` returns 550, because the FTP server
-  has no write permission on that tree, unlike 0777 `/data/pkg`. PS4-Xplorer
-  2.0 in Root Access mode shows them and offers Delete, but the operation hangs
-  with an empty progress bar and its Cancel stops responding too; the app exits
-  on its own and nothing is partially deleted. A GoldHEN payload or shell is
-  probably the only route left. Low stakes either way. `/data/playden-ui-preview` was deleted to test the new
-default; it said `1280x720 6 live`.
+- The stray `/data/data/PLDN10001/FAKE78xxx` tree from the doubled-path bug is
+  **deleted** (24 files, 18 directories). The real titles at
+  `/data/PLDN10001/FAKE78xxx` are untouched and keep their original modes; they
+  are the ones carrying `game-launch.json`, which the strays never had.
+- The five `steam-6300.set-aside-*` bottles measure **971 MB**, not the ~1.6 GB
+  guessed earlier. They have been chmodded to 0777 so they can be deleted over
+  FTP; the live bottles beside them were left `drwx------` and must stay that
+  way -- widening a live bottle is what caused `session-owner-invalid`.
