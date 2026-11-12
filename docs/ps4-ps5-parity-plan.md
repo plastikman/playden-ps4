@@ -2,56 +2,51 @@
 
 ## Runtime layout decision (2026-11-11)
 
-Use the PS5 runtime's on-disk contract on PS4. Playden's game data root is
-`/data/playden/games/<install_id>`; its bottle is
-`library/prefixes/game`, its profile is under `library/profiles`, and a small
-`/data/homebrew/FAKE78xxx/game-launch.json` names the game. The PS4 still runs
-Wine inside `PLDN10001`; these folders are descriptors, not separately
-registered PS4 titles. A Play request must pass a session ID to Orbis-Win, and
-Orbis-Win must write the result under that game's `logs/sessions` folder.
+The PS4 uses the PS5 runtime's on-disk contract. A game's data root is
+`/data/playden/games/<install_id>`, its bottle `library/prefixes/game`, its
+profile `library/profiles`, and a small per-game title folder holds
+`game-launch.json`. That title folder lives beside the host application's data:
+`/data/PLDN10001` on PS4, `/data/homebrew` on PS5 (`src/runtime/title_root.h`).
+The PS4 still runs Wine inside `PLDN10001`; these folders are descriptors, not
+separately registered PS4 titles. Play passes a session ID to Orbis-Win, which
+writes the result under that game's `logs/sessions`.
 
-The PS4 package generates a bundled kit view from its Wine prefix and runtime
-identity. The shared `FilesystemPackageInstaller` consumes that view, and the
-PS4 live composition builds a `RuntimeHost` with the shared controller. The
-Orbis-Win PS4 module on branch `playden-ps4-0170` now reads descriptors
-and writes session records; Playden hands a session to it with `LoadExec`. That
-branch starts from the hardware-tested 01.70 code and resumes the same session
-when Wine runs the next program in an execution chain.
-The package build requires a clean Orbis-Win manifest and copies its module
-unchanged. Hardware has not yet verified this path, so launch parity remains
-open.
+The PS4 package describes its bundled Orbis-Win as a kit (`scripts/ps4-kit-view.py`)
+and the shared `FilesystemPackageInstaller` consumes that view;
+`ps4/runtime_ps4/` supplies the kit, a native coordinator whose titles are
+profile names, and the legacy-prefix migration. The runtime bundle is named
+`wine-wow64`, which the profile validation compares against the profile's own
+`runtime` field.
 
-The new bottle is made from the matching Wine template. On first preparation,
-Playden copies the old prefix's `drive_c/users`, `user.reg` and `userdef.reg`
-into that bottle, flushes the files, then writes a completion marker. The old
-prefix is retained for recovery. Other changes in an old `system.reg` are not
-yet imported; verify a game with an existing save before considering this
-migration complete.
+**Observed on hardware, 2026-11-11 (PlayDen 02.67, Orbis-Win 01.73):** Portal 2
+(620) prepared, published, launched through `LoadExec`, reached its main menu,
+quit, and Playden read the session back:
+`play finished install=steam-620 state=5 code= cleared=1 played_s=275`.
+Half-Life: Source (280) and Dreamfall (6300) also launched. Three defects had to
+be fixed first, each measured rather than inferred:
 
-Finish in this order:
+1. Orbis-Win's descriptor check hard-coded `/data/homebrew/`; it now validates
+   against the title's own data root (`prospero-win` 1f53082).
+2. Orbis-Win's diagnostics chmodded the game's `library` folder to 0777 on every
+   launch, which the evidence reader then refused; under Playden the log folders
+   stay owner-only (`pw_diagnostics_private_modes`, `prospero-win` 4a89b39).
+3. A PS4 title cannot `dup()` a directory descriptor (EPERM), so every
+   `dup`+`fdopendir` listing read as empty and the directory walk took each child
+   for a swapped entry (ESTALE). `platform::OpenHeldListing` lists by path on the
+   console. Both `getdents` calls work on either kind of descriptor; only `dup`
+   does not.
 
-1. Confirm from a PS4 app process that `/data/playden` and `/data/homebrew`
-   can be created and written. FTP success does not prove app access. Stop
-   preparation with a clear reason if either root is unavailable.
-2. Port descriptor admission and session recording into the Orbis-Win PS4
-   Wine module. Select `data_root/library`, the published profile and its
-   `prefixes/game`; validate the descriptor, launch argument and publication
-   before Wine starts. Report start, exit and failure, including a failed
-   setup. The PS4 stat omission is handled through `fstat`; test the owner and
-   mode checks on hardware. Validate the profile and publication against the
-   descriptor before marking the runtime path ready for general use.
-3. Test the wired `RuntimeHostConfig::launch_title` same-title Wine handoff.
-   Check that the session record appears and that an abnormal exit reconciles
-   on the next Playden start.
-4. Migrate each old `/data/PLDN10001/prefixes/steam-<app>` and the special
-   Half-Life 2 prefix into that game's new bottle without discarding registry
-   or saves. A new template must be staged and owned before user data is
-   merged. Journal and verify each move. Existing Steam game files may stay
-   at `/data/PLDN10001/games/<app>`: the shared runtime records their
-   `install_path` separately from `data_root`.
-5. Test a prepared game, normal return, a runtime failure, an interrupted
-   preparation, and an existing save on hardware. Only then make the shared
-   runtime path the default player flow.
+Open on this path:
+
+- A game prepared with an earlier kit refuses both Play and "Update games to the
+  new runtime kit" (`installed title and bottle are not this install's from a
+  compatible kit`); only Maintenance > Recreate bottle recovers it, and each
+  Recreate leaves a `<install>.set-aside-<uuid>` bottle copy.
+- Legacy prefix migration (`ps4/runtime_ps4/legacy_bottle.cpp`) copies an old
+  `/data/PLDN10001/prefixes/steam-<app>` into the new bottle; a game with an
+  existing save has not been verified end to end.
+- Cloud sync before and after play, "Run launcher or setup", and detailed-log
+  launches are wired but unexercised.
 
 ## Goal
 
@@ -74,6 +69,19 @@ This plan records the state observed on 2026-11-09. Update the matrix whenever
 a gap is completed or intentionally deferred.
 
 ## Architectural finding
+
+**Resolved 2026-11-11, with one step left.** The PS4 title now links and runs
+the shared product layer: `ps4/homebrew_live.cpp` composes the same services the
+desktop host's live mode composes (account, library, organization, details,
+installs, Cloud, download servers, store details, community recipes, local
+store) and hands them to the shared `Controller` and `RuntimeHost`, drawn by
+`src/homebrew/view.cpp` through a CPU backend of hui's renderer (`ps4/hui_cpu/`).
+Playden's own UI is what the title draws by default since 02.68; the first PS4
+launcher runs only when the switch file says `legacy`. Retiring `ps4/ui.cpp`,
+`ps4/main.c`'s page state and most of `ps4/platform_ps4/steam_auth.cpp` is the
+remaining step. Two services are not wired yet: web access and self-update.
+
+The finding that led there, recorded 2026-11-09:
 
 PS4 presently has visual resemblance, not shared product behavior. Its five
 tabs and details pages are drawn by `ps4/ui.cpp`; controller state and page
@@ -101,52 +109,20 @@ behind PS4 implementations.
 
 ## Parity matrix
 
-Implementation checkpoint, 2026-11-09: the PS4 target compiles with the
-shared library cache, shared organization file, generic Cloud prefix lookup,
-selected-depot and executable install checks, private prefixes for new Steam
-games, and executable architecture detection. The supported PS4 download
-setting was one connection until 01.86; it is now four, PS5's default. Build 01.80 was installed on the console and
-aborted during startup, after cached Steam authentication and before the
-library was displayed. These changes have not passed a console test.
-See `ps4-parity-inventory.json` for evidence per row. The shared route and
-controller model, multi-job queue, update workflows, and platform services
-remain open. An installed game crashing on the older package is not evidence
-that these new changes work or fail.
+**Checkpoint 2026-11-11 (PlayDen 02.68, Orbis-Win 01.73).** The PS4 runs the
+shared product layer, so most rows below are the shared implementation rather
+than a PS4 one. "Shared" means the shared code is wired and compiled into the
+title; it does **not** mean the row has the hardware evidence this plan requires
+(see *PS4 hardware gates*). What one session observed on the console is noted per
+row and, in detail, under *Runtime layout decision*.
 
-Local build 01.80 was produced from the clean Orbis-Win 01.62 stage, using its
-released Wine module unchanged. Package SHA-256:
-`8d5efeef1bb4608623615d1013477498a1d3c9ee23af042aa17244b008665cfc`.
-`PkgTool.Core pkg_validate` passed all checks. It was uploaded and installed,
-but its launch failed with SIGABRT. Build 01.81 fixes Mafia's trailing-slash
-working-directory profile rejection and adds library-startup checkpoints.
-It also aborted after the library refresh was queued. Build 01.82's worker
-checkpoints showed that authentication and network fetch completed, then the
-process aborted inside the library cache save. Build 01.83 skips that PS4 cache
-path so the library and Mafia can be tested. It passed package validation and
-was uploaded, but has not yet been launched on the console. Restoring the PS4
-offline library cache remains open work. Build 01.84 exported the SDK's
-extended-libc-heap settings from the UI module after Mafia's manifest inflated
-size triggered a 1.6 MB `operator new` failure despite reported free memory.
-That could not help: libc reads those settings only from the eboot, whose
-CRT already requested an unlimited, extended heap.
+Still genuinely absent: web access and self-update are not constructed on PS4;
+external storage stays deferred. The first PS4 launcher still exists behind the
+`legacy` switch file and has not been removed.
 
-Build 01.85 measured the heap with `malloc_stats_fast`: libSceLibcInternal's
-heap is fixed at 13,712 KiB and never grows (flexible memory stayed at
-~446 MiB while malloc refused). Playden idles near 8 MiB, so a depot manifest
-(Mafia, app 40990) or the chunk buffers of more than one download worker
-exhausted it. Orbis-Win found the same 13 MiB ceiling in wineserver and moved
-Wine's Unix side to its own heap. Build 01.86 does the same for the UI module:
-`ps4/playden_heap.c` (adapted from Orbis-Win's `pw_wine_heap.c`) serves
-malloc, calloc, realloc, free and posix_memalign through `-Wl,--wrap`, backed
-by anonymous (flexible) mappings, and hands pointers libc allocated back to
-libc. The build fails if the module imports libc's allocator directly. On the
-console 01.86 held 32 MiB at startup, downloaded Mafia past the failing
-manifest, and downloaded with four connections (PS5's default, restored) at
-about 10.5 MiB live with no allocation failures.
-Orbis-Win's package parity script reports its expected
-eboot check as failing because Playden's eboot starts `playden_ui.prx`, and its
-kernelbase source check as failing on the unchanged 01.62 baseline DLL. That
-script is not a Playden acceptance gate; no PS4 launch result is implied.
+The 2026-11-09 checkpoint that preceded this work (library cache, heap ceiling,
+download connections, Mafia's manifest) is kept in git history; its conclusions
+about the PS4 monolith are superseded by *Architectural finding*.
 
 Status meanings:
 
@@ -159,35 +135,35 @@ Status meanings:
 
 | Area | PS5 reference behavior | PS4 state | Parity target |
 | --- | --- | --- | --- |
-| Navigation and UI state | Shared Home, Library, Downloads, Saves, Settings, Details, Session, Save details, and Manage games routes | Partial; five tabs and bespoke subpages | Drive all routes and focus/modal state from the shared model; render the same actions and messages |
-| Home | Continue playing, recent/installed shelves, active work, notices | Partial; installed row and active download | Project the shared Home shelves, status badges, notices, and details navigation |
-| Steam sign-in | QR and password, Steam Guard approval/codes, restore, stay signed in, switch account, sign out, offline/error recovery | Partial; QR and cached restore | Wire the shared account service and complete every sign-in/account action |
-| Library cache | Cached/offline library, refresh, license-change refresh | Partial; `LibraryService`/`LibraryCache` are wired, but shared controller and console recovery are unverified | Use `LibraryService` and `LibraryController`, including stale/offline state and refresh |
-| Library organization | Favorites, Hidden, collections, pinned collections, compatibility rating, notes, search, sort, filters, durable selection | Partial; Favorites and Hidden use shared `OrganizationSnapshot`, other actions absent | Use `OrganizationSnapshot` and its persistence controller without a PS4-only format |
-| Library sources | Steam plus imported/local games | Missing local source | Use the store registry; add Local only when PS4 storage access is ready |
-| Artwork | Cached covers, hero/logo/program/title art, fallbacks, failure state | Partial; cover cache | Adopt shared artwork state and cache policy; render the same fallbacks and pending/error states |
-| Game details | Store metadata, install/update/play, game settings, maintenance, notes, compatibility, collections, run-once tools | Partial; metadata, install/launch/delete | Project the shared details actions and runtime/update state; remove record-exists shortcuts |
-| Install choices | Storage, branch/version, content language, DLC, measured size, reservation/no-space behavior | Partial; global language and immediate install | Use the shared install sheet and size checks; keep PS4 volume reporting capability-aware |
-| Downloads | Multiple jobs, pause/resume, cancel, reorder/download-now, verify/apply states, rates/ETA, completed history | Partial; one active/last job and cancel, one supported network connection | Use `InstallService` and the shared Downloads model |
-| Interrupted installs | Resume journal, truthful incomplete state, repair/update of stale records | Partial; borrowed depots and launch executable checked, full record verification still pending | Validate selected depots against the record; never show Play for incomplete content |
-| Game updates | Installed-game check, changed-file sizing, DLC changes, per-game and batch updates | Missing | Wire `AppDetailsService`, update-check persistence, details update, and Manage games > Updates |
-| Runtime preparation | Readiness, queue, repair, recreate, settings publication, runtime update, progress and refusal reasons | Partial and PS4-specific | Add a PS4 runtime-host implementation behind a shared interface and project the same lifecycle |
-| Launch/session | Preflight, Cloud-before-play, preparation, launch state, failure evidence, return and post-play work | Partial; direct same-title Wine handoff | Preserve PS4 same-title launch while exposing the shared Play/Session state machine |
-| Steamworks support | Prepared globally as part of game setup | Partial; added in the PS4 launch/install path | Make it shared setup behavior for every applicable game; no app-specific branch |
-| Per-game settings | Presets, executable/launch choice, graphics, architecture, overrides, input, writable folders, reset/export | Partial; generated launch profiles now use detected PE architecture and new games get private prefixes; player workflow absent | Use the shared recipes/settings contract with PS4-supported capabilities |
-| Maintenance | Apply settings, verify/repair, clear shader cache, back up saves, recreate bottle, update runtime kit | Missing | Implement PS4 equivalents and gate only genuinely unsupported actions |
-| Steam Cloud | Quick check, Sync all, per-game details, conflicts, use-local/use-Cloud, automatic pre/post-play sync, leftover data | Partial; per-game check/apply use a game profile prefix, shared controller and pre/post-play sync absent | Use `CloudService` and shared controller lifecycle with generic prefix/save locations |
-| Uninstall | Cloud gate, runtime removal, files, keep/delete saves, queued/batch flow, truthful stopped states | Partial; deletes files and keeps prefix/saves | Use the shared uninstall flow adapted to the single PS4 title |
-| Manage installed games | Updates, runtime-kit migrations, move, batch uninstall | Missing | Add shared route; mark Move unavailable until multiple writable volumes exist |
+| Navigation and UI state | Shared Home, Library, Downloads, Saves, Settings, Details, Session, Save details, and Manage games routes | Shared, since 02.68 by default; the shared model drives every route | Drive all routes and focus/modal state from the shared model; render the same actions and messages |
+| Home | Continue playing, recent/installed shelves, active work, notices | Shared; Continue playing, shelves, notices observed | Project the shared Home shelves, status badges, notices, and details navigation |
+| Steam sign-in | QR and password, Steam Guard approval/codes, restore, stay signed in, switch account, sign out, offline/error recovery | Shared account service; cached sign-in carried over, other actions untested | Wire the shared account service and complete every sign-in/account action |
+| Library cache | Cached/offline library, refresh, license-change refresh | Shared `LibraryService`/`LibraryCache`; 118-game library observed | Use `LibraryService` and `LibraryController`, including stale/offline state and refresh |
+| Library organization | Favorites, Hidden, collections, pinned collections, compatibility rating, notes, search, sort, filters, durable selection | Shared `OrganizationSnapshot` and persistence controller | Use `OrganizationSnapshot` and its persistence controller without a PS4-only format |
+| Library sources | Steam plus imported/local games | Shared registry; Local store wired, untested | Use the store registry; add Local only when PS4 storage access is ready |
+| Artwork | Cached covers, hero/logo/program/title art, fallbacks, failure state | Shared artwork service and cache; no banner where Steam has none (upstream gap) | Adopt shared artwork state and cache policy; render the same fallbacks and pending/error states |
+| Game details | Store metadata, install/update/play, game settings, maintenance, notes, compatibility, collections, run-once tools | Shared details actions, runtime and update state | Project the shared details actions and runtime/update state; remove record-exists shortcuts |
+| Install choices | Storage, branch/version, content language, DLC, measured size, reservation/no-space behavior | Shared install sheet; PS4 reports no free space | Use the shared install sheet and size checks; keep PS4 volume reporting capability-aware |
+| Downloads | Multiple jobs, pause/resume, cancel, reorder/download-now, verify/apply states, rates/ETA, completed history | Shared `InstallService` and Downloads model | Use `InstallService` and the shared Downloads model |
+| Interrupted installs | Resume journal, truthful incomplete state, repair/update of stale records | Shared; an unfinished download is adopted as a paused job | Validate selected depots against the record; never show Play for incomplete content |
+| Game updates | Installed-game check, changed-file sizing, DLC changes, per-game and batch updates | Shared `AppDetailsService` and update-check persistence; kit-update dialog observed | Wire `AppDetailsService`, update-check persistence, details update, and Manage games > Updates |
+| Runtime preparation | Readiness, queue, repair, recreate, settings publication, runtime update, progress and refusal reasons | Shared `RuntimeHost` with a PS4 kit and coordinator; prepare observed | Add a PS4 runtime-host implementation behind a shared interface and project the same lifecycle |
+| Launch/session | Preflight, Cloud-before-play, preparation, launch state, failure evidence, return and post-play work | Shared Play/Session state machine; launch, exit and play time observed | Preserve PS4 same-title launch while exposing the shared Play/Session state machine |
+| Steamworks support | Prepared globally as part of game setup | Shared setup through `RuntimeHost`, no app-specific branch | Make it shared setup behavior for every applicable game; no app-specific branch |
+| Per-game settings | Presets, executable/launch choice, graphics, architecture, overrides, input, writable folders, reset/export | Shared recipes/settings contract; private settings storage works | Use the shared recipes/settings contract with PS4-supported capabilities |
+| Maintenance | Apply settings, verify/repair, clear shader cache, back up saves, recreate bottle, update runtime kit | Shared menu; Recreate bottle observed, other actions untested | Implement PS4 equivalents and gate only genuinely unsupported actions |
+| Steam Cloud | Quick check, Sync all, per-game details, conflicts, use-local/use-Cloud, automatic pre/post-play sync, leftover data | Shared `CloudService` and controller wired; sync untested | Use `CloudService` and shared controller lifecycle with generic prefix/save locations |
+| Uninstall | Cloud gate, runtime removal, files, keep/delete saves, queued/batch flow, truthful stopped states | Shared uninstall flow wired; untested | Use the shared uninstall flow adapted to the single PS4 title |
+| Manage installed games | Updates, runtime-kit migrations, move, batch uninstall | Shared route wired; Move unavailable (one volume) | Add shared route; mark Move unavailable until multiple writable volumes exist |
 | Internal storage | Managed install root and install records | Present for current flow | Keep transactional ownership, record, and resume rules |
 | External storage | Discover, select default, install/move, disconnect/reconnect | Deferred; `/mnt/ext0` is not writable from the title under current policy | Keep in the model as unavailable with a reason; implement after a reviewed PS4 access mechanism exists |
-| Local import | Scan drop folders, add/play in place, copy/move into Playden, remove from library | Missing and deferred with storage access | Port the shared Local store once its PS4 directory policy and mounts are defined |
-| Settings | Downloads, updates, account, storage, web access, runtime kit/about, accessibility plus game settings | Partial; language and diagnostic/runtime controls | Render shared settings, with PS4 diagnostics in an Advanced/Diagnostics section |
-| Self-update | Check/download/stage/relaunch/rollback and release notes | Missing | Point to `plastikman/playden-ps4`, use PS4 package install/relaunch mechanics, and preserve the shared state model |
-| Runtime-kit update | Install/admit version and update prepared games | Missing shared workflow | Define the PS4 runtime bundle contract, update it transactionally, then expose shared status/actions |
-| Web access and logs | Paired local web service, redacted logs/files, in-app log viewer | Missing; only remote receiver controls exist | Port service where PS4 networking permits; always retain an in-app redacted log path |
-| Download-server selection | List/test/prefer Steam CDN server | Missing | Wire `DownloadServerService`; do not expose raw concurrency as the normal player control |
-| Accessibility and polish | Shared HUI layout, button glyphs, focus behavior, motion preference, font fallbacks, keyboard | Partial | Render from the shared view contract and implement required PS4 HUI/platform primitives |
+| Local import | Scan drop folders, add/play in place, copy/move into Playden, remove from library | Shared Local store wired; untested, and `drop_folder_access.cpp` still lists through `dup` | Port the shared Local store once its PS4 directory policy and mounts are defined |
+| Settings | Downloads, updates, account, storage, web access, runtime kit/about, accessibility plus game settings | Shared settings render | Render shared settings, with PS4 diagnostics in an Advanced/Diagnostics section |
+| Self-update | Check/download/stage/relaunch/rollback and release notes | Missing from the shared composition; the first PS4 launcher's own updater remains | Point to `plastikman/playden-ps4`, use PS4 package install/relaunch mechanics, and preserve the shared state model |
+| Runtime-kit update | Install/admit version and update prepared games | Shared dialog present; refuses games prepared with an earlier kit (Recreate bottle recovers) | Define the PS4 runtime bundle contract, update it transactionally, then expose shared status/actions |
+| Web access and logs | Paired local web service, redacted logs/files, in-app log viewer | Missing; `web::Service` is not constructed on PS4 | Port service where PS4 networking permits; always retain an in-app redacted log path |
+| Download-server selection | List/test/prefer Steam CDN server | Shared `DownloadServerService` wired; untested | Wire `DownloadServerService`; do not expose raw concurrency as the normal player control |
+| Accessibility and polish | Shared HUI layout, button glyphs, focus behavior, motion preference, font fallbacks, keyboard | Shared view contract on the CPU renderer; ~58 fps, frames skipped when idle | Render from the shared view contract and implement required PS4 HUI/platform primitives |
 
 ## Milestone 0: correctness before parity expansion
 
@@ -219,6 +195,15 @@ Acceptance games for this gate:
   with no title-specific installer branch.
 
 ## Milestone 1: converge on the shared product layer
+
+**Done 2026-11-11, except removing the old launcher.** Steps 1-4 below describe
+how it was approached; what shipped differs in one way worth recording: instead
+of porting the shared model piece by piece onto the PS4 UI, the PS4 adopted the
+whole app layer at once (`ps4/homebrew_live.cpp` composing the desktop host's
+live services, `src/homebrew/view.cpp` drawn by `ps4/hui_cpu/`), which made most
+of the per-feature porting unnecessary. Web access and self-update are the two
+services still unwired.
+
 
 ### 1. Build the shared model on PS4
 
@@ -385,6 +370,21 @@ Every milestone package must record:
 - whether the behavior was merely built, host-tested, or observed on PS4.
 
 Never mark a parity row Present from a screenshot alone.
+
+## What is left (2026-11-11)
+
+1. Remove the first PS4 launcher: `ps4/ui.cpp`, the page state in `ps4/main.c`
+   and most of `ps4/platform_ps4/steam_auth.cpp`, once the shared path has run
+   without the `legacy` escape for a while.
+2. Wire web access and self-update into the PS4 composition.
+3. Recover games prepared with an earlier kit without Recreate bottle, and stop
+   `.set-aside-*` bottles accumulating.
+4. Exercise on hardware, with the evidence the gates below require: Cloud sync
+   before and after play, uninstall, Manage installed games, game updates, the
+   Local store (and replace `drop_folder_access.cpp`'s `dup` listings first),
+   download-server selection, and a legacy-prefix migration for a game with an
+   existing save.
+5. Keep deferred rows truthful in the UI: external storage, Move.
 
 ## Definition of parity complete
 

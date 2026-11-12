@@ -239,7 +239,8 @@ int playden_ps4_main(int argc, char **argv) {
     int override_count = 0;    /* the picker's choices; "Type your own" follows them */
     // Restore a saved Steam session silently. With no cached credentials the
     // launcher remains on Connect Steam and does not start a QR flow.
-    /* Playden's own UI (the preview switch file) brings its own services: no second session restore here. */
+    /* Playden's own UI brings its own services: no second session restore here. The first PS4
+     * launcher below runs only when the switch file asks for it (ps4/homebrew_preview.cpp). */
     const int preview = playden_ps4_preview_wanted && playden_ps4_preview_run && playden_ps4_preview_wanted();
     if (!preview && playden_ps4_auth_restore_cached()) page = 1;
     selected = 4;
@@ -260,7 +261,7 @@ int playden_ps4_main(int argc, char **argv) {
     sceSystemServiceHideSplashScreen();
     sceVideoOutSubmitFlip(handle, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
     log_line("PLDN10001: interactive launcher shell displayed");
-    /* /data/PLDN10001/ui-preview: Playden's own UI on the CPU renderer, for measuring (ps4/homebrew_preview.cpp). */
+    /* Playden's own UI on the CPU renderer (ps4/homebrew_preview.cpp); it does not return. */
     if (preview)
         playden_ps4_preview_run(handle, buffers, BUFFERS, WIDTH, HEIGHT);
 

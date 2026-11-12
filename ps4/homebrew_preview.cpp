@@ -2,11 +2,15 @@
 // Copyright (c) 2026 Playden contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A measurement build, not the launcher: with /data/playden-ui-preview (FTP can create it; the title's
-// own folder is private to it) or /data/PLDN10001/ui-preview present, main.c hands the
-// display to this loop instead of the native shell. It runs the UI on its simulation fixtures (no
-// Steam, no installs), drives it with the controller, and logs how long frames take and how much
-// memory the UI holds. The file may say "WIDTHxHEIGHT THREADS" (default 1280x720 6).
+// This is the title's UI: main.c hands it the display, and it runs Playden's own app layer against
+// the live services (ps4/homebrew_live.cpp) with the player's account, library and games. It draws
+// with the CPU renderer, drives the UI from the controller, and logs frame times and the memory the
+// UI holds every two seconds.
+//
+// /data/playden-ui-preview (FTP can write it; the title's own folder is private to it) or
+// /data/PLDN10001/ui-preview changes that: "legacy" runs the PS4 port's first launcher instead,
+// "fixtures" draws the demo catalogue rather than the player's games, and "WIDTHxHEIGHT THREADS"
+// sets the renderer's size and thread count (default 1280x720 6).
 
 #include "gfx/surface.hpp"
 #include "homebrew/render.hpp"
@@ -41,6 +45,9 @@ extern "C" void playden_ps4_log_text(const char *line);
 namespace
 {
 
+// Playden's own UI is what this title runs. The switch file only changes that: "legacy" keeps the
+// PS4 port's first launcher (ps4/ui.cpp), "fixtures" draws the demo catalogue instead of the
+// player's own games, and "WIDTHxHEIGHT THREADS" sets the renderer's size and thread count.
 constexpr const char *kMarkers[] = {"/data/playden-ui-preview", "/data/PLDN10001/ui-preview"};
 constexpr const char *kAssets = "/app0/homebrew/assets";
 constexpr const char *kFixtures = "/app0/homebrew/fixtures";
@@ -186,26 +193,34 @@ static FILE *open_marker()
     return nullptr;
 }
 
+// Whether this title draws Playden's own UI: always, unless the switch file asks for the first
+// PS4 launcher ("legacy" anywhere in it).
 extern "C" int playden_ps4_preview_wanted(void)
 {
     FILE *marker = open_marker();
     if (marker == nullptr)
-        return 0;
+        return 1;
+    char text[128] = {};
+    const std::size_t read = std::fread(text, 1, sizeof(text) - 1, marker);
     std::fclose(marker);
-    return 1;
+    text[read] = '\0';
+    return std::strstr(text, "legacy") == nullptr;
 }
 
 // Runs until the title is closed. buffers: the registered VideoOut buffers, frame_width x frame_height.
 extern "C" void playden_ps4_preview_run(int video, void **buffers, int buffer_count, int frame_width, int frame_height)
 {
     int width = 1280, height = 720, threads = 6;
-    bool live = false;
+    bool live = true;  // the player's own account and games, unless the switch file says fixtures
     if (FILE *marker = open_marker())
     {
         int w = 0, h = 0, t = 0;
-        char mode[16] = {};
-        const int read = std::fscanf(marker, "%dx%d %d %15s", &w, &h, &t, mode);
-        live = read == 4 && std::strcmp(mode, "live") == 0;
+        char text[128] = {};
+        const std::size_t read_bytes = std::fread(text, 1, sizeof(text) - 1, marker);
+        text[read_bytes] = '\0';
+        if (std::strstr(text, "fixtures"))
+            live = false;
+        const int read = std::sscanf(text, "%dx%d %d", &w, &h, &t);
         if (read >= 2 && w >= 320 && h >= 180 && w <= frame_width && h <= frame_height)
         {
             width = w;
