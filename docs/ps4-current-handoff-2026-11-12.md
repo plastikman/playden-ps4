@@ -102,19 +102,43 @@ full flexible-mapping fallback is not viable on this PS4 runtime"*. Per-page
 (16 KiB) flexible mappings do work, so there is a size threshold worth finding
 between 16 KiB and 768 KiB.
 
-**The caller is not identified.** Symbolizing the backtrace against
-`prospero-win/.deps/wine-ps5/prx/ntdll.shared.elf` (text base 0, so offsets map
-directly) produced `set_page_vprot_exec_write_protect` /
-`__wine_ps5_wait_for_exec_migration` / `anon_mmap_fixed` — but the run contains
-**zero** `exec-migrate`, `exec-rx-timing` and `exec-range` records, so the
-migration path did not run and that chain is not trustworthy. Orbis-Win's
-`api-mmap` and `map-fault-history` diagnostics also produced 0 records in this
-build.
+**The caller is a PE image mapping.** With the correct symbols:
 
-Next task: a diagnostic Orbis-Win build in `src/native/pw_wine_dmem_glue_ps4.c`
-that logs address, size, flags and return address for every large
-`MAP_FIXED|ANON` in the `0x6ffff…` region, and on failure retries in smaller
-chunks — answering who asks for it and whether size is the trigger.
+```
+__wine_syscall_dispatcher
+NtMapViewOfSection          virtual.c:7368
+virtual_map_section         virtual.c:4198
+map_image_into_view_impl    virtual.c:3882
+set_vprot                   virtual.c:2512
+counted_mprotect            virtual.c:229
+```
+
+The guest maps a 5.5 MiB PE image at a fixed address; `mono-2.0-bdwgc.dll` is
+almost exactly that size, which fits Hollow Knight being the only Mono game
+tested.
+
+⚠ **Symbolize against the ELF that built the shipped PRX.** There are two Wine
+trees with different `ntdll.shared.elf`:
+`worktrees/playden-ps4-0170/.deps/wine-ps5/prx/` (2026-11-11, **the one 0173
+ships**) and `prospero-win/.deps/wine-ps5/prx/` (2026-11-04). Using the wrong
+one produced a plausible but entirely fictitious backtrace
+(`set_page_vprot_exec_write_protect`, `__wine_ps5_wait_for_exec_migration`,
+`anon_mmap_fixed`) and sent a whole investigation down an exec-migration path
+that never ran — which the absence of any `exec-migrate` record should have
+flagged sooner. Both have text base 0, so offsets map directly either way and
+nothing warns you.
+
+Also note `trace_vm_api()` only fills a ring buffer a fault handler later
+dumps, so a call that never returns is never recorded. That is why `api-mmap`
+and `map-fault-history` show 0 records for the fatal mapping. Immediate
+`sceKernelDebugOutText` is required to trace a call that can kill the process.
+
+**The fix under test** (Orbis-Win `src/native/pw_wine_dmem_glue_ps4.c`): large
+`MAP_FIXED|MAP_ANON` requests are now placed in 256 KiB pieces
+(`PW_SHADOW_SAFE_CHUNK`) by `mmap_fixed_anon_chunked()`, with an immediate
+`big-fixed-anon begin/end` klog line naming address, size, flags and caller.
+The range migration's replacement mapping uses the same helper, since it has
+the same hazard.
 
 **Isaac (250900)** — `played_s=24` on every build. Opens a window with the
 correct title and version, never paints, exits. Its only discriminator against
