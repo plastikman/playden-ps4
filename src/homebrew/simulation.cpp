@@ -35,6 +35,7 @@
 #include <string_view>
 #include <utility>
 #include <type_traits>
+#include "platform/console_name.h"
 
 namespace playden::homebrew {
 std::string FormatDownloadRate(std::optional<std::uint64_t> rate, std::optional<int> eta, const std::string& server_name) {
@@ -569,15 +570,15 @@ std::vector<std::string> context_actions(bool live) {
     return {"favorite", "collection", "compatibility", "note", "hide", "verify", "uninstall", "logs", "cancel"};
 }
 
-constexpr const char* uninstall_body_kept = "The game's files and its PS5 title are removed from this console. Its saves and "
+constexpr const char* uninstall_body_kept = "The game's files and its " PLAYDEN_CONSOLE_NAME " title are removed from this console. Its saves and "
                                             "settings are kept, and installing the game again brings them back.";
-constexpr const char* uninstall_body_kept_imported = "The game's files and its PS5 title are removed from this console. Its saves and "
+constexpr const char* uninstall_body_kept_imported = "The game's files and its " PLAYDEN_CONSOLE_NAME " title are removed from this console. Its saves and "
                                                      "settings are kept, and adding the game again brings them back.";
-constexpr const char* uninstall_body_deleted = "The game's files, its PS5 title and its saves and settings on this console are "
+constexpr const char* uninstall_body_deleted = "The game's files, its " PLAYDEN_CONSOLE_NAME " title and its saves and settings on this console are "
                                                "deleted.";
-constexpr const char* uninstall_batch_body_kept = "Their files and PS5 titles are removed from this console. Their saves and "
+constexpr const char* uninstall_batch_body_kept = "Their files and " PLAYDEN_CONSOLE_NAME " titles are removed from this console. Their saves and "
                                                   "settings are kept, and installing a game again brings them back.";
-constexpr const char* uninstall_batch_body_deleted = "Their files, PS5 titles and saves and settings on this console are deleted.";
+constexpr const char* uninstall_batch_body_deleted = "Their files, " PLAYDEN_CONSOLE_NAME " titles and saves and settings on this console are deleted.";
 
 // The name kept game data is shown with: the game's name, else the library's, else its app id.
 std::string kept_name(const State& state, const LiveKeptBottle& kept) {
@@ -850,7 +851,7 @@ ModalEntry cancel_job_confirmation(const State& state, const Job* job, std::stri
 ModalEntry recreate_confirmation(const std::string& title, std::string opener) {
     ModalEntry confirmation{"confirmation", "Recreate the bottle?", std::move(opener), {"cancel", "confirm-destructive"}, 1, false};
     confirmation.body = title + "'s Windows environment is made again from the runtime kit, with its saves and settings brought back. "
-                        "The PS5 title is removed and prepared again, so the game then waits for the PS5 Home screen once more.";
+                        "The " PLAYDEN_CONSOLE_NAME " title is removed and prepared again, so the game then waits for the " PLAYDEN_CONSOLE_NAME " Home screen once more.";
     return confirmation;
 }
 
@@ -965,7 +966,7 @@ constexpr const char* kImportEmptyText =
     "Copy game folders into playden/import on an exFAT drive, or into /data/playden-import over FTP, then choose "
     "Look for games.";
 constexpr const char* kImportCopyOnlyText =
-    "This folder's name has characters the PS5 can't start a game from. Copy it into Playden instead.";
+    "This folder's name has characters the " PLAYDEN_CONSOLE_NAME " can't start a game from. Copy it into Playden instead.";
 
 constexpr const char* kImportDropVolume = "internal";
 // The wizard's step 1 title, and what it says about importing later.
@@ -1068,7 +1069,7 @@ StartupProblem describe_startup_problem(const std::string& detail, bool granted)
         if (has("stable launcher source identity does not match"))
             return {"Playden can't start",
                     "The Playden that started is not the copy in /data/homebrew. If you just copied a new version, "
-                    "restart the PS5; if it stays, copy the whole app folder to /data/homebrew again."};
+                    "restart the " PLAYDEN_CONSOLE_NAME "; if it stays, copy the whole app folder to /data/homebrew again."};
         return {"Playden can't start", "Playden has root access but can't use its data in /data/playden. "
                                        "Restart Playden. Don't change permissions inside /data/playden over FTP: its private folders "
                                        "must stay owner-only. If it stays, send logs/native-startup.log from Playden's app folder."};
@@ -1078,7 +1079,7 @@ StartupProblem describe_startup_problem(const std::string& detail, bool granted)
         return incomplete;
     if (stage({"network", "socket", "socket-options"}))
         return {"Playden can't start", "The console's network did not start, and Playden needs it to ask for root "
-                                       "access. Restart the PS5, jailbreak it again, then open Playden again."};
+                                       "access. Restart the " PLAYDEN_CONSOLE_NAME ", jailbreak it again, then open Playden again."};
     if (stage({"stream-helper"}))
         return {"Root access is missing",
                 "The ELF loader on port 9021 stopped while Playden sent it the root helper. Load the ELF loader "
@@ -1977,7 +1978,7 @@ void Simulation::stop_runtime_batch() {
     UpdatePreparationQueue(runtime_queue_);
     ModalEntry stopped{"confirmation", "Runtime kit update stopped", state_.navigation.focus_key, {"alert-ok", "runtime-batch-free"}, 0, false};
     stopped.body = "Console storage would drop below " + format_bytes(kRuntimeBatchFloorBytes) +
-                   ", and the PS5 can restart when it runs this low.\n\n" + std::to_string(done) + " of " +
+                   ", and the " PLAYDEN_CONSOLE_NAME " can restart when it runs this low.\n\n" + std::to_string(done) + " of " +
                    std::to_string(runtime_batch_total_) + " games are done. The other " + std::to_string(left) +
                    " stay on the Runtimes tab, and they still start as they did.";
     state_.notices.erase(std::remove_if(state_.notices.begin(), state_.notices.end(),
@@ -2498,7 +2499,7 @@ void Simulation::build_manage_games_view() {
     view_.title = updates ? "Update games" : runtimes ? "Update to the new runtime kit" : moves ? "Move games" : "Uninstall games";
     const auto* destination = moves ? volume_of(state_, manage_move_volume_id_) : nullptr;
     if (moves) {
-        view_.subtitle = "Saves, settings and the PS5 title go with the game · it can't be played while it moves";
+        view_.subtitle = "Saves, settings and the " PLAYDEN_CONSOLE_NAME " title go with the game · it can't be played while it moves";
     } else if (runtimes) {
         view_.subtitle = !runtime_batch_.empty() || runtime_batch_current_
             ? "Updating " + std::to_string(runtime_batch_total_ - runtime_batch_.size()) + " of " + std::to_string(runtime_batch_total_)
@@ -3240,7 +3241,7 @@ void Simulation::UpdateRuntime(RuntimeState runtime, const std::vector<LiveRunti
                 if (told != start_failures_told_.end()) start_failures_told_.erase(told);
                 if (!said) NotifyPlayStopped(id, "The game could not start. Open Logs in Settings for details.");
             }
-            else if (game.play_detail == "The game's PS5 title may still be running. Close it, then press Play." ||
+            else if (game.play_detail == "The game's " PLAYDEN_CONSOLE_NAME " title may still be running. Close it, then press Play." ||
                      game.play_detail == "Choose which Cloud saves to keep, or press Play again to start without syncing." ||
                      game.play_detail == "Cloud saves could not be checked. Press Play again to start without syncing.")
                 NotifyPlayStopped(id, game.play_detail);
@@ -3334,7 +3335,7 @@ void Simulation::show_ready_prompt() {
     const auto* game = find_game(state_, id);
     ModalEntry prompt{"confirmation", (game ? game->title : std::string("Your game")) + " is ready to play",
                       state_.navigation.focus_key, {"ready-later", "quit-to-home"}, 1, false};
-    prompt.body = "Play quits Playden to the PS5 Home screen, where the game appears. Start it from there.";
+    prompt.body = "Play quits Playden to the " PLAYDEN_CONSOLE_NAME " Home screen, where the game appears. Start it from there.";
     open_modal(std::move(prompt));
 }
 
@@ -5616,7 +5617,7 @@ void Simulation::seed_community_scenario(bool offline) {
     };
     const std::vector<Seed> seeds = {
         {GameRef::Steam(900002), "120hz-left-stick-pointer", "120 Hz, pointer on left stick", "works", "leolobato", '1', 14, 1,
-         "Turn on 120 Hz output in the PS5's screen settings first.",
+         "Turn on 120 Hz output in the " PLAYDEN_CONSOLE_NAME "'s screen settings first.",
          {{"resolution", "3840x2160"}, {"refresh", "120"}, {"controller", "keyboard"}, {"pointer_stick", "left_stick"},
           {"button.touchpad", "m"}}},
         {GameRef::Steam(900002), "gamepad-layout", "Gamepad layout", "works", "rina", '2', 3, 0, "",
@@ -6292,7 +6293,7 @@ bool Simulation::scenario(const std::string& name) {
         state_.recipe_votes = name == "votes-off" ? playden::RecipeVotesPreference::kOff
                             : name == "vote-reason" ? playden::RecipeVotesPreference::kOn : playden::RecipeVotesPreference::kUnset;
         state_.library.ratings[id] = Compatibility::Works;
-        state_.library.notes[id] = "Turn on 120 Hz output in the PS5's screen settings first.";
+        state_.library.notes[id] = "Turn on 120 Hz output in the " PLAYDEN_CONSOLE_NAME "'s screen settings first.";
         auto& record = state_.game_settings[id];
         const auto recipe_id = rt::CommunityRecipeIdFor(GameRef::Steam(900002), "120hz-left-stick-pointer");
         const std::string revision(64, '1');
@@ -6802,7 +6803,7 @@ void Simulation::rebuild_view() {
         if (modal.id == "move-storage") {
             const auto* installation = move_picker_game_.valid() ? find_installation(state_, move_picker_game_) : nullptr;
             view_.subtitle = installation && installation->installed_bytes
-                ? format_bytes(installation->installed_bytes) + " moves there, with its saves, settings and PS5 title."
+                ? format_bytes(installation->installed_bytes) + " moves there, with its saves, settings and " PLAYDEN_CONSOLE_NAME " title."
                 : "Each game moves from the drive it is on.";
         }
         if (modal.id == "storage" && live() && picking_install_volume_) {
@@ -6841,7 +6842,7 @@ void Simulation::rebuild_view() {
             view_.subtitle = "Saves and settings kept when a game was uninstalled. Installing a game again brings its saves "
                              "back. Saves in Steam Cloud stay in Steam Cloud.";
         if (modal.id == "leftover-titles")
-            view_.subtitle = "PS5 titles Playden made but no longer has a record of. Deleting one removes its title and Home "
+            view_.subtitle = PLAYDEN_CONSOLE_NAME " titles Playden made but no longer has a record of. Deleting one removes its title and Home "
                              "tile; its saves and settings move to Kept game data, and its game files stay in the Library.";
         if (modal.id == "download-server")
             view_.subtitle = "Applies to downloads that start or resume from now.";
@@ -7201,7 +7202,7 @@ void Simulation::rebuild_view() {
                     const auto note = state_.library.notes.find(draft.game);
                     const bool empty = note == state_.library.notes.end() || note->second.empty();
                     item.value = empty ? std::string("Optional") : note->second;
-                    item.subtitle = "What other players should know, like a PS5 setting to change.";
+                    item.subtitle = "What other players should know, like a " PLAYDEN_CONSOLE_NAME " setting to change.";
                 } else if (action_key == "share-what") {
                     item.kind = RowKind::Status;
                     item.title = "What is sent";
@@ -7626,7 +7627,7 @@ void Simulation::rebuild_view() {
                     const auto& program = setup->second.programs[index];
                     item.title = program.path;
                     const auto detected = rt::DetectedLabel(program.detected);
-                    item.subtitle = program.architecture.empty() ? "Not a Windows program the PS5 can start."
+                    item.subtitle = program.architecture.empty() ? "Not a Windows program the " PLAYDEN_CONSOLE_NAME " can start."
                         : program.refusal.empty() ? (program.architecture == "pe64" ? "64-bit" : "32-bit") +
                                                      (detected.empty() ? std::string() : " · " + detected)
                         : program.refusal_soft ? program.refusal + " Choosing it also sets Known problems to Try anyway."
@@ -7670,7 +7671,7 @@ void Simulation::rebuild_view() {
                 // The game's move to another drive: the same Queue job as the Move tab's.
                 const auto* installation = find_installation(state_, settings_game);
                 const auto* here = installation ? volume_of(state_, installation->volume_id) : nullptr;
-                item.subtitle = "Saves, settings and the PS5 title go with the game.";
+                item.subtitle = "Saves, settings and the " PLAYDEN_CONSOLE_NAME " title go with the game.";
                 item.badge = "Game must be closed";
                 if (here) item.value = here->label;
                 const auto blocker = move_blocker(settings_game, {});
@@ -7743,7 +7744,7 @@ void Simulation::rebuild_view() {
                 if ((kind == MaintenanceKind::Repair || kind == MaintenanceKind::ClearShaderCache ||
                      kind == MaintenanceKind::BackupSaves) && runtime && runtime->status == "Needs recovery") {
                     item.enabled = false;
-                    item.subtitle = "Finish the PS5 title's recovery first, or use Recreate bottle.";
+                    item.subtitle = "Finish the " PLAYDEN_CONSOLE_NAME " title's recovery first, or use Recreate bottle.";
                 }
             } else if (action_key.rfind("volume-", 0) == 0) {
                 item.kind = RowKind::Volume;
@@ -7959,7 +7960,7 @@ void Simulation::rebuild_view() {
                     const auto& program = setup->second.programs[index];
                     item.title = program_file_name(program.path);
                     const auto detected = rt::DetectedLabel(program.detected);
-                    item.subtitle = program_note(program.path, program.architecture.empty() ? "Not a Windows program the PS5 can start."
+                    item.subtitle = program_note(program.path, program.architecture.empty() ? "Not a Windows program the " PLAYDEN_CONSOLE_NAME " can start."
                         : program.refusal);
                     if (!program.architecture.empty() && program.refusal.empty())
                         item.value = (program.architecture == "pe64" ? "64-bit" : "32-bit") + (detected.empty() ? std::string() : " · " + detected);
@@ -8209,7 +8210,7 @@ void Simulation::rebuild_view() {
         installed.subtitle = "Uninstall games you no longer play to free up space";
         if (state_.installations.empty()) {
             installed.kind = RowKind::Status; installed.action.clear(); installed.enabled = false; installed.value = "None";
-            installed.subtitle = "Free up space in the PS5's Settings > Storage";
+            installed.subtitle = "Free up space in the " PLAYDEN_CONSOLE_NAME "'s Settings > Storage";
         } else {
             std::uint64_t bytes = 0;
             for (const auto& item : state_.installations) bytes += item.installed_bytes;
@@ -8395,7 +8396,7 @@ void Simulation::rebuild_view() {
                     const auto* other = find_volume(state_, also->second);
                     auto& status = row("details-also-on", RowKind::Status, "On two drives", "");
                     status.subtitle = "Playden uses the copy on " + (here ? here->label : std::string("this drive")) + ". Delete the one on " +
-                                      (other ? other->label : std::string("the other drive")) + " so the PS5 can't mix them up.";
+                                      (other ? other->label : std::string("the other drive")) + " so the " PLAYDEN_CONSOLE_NAME " can't mix them up.";
                     status.enabled = false;
                 }
                 if (installation->available) {
@@ -8612,7 +8613,7 @@ void Simulation::rebuild_view() {
             // Once setup has finished, when Play can start the game and adding the installer would help.
             const bool physx_message = runtime && runtime->physx_needed && status == "Ready" && runtime->play_work.empty();
             auto& setup = row("details-setup", RowKind::Status, "Setup", "");
-            setup.value = waiting ? "Waiting for the PS5" : kit_update ? "Runtime kit update available"
+            setup.value = waiting ? "Waiting for the " PLAYDEN_CONSOLE_NAME : kit_update ? "Runtime kit update available"
                 : status == "Not prepared" ? "Not set up" : status == "Needs recovery" ? "Interrupted"
                 : status == "Registration pending" ? "Not confirmed" : status == "Removal incomplete" ? "Removing"
                 : status == "Preparing" && runtime && !runtime->detail.empty() ? runtime->detail : status;
@@ -8637,10 +8638,10 @@ void Simulation::rebuild_view() {
                 if (position > 0 && queue.waiting.size() > 1)
                     hint = std::to_string(position) + " of " + std::to_string(queue.waiting.size()) + " waiting. " + hint;
             }
-            else if (waiting && imported) hint = "The PS5 adds the game to Home when Playden quits.";
-            else if (waiting) hint = "Quit Playden and " + game->title + " appears on the PS5 Home screen.";
-            else if (status == "Registration pending") hint = "The PS5 hasn't confirmed " + game->title + " yet.";
-            else if (status == "Removal incomplete") hint = "Removing " + game->title + " from the PS5 Home screen stopped partway.";
+            else if (waiting && imported) hint = "The " PLAYDEN_CONSOLE_NAME " adds the game to Home when Playden quits.";
+            else if (waiting) hint = "Quit Playden and " + game->title + " appears on the " PLAYDEN_CONSOLE_NAME " Home screen.";
+            else if (status == "Registration pending") hint = "The " PLAYDEN_CONSOLE_NAME " hasn't confirmed " + game->title + " yet.";
+            else if (status == "Removal incomplete") hint = "Removing " + game->title + " from the " PLAYDEN_CONSOLE_NAME " Home screen stopped partway.";
             else if (status == "Needs repair") hint = "Some of " + game->title + "'s setup files changed.";
             else if (status == "No runtime kit") hint = "Playden needs its runtime kit to set up games.";
             else if (physx_message) {
@@ -8908,7 +8909,7 @@ void Simulation::rebuild_view() {
             if (found > 0) entry.value = std::to_string(found) + " found";
         }
         if (live()) {
-            auto& suffix = add("settings-title-store", RowKind::Toggle, "Store name in PS5 titles", "toggle-title-store");
+            auto& suffix = add("settings-title-store", RowKind::Toggle, "Store name in " PLAYDEN_CONSOLE_NAME " titles", "toggle-title-store");
             suffix.selected = state_.title_store_suffix;
             suffix.subtitle = "Name game titles like \"Half-Life 2 (Steam)\". Prepared games change with their next Update.";
             auto& cloud = add("settings-cloud-saves", RowKind::Toggle, "Sync Cloud saves automatically", "toggle-cloud-saves");
@@ -8990,7 +8991,7 @@ void Simulation::rebuild_view() {
             std::uint64_t bytes = 0;
             for (const auto& title : state_.leftover_titles) bytes += title.bytes;
             const auto count = state_.leftover_titles.size();
-            auto& item = add("settings-leftovers", RowKind::Action, "Leftover PS5 titles", "leftover-manage");
+            auto& item = add("settings-leftovers", RowKind::Action, "Leftover " PLAYDEN_CONSOLE_NAME " titles", "leftover-manage");
             item.subtitle = "Game titles Playden no longer has a record of";
             item.value = std::to_string(count) + (count == 1 ? " title · " : " titles · ") + format_bytes(bytes);
         }
@@ -9173,7 +9174,7 @@ void Simulation::rebuild_view() {
                 toggle.subtitle = "Playden's logs and game files on the local network while Playden is open.";
                 auto& address = add("settings-web-address", RowKind::Status, "Address unknown", "");
                 address.value = "port " + std::to_string(shown.port);
-                address.subtitle = "Open the console's IP address shown in the PS5's network settings, port " +
+                address.subtitle = "Open the console's IP address shown in the " PLAYDEN_CONSOLE_NAME "'s network settings, port " +
                                    std::to_string(shown.port) + ", on a phone or computer on the same network.";
                 address.enabled = false;  // nothing to do on it: focus stays on the switch
             } else if (shown.state == "failed") {
@@ -10265,8 +10266,8 @@ void Simulation::quit_to_home() {
     state_.quit_waiting = true;
     ModalEntry wait{"confirmation", quit_wait_title_, state_.navigation.focus_key, {"cancel"}, 0, false};
     wait.body = preparing != state_.runtime_games.end()
-        ? name + " is being prepared. Playden quits to the PS5 Home screen once it is done, so it is not left half-made."
-        : "Playden quits to the PS5 Home screen once the queued games are held, so none is left half-made.";
+        ? name + " is being prepared. Playden quits to the " PLAYDEN_CONSOLE_NAME " Home screen once it is done, so it is not left half-made."
+        : "Playden quits to the " PLAYDEN_CONSOLE_NAME " Home screen once the queued games are held, so none is left half-made.";
     open_modal(std::move(wait));
 }
 
@@ -11278,7 +11279,7 @@ void Simulation::activate() {
             quit_sync_game_ = id;
             pending_cloud_requests_.push_back({CloudRequestKind::Sync, id});
             ModalEntry wait{"confirmation", "Syncing Cloud saves…", state_.navigation.focus_key, {"saves-quit-anyway", "cancel"}, 1, false};
-            wait.body = "Playden quits to the PS5 Home screen once this game's saves are in step with Steam Cloud.";
+            wait.body = "Playden quits to the " PLAYDEN_CONSOLE_NAME " Home screen once this game's saves are in step with Steam Cloud.";
             open_modal(std::move(wait));
         }
     } else if (action_name == "update-ready-play") {
@@ -11473,13 +11474,13 @@ void Simulation::activate() {
         destructive_target_ = id;
         ModalEntry confirmation{"confirmation", "Remove " + game->title + " from the library?", state_.navigation.focus_key,
                                 {"cancel", "confirm-destructive"}, 0, true};
-        confirmation.body = "The game's folder and files stay where they are, and Import games can add it again. Its PS5 "
+        confirmation.body = "The game's folder and files stay where they are, and Import games can add it again. Its " PLAYDEN_CONSOLE_NAME " "
                             "title is removed; its saves and settings on this console are kept.";
         open_modal(std::move(confirmation));
     } else if (action_name == "leftover-manage") {
         if (state_.leftover_titles.empty()) return;
         leftover_selected_.clear();
-        open_modal({"leftover-titles", "Leftover PS5 titles", state_.navigation.focus_key, leftover_manager_actions(), 0, false});
+        open_modal({"leftover-titles", "Leftover " PLAYDEN_CONSOLE_NAME " titles", state_.navigation.focus_key, leftover_manager_actions(), 0, false});
     } else if (action_name == "leftover-select-all") {
         std::set<std::string> choosable;
         for (const auto& title : state_.leftover_titles) if (!leftover_queued(title.title_id)) choosable.insert(title.title_id);
@@ -11500,10 +11501,10 @@ void Simulation::activate() {
             }
         pending_destructive_action_ = action_name;
         const bool one = leftover_selected_.size() == 1;
-        ModalEntry confirmation{"confirmation", one ? "Delete leftover PS5 title?" : "Delete leftover PS5 titles?",
+        ModalEntry confirmation{"confirmation", one ? "Delete leftover " PLAYDEN_CONSOLE_NAME " title?" : "Delete leftover " PLAYDEN_CONSOLE_NAME " titles?",
                                 state_.navigation.focus_key, {"cancel", "confirm-destructive"}, 0, true};
-        confirmation.body = (one ? only + " and its PS5 Home tile are" : std::to_string(leftover_selected_.size()) +
-                             " leftover PS5 titles and their Home tiles are") + " deleted (" + format_bytes(bytes) + "). " +
+        confirmation.body = (one ? only + " and its " PLAYDEN_CONSOLE_NAME " Home tile are" : std::to_string(leftover_selected_.size()) +
+                             " leftover " PLAYDEN_CONSOLE_NAME " titles and their Home tiles are") + " deleted (" + format_bytes(bytes) + "). " +
                             (one ? "Its" : "Their") + " saves and settings move to Kept game data; game files are not touched.";
         open_modal(std::move(confirmation));
     } else if (action_name == "confirm-destructive" && pending_destructive_action_ == "leftover-selection-delete") {
@@ -13028,7 +13029,7 @@ void Simulation::tick(int ticks) {
             if (!state_.leftover_deletions.empty()) {
                 auto& deletion = state_.leftover_deletions.front();
                 ++leftover_delete_ticks_;
-                deletion.step = leftover_delete_ticks_ < 3 ? "Removing PS5 title…" : "Deleting title files…";
+                deletion.step = leftover_delete_ticks_ < 3 ? "Removing " PLAYDEN_CONSOLE_NAME " title…" : "Deleting title files…";
                 if (leftover_delete_ticks_ >= 6) {
                     const auto id = deletion.title_id;
                     std::erase_if(state_.leftover_titles, [&](const LiveLeftoverTitle& title) { return title.title_id == id; });
@@ -15570,7 +15571,7 @@ void Simulation::open_feedback_privacy() {
     ModalEntry privacy{"confirmation", "Before you send", "feedback-send", {"cancel", "feedback-send-confirm"}, 1, false};
     privacy.body = "Playden sends the game's name, how it ran, what happened if you wrote it, the game's settings, the name you "
                    "share as (if any), the runtime kit, firmware and Playden versions, and the logs when you include them. Logs "
-                   "have the Steam account name, IDs, PS5 user and home network addresses removed. A problem report is published "
+                   "have the Steam account name, IDs, " PLAYDEN_CONSOLE_NAME " user and home network addresses removed. A problem report is published "
                    "as an issue on GitHub and reviewed there; an answer that the game ran well is counted for the compatibility "
                    "list. By sending, you confirm that you own this game.";
     open_modal(std::move(privacy));
@@ -16283,7 +16284,7 @@ std::string PreparationStepWords(const std::string& step) {
     if (step == "publish-profile" || step == "capture-settings" || step == "capture-update" ||
         step == "initialize-control" || step == "control-ready")
         return "Applying settings";
-    if (step == "query-native" || step == "register" || step == "await-native") return "Waiting for the PS5";
+    if (step == "query-native" || step == "register" || step == "await-native") return "Waiting for the " PLAYDEN_CONSOLE_NAME;
     return step.empty() ? std::string{} : "Preparing";
 }
 
@@ -16299,7 +16300,7 @@ int PreparationStepNumber(const std::string& step) {
 }
 
 std::string PreparationProgressWords(bool has_record, const std::string& step) {
-    const auto words = has_record ? PreparationStepWords(step) : std::string("Reserving a PS5 title");
+    const auto words = has_record ? PreparationStepWords(step) : std::string("Reserving a " PLAYDEN_CONSOLE_NAME " title");
     if (words.empty() || words == "Preparing") return words;
     return "Step " + std::to_string(has_record ? PreparationStepNumber(step) : 1) + " of " +
            std::to_string(kPreparationSteps) + " · " + words;

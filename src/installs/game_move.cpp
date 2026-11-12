@@ -23,6 +23,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include "platform/console_name.h"
 
 namespace playden::installs {
 namespace {
@@ -649,7 +650,7 @@ InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from,
   }
   if (relocated.outcome == GameRelocationResult::Outcome::kFailed) {
     unmark();
-    return fail(relocated.message.empty() ? "The game's PS5 title could not follow the move." : relocated.message,
+    return fail(relocated.message.empty() ? "The game's " PLAYDEN_CONSOLE_NAME " title could not follow the move." : relocated.message,
                 "relocation " + relocated.message);
   }
   // The copy's record goes last: without it the copy isn't whole, and the old folder must stay.
@@ -699,7 +700,7 @@ std::string GameMover::Finish(const std::string& from, const std::string& to) {
 }
 
 std::string GameMover::Discard(const std::string& from, const std::string& to) {
-  if (Exists(to + "/" + kMoveSwitchName)) return "The game's PS5 title may already use the copy.";
+  if (Exists(to + "/" + kMoveSwitchName)) return "The game's " PLAYDEN_CONSOLE_NAME " title may already use the copy.";
   if (Missing(to)) return {};
   // Only a partial copy goes: a journal and no install record (copied last, after the switch marker), or
   // a record this move copied before its title refused (the plan is of `from`). A folder that was in the

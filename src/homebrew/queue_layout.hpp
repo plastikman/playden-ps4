@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "platform/console_name.h"
 
 namespace playden::homebrew {
 inline constexpr const char* kQueueDownloads = "downloads";
@@ -23,7 +24,7 @@ struct QueueEntry {
     GameId game_id;
     const Job* job = nullptr;
     std::string title;
-    std::string status;  // the right-hand tag: "Up next", "Queued", "Waiting for the PS5", "Ready", "Uninstalling"
+    std::string status;  // the right-hand tag: "Up next", "Queued", "Waiting for the " PLAYDEN_CONSOLE_NAME, "Ready", "Uninstalling"
     std::string note;    // beside the title: why it waits or failed
     std::string tone;    // good, busy, attention, problem, quiet
     int position = 0;    // waiting preparations, from 1

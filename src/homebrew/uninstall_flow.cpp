@@ -4,6 +4,7 @@
 #include "homebrew/uninstall_flow.hpp"
 
 #include <algorithm>
+#include "platform/console_name.h"
 
 namespace playden::homebrew {
 
@@ -66,7 +67,7 @@ UninstallAction UninstallFlow::CloudSettled(GameId id, CloudStatus status) {
 
 UninstallAction UninstallFlow::CloudRefused(GameId id) {
   if (!WaitingForCloud(id)) return {};
-  return Stop(id, "The game's PS5 title may still be running. Close it, then uninstall again.");
+  return Stop(id, "The game's " PLAYDEN_CONSOLE_NAME " title may still be running. Close it, then uninstall again.");
 }
 
 UninstallAction UninstallFlow::SyncRefused(GameId id) {
@@ -109,9 +110,9 @@ UninstallAction UninstallFlow::Advance(GameId id, const UninstallFacts& facts) {
       // A failure stops the uninstall even when the runtime lists no title: its install list can be
       // empty because it could not be read, while the PS5 title still points at the game's files.
       if (facts.has_title || !facts.removal_failure.empty())
-        return Stop(id, "The PS5 title could not be removed: " +
+        return Stop(id, "The " PLAYDEN_CONSOLE_NAME " title could not be removed: " +
                             (facts.removal_failure.empty() ? std::string("unknown reason.") : facts.removal_failure) +
-                            (facts.removal_started ? " The game stays installed; Retry on its PS5 title continues."
+                            (facts.removal_started ? " The game stays installed; Retry on its " PLAYDEN_CONSOLE_NAME " title continues."
                                                    : " The game stays installed."));
       entry.step = UninstallStep::kRemoveDownload;
     }

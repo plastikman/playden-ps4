@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "platform/console_name.h"
 
 namespace playden::stores::local {
 namespace {
@@ -460,7 +461,7 @@ installs::InstallRunner::Result LocalCopyRunner::Install(
     }
     if (relocated.outcome == LocalRelocationResult::Outcome::kFailed) {
       Log("import copy relocation failed id=" + entry->id + ": " + relocated.message);
-      result.failure = relocated.message.empty() ? "The game's PS5 title could not follow the copy." : relocated.message;
+      result.failure = relocated.message.empty() ? "The game's " PLAYDEN_CONSOLE_NAME " title could not follow the copy." : relocated.message;
       return result;
     }
   }

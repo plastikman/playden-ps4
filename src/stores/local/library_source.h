@@ -21,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "platform/console_name.h"
 
 namespace playden::stores::local {
 
@@ -107,7 +108,7 @@ struct LocalLibraryConfig {
 
 // The words for a game that can't play from its folder because of its name (the descriptor rule).
 inline constexpr const char* kNotAsciiReason =
-    "The game's folder name has characters the PS5 can't play from. Copy the game into Playden instead.";
+    "The game's folder name has characters the " PLAYDEN_CONSOLE_NAME " can't play from. Copy the game into Playden instead.";
 
 class LocalLibrarySource final : public LibrarySource {
  public:

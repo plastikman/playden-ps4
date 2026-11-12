@@ -57,6 +57,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include "platform/console_name.h"
 
 namespace playden::homebrew {
 namespace rt = playden::runtime;
@@ -86,7 +87,7 @@ constexpr std::int64_t kPreflightFreshMs = 30000;
 // The console's process list could not show whether the title runs (the reason is in
 // runtime.log). Closing the game cannot help when no game runs; a restart usually does.
 constexpr char kActivityUnknown[] =
-    "The PS5 could not tell Playden whether the game is running. Restart the PS5, then try again.";
+    "The " PLAYDEN_CONSOLE_NAME " could not tell Playden whether the game is running. Restart the " PLAYDEN_CONSOLE_NAME ", then try again.";
 
 // A relocated game's republish refused because its old publication can't be verified against the
 // new folder (VerifyMovedPublication, or the title's artifacts): only a new title gets past that.
@@ -675,7 +676,7 @@ bool RuntimeHost::DeleteLeftoverTitle(const std::string& title_id, std::string* 
     const auto found = std::find_if(snapshot_.leftover_titles.begin(), snapshot_.leftover_titles.end(),
                                     [&](const auto& title) { return title.title_id == title_id; });
     if (found == snapshot_.leftover_titles.end()) {
-      if (error) *error = "This leftover PS5 title is no longer available.";
+      if (error) *error = "This leftover " PLAYDEN_CONSOLE_NAME " title is no longer available.";
       return false;
     }
     if (snapshot_.deleting_leftover_title == title_id ||
@@ -2322,7 +2323,7 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   }
   if (!c.kit) return "No verified runtime kit is installed.";
   if (saved.revision < record.settings_revision)
-    return again("The game's saved settings are older than its PS5 title's; prepare it again.");
+    return again("The game's saved settings are older than its " PLAYDEN_CONSOLE_NAME " title's; prepare it again.");
   if (!recipe) return refuse(again("Playden no longer knows how to start this game; prepare it again."));
   if (switching)
     Log("recipe switch app=" + std::to_string(record.runtime_number) + " from=" + record.recipe_id + ":" + record.recipe_version +
@@ -2406,7 +2407,7 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   }
   if (plan.app_id != record.runtime_number || plan.recipe_id != next.recipe_id || plan.recipe_version != next.recipe_version ||
       plan.launch_entry_id != next.launch_entry_id || plan.profile_id != record.default_profile_id)
-    return refuse(again("The settings no longer match this game's PS5 title; prepare it again."));
+    return refuse(again("The settings no longer match this game's " PLAYDEN_CONSOLE_NAME " title; prepare it again."));
   // A forced publication runs only when the new runtime changes what the settings write (120 Hz output), so a
   // respin that changes nothing there keeps its publication, registration and bottle as they are.
   // So is a program's run, or the return from one, that publishes what the title already has. A recipe
@@ -2772,7 +2773,7 @@ RuntimeRelocationResult RuntimeHost::RunRelocate(Composition& c, const RuntimeRe
   auto record = *found;
   if (record.install_path != request.to) {
     if (record.state == rt::PreparationState::kRemoving)
-      return answer(Outcome::kBusy, "This game's PS5 title is being removed. Uninstall or Play finishes that first.");
+      return answer(Outcome::kBusy, "This game's " PLAYDEN_CONSOLE_NAME " title is being removed. Uninstall or Play finishes that first.");
     // As the 0.6 games move: the lease first, then the title's activity, both held through the
     // move and the record write.
     const auto control_path = HostPath(record.data_root) / ".playden-control";
@@ -2781,7 +2782,7 @@ RuntimeRelocationResult RuntimeHost::RunRelocate(Composition& c, const RuntimeRe
                          : std::nullopt;
     if (!lease) {
       Log("relocate app=" + app + " waits: the publication lock for " + record.title_id + " is unavailable or held");
-      return answer(Outcome::kBusy, "The game's PS5 title is in use. Close it, then try again.");
+      return answer(Outcome::kBusy, "The game's " PLAYDEN_CONSOLE_NAME " title is in use. Close it, then try again.");
     }
     std::string refusal;
     if (record.state == rt::PreparationState::kReady) {
@@ -2790,7 +2791,7 @@ RuntimeRelocationResult RuntimeHost::RunRelocate(Composition& c, const RuntimeRe
       // Staged titles name the old folder and nothing would republish them.
       refusal = "Finish setting up the game first.";
     } else if (record.journal) {
-      refusal = "Finish the PS5 title's recovery first.";
+      refusal = "Finish the " PLAYDEN_CONSOLE_NAME " title's recovery first.";
     } else if (!record.title_id.empty()) {
       const auto activity = c.coordinator->Activity(record.title_id);
       if (activity == rt::NativeActivity::kUnknown) refusal = kActivityUnknown;
@@ -2854,7 +2855,7 @@ RuntimeRelocationResult RuntimeHost::RunRelocate(Composition& c, const RuntimeRe
   Publish([&](RuntimeSnapshot& s) { s.removing_app.reset(); });
   if (!removed.empty()) {
     Log("relocate app=" + app + " old title removal stopped: " + removed);
-    result.message = "The game's old PS5 title could not be removed yet. Play tries again.";
+    result.message = "The game's old " PLAYDEN_CONSOLE_NAME " title could not be removed yet. Play tries again.";
   }
   return result;
 }
@@ -2993,7 +2994,7 @@ void RuntimeHost::RunPlay(Composition& c, std::uint32_t app_id, const std::strin
     if (!c.launch) {
       result = rt::LaunchResult::Failure(rt::LaunchError::kPersistence, "Play is unavailable.");
     } else if (!record) {
-      result = rt::LaunchResult::Failure(rt::LaunchError::kNotFound, "This game has no PS5 title yet.");
+      result = rt::LaunchResult::Failure(rt::LaunchError::kNotFound, "This game has no " PLAYDEN_CONSOLE_NAME " title yet.");
     } else if (const auto replaced = KitReplaced(c); !replaced.empty()) {
       result = rt::LaunchResult::Failure(rt::LaunchError::kPreflight, replaced);
     } else if (record->state == rt::PreparationState::kReady && FilesChanged(*record)) {
@@ -3326,7 +3327,7 @@ std::string RuntimeHost::RefreshChangedFiles(Composition& c, const RuntimePrepar
   // Settings older than the title's can't be published over it (a forced publication skips them silently).
   if (const auto saved = config_.settings_record ? config_.settings_record(GameOf(record)) : std::nullopt;
       saved && saved->revision < record.settings_revision)
-    return "The game's saved settings are older than its PS5 title's; prepare it again.";
+    return "The game's saved settings are older than its " PLAYDEN_CONSOLE_NAME " title's; prepare it again.";
   // Published again with the new recipe: a program that is gone moves to the one the recipe starts now.
   bool published = false;
   const auto refused = PublishSavedSettings(c, record, &published, true, nullptr, nullptr, true, true);
@@ -3805,7 +3806,7 @@ std::string RuntimeHost::RebindRecipeMarkers(Composition& c, const rt::RuntimeIn
   // A record the installer can't resolve (a recipe the kit refuses) is for the caller's own checks to report.
   if (rebound.code == "kit-invalid") return {};
   Log("recipe rebind app=" + std::to_string(record.runtime_number) + " code=" + rebound.code + " message=" + rebound.message);
-  return "The PS5 title could not take the new recipe: " + rebound.message + ".";
+  return "The " PLAYDEN_CONSOLE_NAME " title could not take the new recipe: " + rebound.message + ".";
 }
 
 void RuntimeHost::PublishCommunityReferences(const Composition& c) {
@@ -3834,7 +3835,7 @@ void RuntimeHost::PublishRecipes(const Composition& c) {
 }
 
 std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest& request, bool* awaiting) {
-  if (!c.leftover_journals_known) return "The PS5 title removal records cannot be read; restart Playden before preparing games.";
+  if (!c.leftover_journals_known) return "The " PLAYDEN_CONSOLE_NAME " title removal records cannot be read; restart Playden before preparing games.";
   if (!c.kit) return Snapshot().kit_reason;
   if (const auto replaced = KitReplaced(c); !replaced.empty()) return replaced;
   // Where the time before the first step goes: the recipe, the reservation and the title's metadata.
@@ -3847,7 +3848,7 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
     const auto pending = c.launch_journal->LoadPending();
     if (!pending.ok) return "The launch record cannot be read; restart Playden before preparing.";
     if (pending.session && pending.session->install_id == ToInstallId(GameOf(request.game, request.runtime_number)))
-      return "Close the game before updating or repairing its PS5 title.";
+      return "Close the game before updating or repairing its " PLAYDEN_CONSOLE_NAME " title.";
   }
   // Before anything is written (or a managed folder opened): folders made over FTP may need a fix.
   if (const auto unwritable = EnsureWritable(request.install_path, {}); !unwritable.empty()) return unwritable;
@@ -3861,7 +3862,7 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
   const bool moving = existing && existing->state == rt::PreparationState::kRemoving && existing->journal &&
                       existing->journal->operation == "remove-move";
   if (existing && existing->state == rt::PreparationState::kRemoving && !moving)
-    return "This game's PS5 title is still being removed. Uninstall the game again to finish.";
+    return "This game's " PLAYDEN_CONSOLE_NAME " title is still being removed. Uninstall the game again to finish.";
   // RunRemove runs inline, so removals_handled (the controller's uninstall progress) does not move.
   // A pending move finishes whatever the paths say now (the game may be back in its first folder).
   // The same folder on another USB mount: its drive changed places, and the game hasn't gone anywhere.
@@ -3885,7 +3886,7 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
     // and never turns into an uninstall of the game's new download.
     if (const auto removed = RunRemove(c, request.runtime_number, false, true); !removed.empty()) {
       Log("moved install app=" + std::to_string(request.runtime_number) + " removal stopped: " + removed);
-      return "The game's old PS5 title could not be removed yet. Play tries again.";
+      return "The game's old " PLAYDEN_CONSOLE_NAME " title could not be removed yet. Play tries again.";
     }
     existing.reset();
   }
@@ -3975,7 +3976,7 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
     if (const auto listed = SyncTitleAllowList(c); !listed.empty()) return listed;
     if (existing->state == rt::PreparationState::kReady) {
       if (c.coordinator->Activity(existing->title_id) != rt::NativeActivity::kStopped)
-        return "Close the game before updating or repairing its PS5 title.";
+        return "Close the game before updating or repairing its " PLAYDEN_CONSOLE_NAME " title.";
       // An interrupted settings update resumes its saved request; nothing is regenerated.
       if (existing->journal) {
         const auto resumed = DrivePublication(c, *existing);
@@ -4089,7 +4090,7 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
       }
       c.admission[existing->install_id] = admission;
       PublishInstalls(c);
-      if (rt::AdmissionNeedsRepair(admission)) return "The PS5 title still fails its start check: " + admission;
+      if (rt::AdmissionNeedsRepair(admission)) return "The " PLAYDEN_CONSOLE_NAME " title still fails its start check: " + admission;
       OpenGameFolders(c, *existing);
       // An update changed the game's files since its launch was set up: the launch is made again from them.
       if (FilesChanged(*existing)) {
@@ -4127,7 +4128,7 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
                                                                         : RecipeForPrepare(c, request, &reason);
       if (!recipe) return reason;
       if (rt::InstalledRecipeId(recipe->id) != existing->recipe_id || rt::RecipeVersionTag(*recipe) != existing->recipe_version)
-        return "This game's setup changed; remove its PS5 title before preparing it again.";
+        return "This game's setup changed; remove its " PLAYDEN_CONSOLE_NAME " title before preparing it again.";
     }
     // A setup that stopped before a kit swap left its title or bottle made with the earlier kit. Neither
     // Retry nor a fresh start finishes over it (both check them against this kit's), so each Try again
@@ -4225,7 +4226,7 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
     auto reserved = c.repository.Reserve(reserve);
     if (!reserved.ok()) {
       if (reserved.error() != rt::RepositoryError::kTitleVariantsExhausted)
-        return "A PS5 title could not be reserved: " + reserved.message();
+        return "A " PLAYDEN_CONSOLE_NAME " title could not be reserved: " + reserved.message();
       // Every ID refused at once usually means one source cannot answer, not that every ID is taken:
       // ask the IDs no other game holds what each source says, until one is not clearly in use.
       std::set<std::string> held;
@@ -4249,12 +4250,12 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
         Log(log_prefix + " occupied=" + std::to_string(occupied) + " " + title + " " + report.Text());
         // Only a ShadowMountPlus that does not answer at all is fixed by loading it again.
         if (report.shadowmount.reason == "no-response")
-          return "ShadowMountPlus isn't answering. Load it again (or restart the PS5 and jailbreak it again), then try again.";
-        return "Playden could not check that a PS5 title is free for this game. Try again; if it still fails, "
+          return "ShadowMountPlus isn't answering. Load it again (or restart the " PLAYDEN_CONSOLE_NAME " and jailbreak it again), then try again.";
+        return "Playden could not check that a " PLAYDEN_CONSOLE_NAME " title is free for this game. Try again; if it still fails, "
                "open Logs in Settings for details.";
       }
       Log(log_prefix + " occupied=" + std::to_string(occupied) + (first_occupied.empty() ? "" : " first=" + first_occupied));
-      return "Every PS5 title this runtime kit offers is in use. Uninstall a game, then try again.";
+      return "Every " PLAYDEN_CONSOLE_NAME " title this runtime kit offers is in use. Uninstall a game, then try again.";
     }
     auto record = reserved.value();
     // Before the title exists: it may only start once its helper lists it.
@@ -4562,7 +4563,7 @@ bool CopySavesTree(const std::filesystem::path& from, const std::filesystem::pat
 
 std::string RuntimeHost::MaintenanceRefusal(Composition& c, const rt::RuntimeInstall& record) {
   if (record.state != rt::PreparationState::kReady) return "Prepare the game first.";
-  if (record.journal) return "Finish the PS5 title's recovery first.";
+  if (record.journal) return "Finish the " PLAYDEN_CONSOLE_NAME " title's recovery first.";
   if (!c.launch_journal) return "Play is unavailable.";
   const auto pending = c.launch_journal->LoadPending();
   if (!pending.ok) return "The launch record cannot be read; restart Playden.";
@@ -4582,7 +4583,7 @@ std::string RuntimeHost::RunMaintenance(Composition& c, std::uint32_t app, Runti
   std::optional<rt::RuntimeInstall> record;
   for (const auto& candidate : c.repository.Snapshot())
     if (candidate.runtime_number == app) record = candidate;
-  if (!record) return "This game has no PS5 title yet.";
+  if (!record) return "This game has no " PLAYDEN_CONSOLE_NAME " title yet.";
   if (const auto replaced = KitReplaced(c); !replaced.empty()) return replaced;
   if (const auto refused = MaintenanceRefusal(c, *record); !refused.empty()) {
     // Settings saved while the game runs reach it on the next Play from Playden.
@@ -4623,7 +4624,7 @@ std::string RuntimeHost::RunMaintenance(Composition& c, std::uint32_t app, Runti
       if (repaired.state != rt::PackageActionState::kComplete) return "The bottle could not be repaired: " + repaired.message;
       // A game whose folder moved fails the check until it is published again, just below.
       if (rt::AdmissionNeedsRepair(admission) && record->moved_from.empty() && !unowned_upgrade)
-        return "The PS5 title still fails its start check: " + admission;
+        return "The " PLAYDEN_CONSOLE_NAME " title still fails its start check: " + admission;
       std::string deferred;
       if (auto refused = RepublishSettings(c, *record, nullptr, true, nullptr, &deferred); !refused.empty())
         return refused;
@@ -4631,12 +4632,12 @@ std::string RuntimeHost::RunMaintenance(Composition& c, std::uint32_t app, Runti
         if (const auto current = c.records.Find(record->install_id))
           if (const auto checked = c.installer->AdmissionDiagnostic(*current); checked != "ok")
             return (deferred.empty() ? std::string() : "The game folder could not be published for mods: " + deferred + " ") +
-                   "The PS5 title still fails its start check: " + checked;
+                   "The " PLAYDEN_CONSOLE_NAME " title still fails its start check: " + checked;
       *ok = true;
       if (const auto current = c.records.Find(record->install_id)) OpenGameFolders(c, *current);
       if (!deferred.empty()) return "Repaired, but the game folder could not be published for mods: " + deferred;
       if (!c.installer->TitleCurrent(*record) || !c.installer->TitleMetadataCurrent(*record))
-        return "Repaired. The PS5 title also has an update: press Update on the game page.";
+        return "Repaired. The " PLAYDEN_CONSOLE_NAME " title also has an update: press Update on the game page.";
       return "Repaired. The game's start files and settings are in place.";
     }
     case RuntimeMaintenance::kBackupSaves: {
@@ -4689,7 +4690,7 @@ std::string RuntimeHost::SyncTitleAllowList(Composition& c) {
   if (!c.kit || std::none_of(c.kit->view.variants.begin(), c.kit->view.variants.end(),
                              [](const rt::KitTitleVariant& variant) { return variant.any_title; }))
     return {};
-  if (!config_.write_title_allow_list) return "This console can't let new PS5 titles start.";
+  if (!config_.write_title_allow_list) return "This console can't let new " PLAYDEN_CONSOLE_NAME " titles start.";
   std::set<std::string> titles;
   for (const auto& record : c.repository.Snapshot())
     if (rt::KitVariantFor(c.kit->view, record.title_id)) titles.insert(record.title_id);
@@ -4698,7 +4699,7 @@ std::string RuntimeHost::SyncTitleAllowList(Composition& c) {
   std::string error;
   if (!config_.write_title_allow_list(contents, &error)) {
     Log("title allow-list write failed titles=" + std::to_string(titles.size()) + " error=" + error);
-    return "The list of PS5 titles allowed to start could not be written: " + error;
+    return "The list of " PLAYDEN_CONSOLE_NAME " titles allowed to start could not be written: " + error;
   }
   Log("title allow-list titles=" + std::to_string(titles.size()));
   return {};
@@ -4749,13 +4750,13 @@ std::optional<RuntimeHost::RemovalFailure> RuntimeHost::RetireTitle(
   struct stat info{};
   if (lstat(source.c_str(), &info) != 0) {
     if (errno == ENOENT) return std::nullopt;
-    return RemovalFailure{"source-unavailable", "The PS5 title's folder cannot be checked."};
+    return RemovalFailure{"source-unavailable", "The " PLAYDEN_CONSOLE_NAME " title's folder cannot be checked."};
   }
   if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid())
-    return RemovalFailure{"source-foreign", "The PS5 title's folder is not Playden's; it was left as it is."};
+    return RemovalFailure{"source-foreign", "The " PLAYDEN_CONSOLE_NAME " title's folder is not Playden's; it was left as it is."};
   if (expected && (expected->device != static_cast<std::uint64_t>(info.st_dev) ||
                    expected->inode != static_cast<std::uint64_t>(info.st_ino)))
-    return RemovalFailure{"source-changed", "The PS5 title's folder changed since it was found; it was left as it is."};
+    return RemovalFailure{"source-changed", "The " PLAYDEN_CONSOLE_NAME " title's folder changed since it was found; it was left as it is."};
   std::string reason;
   const auto trash = config_.state_root / "trash";
   if (!rt::EnsurePrivateDirectories(config_.boundary, config_.state_root, trash, &reason))
@@ -4767,7 +4768,7 @@ std::optional<RuntimeHost::RemovalFailure> RuntimeHost::RetireTitle(
       checked.st_dev != info.st_dev || checked.st_ino != info.st_ino || checked.st_uid != info.st_uid ||
       !homebrew->RenameChild(title_id, *destination, title_id + "-" + operation_id, false) ||
       !homebrew->Sync() || !destination->Sync())
-    return RemovalFailure{"retire-failed", "The PS5 title's folder could not be moved away (error " +
+    return RemovalFailure{"retire-failed", "The " PLAYDEN_CONSOLE_NAME " title's folder could not be moved away (error " +
                                            std::to_string(errno) + ")."};
   Log("remove retired title=" + title_id);
   return std::nullopt;
@@ -4779,7 +4780,7 @@ std::optional<RuntimeHost::RemovalFailure> RuntimeHost::UnregisterTitle(
   TitleRemoverResult result;
   if (listed) {
     if (!config_.unregister_title)
-      return RemovalFailure{"remover-unavailable", "Removing PS5 titles is not available in this build."};
+      return RemovalFailure{"remover-unavailable", "Removing " PLAYDEN_CONSOLE_NAME " titles is not available in this build."};
     result = config_.unregister_title(title_id, operation_id);
     Log("remove unregister title=" + title_id + " sent=" + std::to_string(result.sent) + " code=" +
         (result.code ? std::to_string(*result.code) : std::string("none")) + " detail=" + result.detail);
@@ -4796,10 +4797,10 @@ std::optional<RuntimeHost::RemovalFailure> RuntimeHost::UnregisterTitle(
     return RemovalFailure{"remover-unavailable", "Playden could not start its title remover. Retry to try again."};
   if (result.code && *result.code != 0) {
     char code[16]; std::snprintf(code, sizeof(code), "0x%08x", static_cast<unsigned>(*result.code));
-    return RemovalFailure{"unregister-refused", std::string("The console refused to remove the PS5 title (") + code + ")."};
+    return RemovalFailure{"unregister-refused", std::string("The console refused to remove the " PLAYDEN_CONSOLE_NAME " title (") + code + ")."};
   }
   return RemovalFailure{"unregister-unconfirmed",
-                        "The console has not confirmed that the PS5 title is gone. Retry checks again."};
+                        "The console has not confirmed that the " PLAYDEN_CONSOLE_NAME " title is gone. Retry checks again."};
 }
 
 std::string RuntimeHost::DeleteRetiredTitle(const std::string& title_id, const std::string& operation_id) {
@@ -4809,14 +4810,14 @@ std::string RuntimeHost::DeleteRetiredTitle(const std::string& title_id, const s
   auto parent = platform::ManagedDirectory::Open(trash.parent_path(), platform::DirectoryPolicy::kPrivate);
   if (!parent || !parent->InspectChild(trash.filename().string(), &info) ||
       !S_ISDIR(info.st_mode) || info.st_uid != geteuid())
-    return "The retired PS5 title's folder is not Playden's; it was left as it is.";
+    return "The retired " PLAYDEN_CONSOLE_NAME " title's folder is not Playden's; it was left as it is.";
   const auto total = CountTreeNoFollow(trash.string());
   std::uint64_t done = 0;
   const std::function<void()> removed = [&] { ReportWork(++done, total); };
   std::error_code error;
   RemoveTreeNoFollow(trash, error, &removed);
   ClearWork();
-  return error ? "The PS5 title's folder could not be deleted: " + error.message() : std::string{};
+  return error ? "The " PLAYDEN_CONSOLE_NAME " title's folder could not be deleted: " + error.message() : std::string{};
 }
 
 namespace {
@@ -4878,19 +4879,19 @@ std::string RuntimeHost::RunDeleteLeftover(Composition& c, LeftoverDelete reques
     Log("leftover delete failed title=" + id + " step=" + request.step + " " + message);
     return message;
   };
-  if (!c.leftover_journals_known) return fail("The PS5 title removal records cannot be read; restart Playden before retrying.");
+  if (!c.leftover_journals_known) return fail("The " PLAYDEN_CONSOLE_NAME " title removal records cannot be read; restart Playden before retrying.");
   if (!c.repository.Loaded()) {
     const auto loaded = c.repository.Load();
     PublishInstalls(c);
-    if (!loaded.ok()) return fail("Playden's records of PS5 titles cannot be read: " + loaded.message() + ".");
+    if (!loaded.ok()) return fail("Playden's records of " PLAYDEN_CONSOLE_NAME " titles cannot be read: " + loaded.message() + ".");
   }
   for (const auto& record : c.repository.Snapshot())
-    if (record.title_id == id) return fail("This PS5 title now belongs to an installed game; it was left as it is.");
+    if (record.title_id == id) return fail("This " PLAYDEN_CONSOLE_NAME " title now belongs to an installed game; it was left as it is.");
   if (const auto pending = c.leftover_deletes.find(id); pending != c.leftover_deletes.end()) request = pending->second;
   else if (c.blocked_leftover_titles.count(id))
     return fail("The removal record cannot be read; restart Playden before retrying.");
   auto homebrew = platform::ManagedDirectory::Open(config_.homebrew_root, platform::DirectoryPolicy::kApprovedTree);
-  if (!homebrew) return fail("The PS5 title's folder cannot be checked.");
+  if (!homebrew) return fail("The " PLAYDEN_CONSOLE_NAME " title's folder cannot be checked.");
   const auto activity = c.coordinator->Activity(id);
   if (activity == rt::NativeActivity::kActive) return fail("Close the game before uninstalling it.");
   if (activity != rt::NativeActivity::kStopped) return fail(kActivityUnknown);
@@ -4898,12 +4899,12 @@ std::string RuntimeHost::RunDeleteLeftover(Composition& c, LeftoverDelete reques
   struct stat info{};
   if (lstat(source.c_str(), &info) == 0) {
     if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid())
-      return fail("The PS5 title's folder is not Playden's; it was left as it is.");
+      return fail("The " PLAYDEN_CONSOLE_NAME " title's folder is not Playden's; it was left as it is.");
     if (request.step != "retire" || request.title.device != static_cast<std::uint64_t>(info.st_dev) ||
         request.title.inode != static_cast<std::uint64_t>(info.st_ino))
-      return fail("The PS5 title's folder changed since it was found; it was left as it is.");
-  } else if (errno != ENOENT) return fail("The PS5 title's folder cannot be checked.");
-  else if (request.operation_id.empty()) return fail("This leftover PS5 title is no longer available.");
+      return fail("The " PLAYDEN_CONSOLE_NAME " title's folder changed since it was found; it was left as it is.");
+  } else if (errno != ENOENT) return fail("The " PLAYDEN_CONSOLE_NAME " title's folder cannot be checked.");
+  else if (request.operation_id.empty()) return fail("This leftover " PLAYDEN_CONSOLE_NAME " title is no longer available.");
   if (!request.operation_id.empty()) {
     const auto trash = config_.state_root / "trash";
     const auto retired = trash / (id + "-" + request.operation_id);
@@ -4912,12 +4913,12 @@ std::string RuntimeHost::RunDeleteLeftover(Composition& c, LeftoverDelete reques
       if (!parent || !S_ISDIR(info.st_mode) || info.st_uid != geteuid() ||
           request.title.device != static_cast<std::uint64_t>(info.st_dev) ||
           request.title.inode != static_cast<std::uint64_t>(info.st_ino))
-        return fail("The retired PS5 title's folder changed; it was left as it is.");
-    } else if (errno != ENOENT) return fail("The retired PS5 title's folder cannot be checked.");
+        return fail("The retired " PLAYDEN_CONSOLE_NAME " title's folder changed; it was left as it is.");
+    } else if (errno != ENOENT) return fail("The retired " PLAYDEN_CONSOLE_NAME " title's folder cannot be checked.");
   }
   // Check the inventory before retiring: an unavailable remover must leave a listed title's source intact.
   if (TitleListed(c, id) && !config_.unregister_title)
-    return fail("Removing PS5 titles is not available in this build.");
+    return fail("Removing " PLAYDEN_CONSOLE_NAME " titles is not available in this build.");
   if (request.operation_id.empty()) {
     const auto operation = config_.uuid();
     if (!operation || !LeftoverOperationId(*operation)) return fail("No secure random source for the removal.");
@@ -4925,20 +4926,20 @@ std::string RuntimeHost::RunDeleteLeftover(Composition& c, LeftoverDelete reques
     if (const auto error = SaveLeftoverDelete(c, request); !error.empty()) return fail(error);
   }
   if (request.step == "retire") {
-    Publish([](RuntimeSnapshot& s) { s.deleting_leftover_step = "Removing PS5 title…"; });
+    Publish([](RuntimeSnapshot& s) { s.deleting_leftover_step = "Removing " PLAYDEN_CONSOLE_NAME " title…"; });
     if (const auto error = RetireTitle(c, id, request.operation_id, &request.title)) return fail(error->message);
     request.step = "unregister";
     if (const auto error = SaveLeftoverDelete(c, request); !error.empty()) return fail(error);
   }
   if (request.step == "unregister") {
-    Publish([](RuntimeSnapshot& s) { s.deleting_leftover_step = "Removing PS5 title…"; });
+    Publish([](RuntimeSnapshot& s) { s.deleting_leftover_step = "Removing " PLAYDEN_CONSOLE_NAME " title…"; });
     if (Stopping()) return fail("The removal will continue when Playden starts again.");
     if (const auto error = UnregisterTitle(c, id, request.operation_id)) return fail(error->message);
     request.step = "trash";
     if (const auto error = SaveLeftoverDelete(c, request); !error.empty()) return fail(error);
   }
   // A restart or a retry still checks the native inventory before clearing the durable journal.
-  if (TitleListed(c, id)) return fail("The console has not confirmed that the PS5 title is gone. Retry checks again.");
+  if (TitleListed(c, id)) return fail("The console has not confirmed that the " PLAYDEN_CONSOLE_NAME " title is gone. Retry checks again.");
   Publish([](RuntimeSnapshot& s) { s.deleting_leftover_step = "Deleting title files…"; });
   if (const auto error = DeleteRetiredTitle(id, request.operation_id); !error.empty()) return fail(error);
   const auto cleared = c.storage.RemoveDurable(LeftoverDeleteFile(id));
@@ -5197,7 +5198,7 @@ std::string RuntimeHost::RunRemove(Composition& c, std::uint32_t app, bool delet
     PublishInstalls(c);
     if (!loaded.ok()) {
       Log("remove records unavailable: " + loaded.message());
-      return "Playden's records of PS5 titles cannot be read: " + loaded.message() + ".";
+      return "Playden's records of " PLAYDEN_CONSOLE_NAME " titles cannot be read: " + loaded.message() + ".";
     }
     Log("remove records read again installs=" + std::to_string(c.repository.Snapshot().size()));
   }
@@ -5206,7 +5207,7 @@ std::string RuntimeHost::RunRemove(Composition& c, std::uint32_t app, bool delet
     if (record.runtime_number == app) found = record;
   if (!found) return {};  // no PS5 title: nothing to remove
   auto record = *found;
-  if (!config_.unregister_title) return "Removing PS5 titles is not available in this build.";
+  if (!config_.unregister_title) return "Removing " PLAYDEN_CONSOLE_NAME " titles is not available in this build.";
   if (c.launch_journal) {
     const auto pending = c.launch_journal->LoadPending();
     if (!pending.ok) return "The launch record cannot be read; restart Playden before uninstalling.";

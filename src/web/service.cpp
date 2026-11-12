@@ -3,6 +3,7 @@
 
 #include "web/address.h"
 #include "web/assets.h"
+#include "platform/console_name.h"
 
 namespace playden::web {
 namespace {
@@ -167,7 +168,7 @@ void Service::Shutdown() {
 
 void Service::Handle(const Request& request, Response& response) {
   if (const auto host = HeaderValue(request, "host"); host && !LocalAuthority(*host))
-    return SendError(response, 403, "Open this page by the PS5's IP address.");
+    return SendError(response, 403, "Open this page by the " PLAYDEN_CONSOLE_NAME "'s IP address.");
   if (request.method == Method::kPost && !SameOrigin(request))
     return SendError(response, 403, "This request came from another site.");
   router_.Handle(request, response);

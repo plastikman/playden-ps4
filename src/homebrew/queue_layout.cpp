@@ -4,6 +4,7 @@
 #include "homebrew/queue_layout.hpp"
 
 #include <algorithm>
+#include "platform/console_name.h"
 
 namespace playden::homebrew {
 namespace {
@@ -188,9 +189,9 @@ QueueSection preparations(const State& state) {
         item.title = game_title(state, id);
         item.note = game.detail;
         item.tone = "attention";
-        if (game.status == "Waiting for the PS5") {
-            item.status = "Waiting for the PS5";
-            item.note = "Quit Playden and the PS5 adds it to Home";
+        if (game.status == "Waiting for the " PLAYDEN_CONSOLE_NAME) {
+            item.status = "Waiting for the " PLAYDEN_CONSOLE_NAME;
+            item.note = "Quit Playden and the " PLAYDEN_CONSOLE_NAME " adds it to Home";
         } else if (game.status == "Registration pending") {
             item.status = "Registration pending";
         } else if (game.status == "Needs recovery") {

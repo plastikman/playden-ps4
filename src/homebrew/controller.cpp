@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <utility>
+#include "platform/console_name.h"
 
 namespace playden::homebrew {
 namespace {
@@ -763,7 +764,7 @@ void Controller::TickCloud() {
       if (const auto stopped = uninstalls_.CloudRefused(id); stopped.kind == UninstallAction::Kind::kStop)
         StopUninstall(id, stopped.reason);
       if (sync_before_play_.erase(id)) {
-        play_notes_[id] = "The game's PS5 title may still be running. Close it, then press Play.";
+        play_notes_[id] = "The game's " PLAYDEN_CONSOLE_NAME " title may still be running. Close it, then press Play.";
         ++play_notes_revision_;
       }
     }
@@ -1285,7 +1286,7 @@ void Controller::TickRuntime() {
           finish(false, failure->second);
           continue;
         }
-        if (record_of(id)) { finish(false, "The PS5 title could not be removed."); continue; }
+        if (record_of(id)) { finish(false, "The " PLAYDEN_CONSOLE_NAME " title could not be removed."); continue; }
         pending.prepare_submitted = true;
         pending.refusal = refusal_of(id);
         pending.submitted_at = std::chrono::steady_clock::now();
@@ -1306,7 +1307,7 @@ void Controller::TickRuntime() {
       if (!pending.seen_preparing && !unseen_too_long) { ++it; continue; }
       const auto* record = record_of(id);
       if (record && (ready(record) || record->awaiting_registration))
-        finish(true, record->awaiting_registration ? "Bottle recreated. The PS5 adds the game to Home when Playden quits."
+        finish(true, record->awaiting_registration ? "Bottle recreated. The " PLAYDEN_CONSOLE_NAME " adds the game to Home when Playden quits."
                                                    : "Bottle recreated with the saves and settings brought back.");
       else
         finish(false, refusal_of(id).empty() ? "The game could not be prepared again; press Prepare on the game page."
@@ -1533,17 +1534,17 @@ void Controller::TickRuntime() {
     } else if (snapshot.status != RuntimeHostStatus::kReady) {
       game.status = "Unavailable"; game.detail = snapshot.reason;
     } else if (IsNumber(snapshot, snapshot.removing_app, id)) {
-      game.status = "Removing"; game.detail = "Removing the game's PS5 title";
+      game.status = "Removing"; game.detail = "Removing the game's " PLAYDEN_CONSOLE_NAME " title";
     } else if (IsNumber(snapshot, snapshot.preparing_app, id) && record && record->moving) {
       // Prepare removes the title made for the game's old folder (installed again on another drive).
-      game.status = "Preparing"; game.detail = "Removing the PS5 title made for the game's old drive";
+      game.status = "Preparing"; game.detail = "Removing the " PLAYDEN_CONSOLE_NAME " title made for the game's old drive";
     } else if (record && record->moving) {
       // That removal stopped part way: Play or Prepare finishes the move, never an uninstall of the new download.
       game.status = "Needs repair"; game.can_prepare = usable; game.moving = true;
-      game.detail = "Play finishes moving the PS5 title to the game's new drive.";
+      game.detail = "Play finishes moving the " PLAYDEN_CONSOLE_NAME " title to the game's new drive.";
     } else if (record && record->state == runtime::PreparationState::kRemoving) {
       game.status = "Removal incomplete"; game.can_prepare = true;
-      game.detail = record->failure.empty() ? "Retry finishes removing the PS5 title, then uninstalls the game."
+      game.detail = record->failure.empty() ? "Retry finishes removing the " PLAYDEN_CONSOLE_NAME " title, then uninstalls the game."
                                             : record->failure;
     } else if (IsNumber(snapshot, snapshot.preparing_app, id)) {
       game.status = "Preparing"; game.detail = PreparationProgressWords(record != nullptr, record ? record->step : std::string{});
@@ -1560,8 +1561,8 @@ void Controller::TickRuntime() {
     } else if (record && record->awaiting_registration) {
       // Staged and submitted: ShadowMountPlus registers it as soon as Playden quits,
       // so the game is ready to play from Home. Checking only asks the console.
-      game.status = "Waiting for the PS5"; game.awaiting_registration = true;
-      game.detail = "Waiting for the PS5, which adds the game to Home when Playden quits";
+      game.status = "Waiting for the " PLAYDEN_CONSOLE_NAME; game.awaiting_registration = true;
+      game.detail = "Waiting for the " PLAYDEN_CONSOLE_NAME ", which adds the game to Home when Playden quits";
       game.can_prepare = usable;
     } else if (record && record->recovery_pending &&
                (record->step == "register" || record->step == "await-native" || record->step == "query-native")) {
@@ -1580,7 +1581,7 @@ void Controller::TickRuntime() {
       game.status = "Failed"; game.detail = record->failure; game.can_prepare = usable;
     } else {
       game.status = usable ? "Not prepared" : "No runtime kit";
-      game.detail = usable ? "Play prepares it: a private bottle and the game's own PS5 title" : snapshot.kit_reason;
+      game.detail = usable ? "Play prepares it: a private bottle and the game's own " PLAYDEN_CONSOLE_NAME " title" : snapshot.kit_reason;
       game.can_prepare = usable;
     }
     // Preparation and its recovery checks require the kit. Keep actions that
@@ -1813,7 +1814,7 @@ std::string Controller::UninstallStatus(GameId id) const {
   if (!uninstalls_.Started(id, files_deleting_)) return "Waiting to uninstall";
   switch (*step) {
     case UninstallStep::kSync: return "Syncing saves…";
-    case UninstallStep::kRemoveTitle: return "Removing PS5 title…";
+    case UninstallStep::kRemoveTitle: return "Removing " PLAYDEN_CONSOLE_NAME " title…";
     case UninstallStep::kRemoveDownload: break;
   }
   // An imported game played from its drive leaves the library; its files stay.

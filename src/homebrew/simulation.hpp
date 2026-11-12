@@ -28,6 +28,7 @@
 #include <tuple>
 #include <string>
 #include <vector>
+#include "platform/console_name.h"
 
 namespace playden::homebrew {
 
@@ -241,7 +242,7 @@ struct LiveRuntimeGame {
     std::string play_detail;  // the last launch's outcome or refusal
     // Uninstall removes the game's PS5 title first; has_title says there is one.
     bool has_title = false;
-    std::string uninstall_status;  // e.g. "Syncing saves…", "Removing PS5 title…"; empty when idle
+    std::string uninstall_status;  // e.g. "Syncing saves…", "Removing " PLAYDEN_CONSOLE_NAME " title…"; empty when idle
     // How far the current copy or deletion is (0–1); absent when it cannot be measured.
     std::optional<float> progress;
     std::string play_work;  // Play's own work before the launch, for Setup ("Installing PhysX…")
@@ -413,7 +414,7 @@ struct LiveCompletedPreparation {
 // An uninstall that runs or waits its turn, listed in Queue's Preparation section.
 struct LiveUninstall {
     GameId game_id;
-    std::string step;  // what it does now, e.g. "Removing PS5 title…"; empty while it waits its turn
+    std::string step;  // what it does now, e.g. "Removing " PLAYDEN_CONSOLE_NAME " title…"; empty while it waits its turn
     bool operator==(const LiveUninstall&) const = default;
 };
 // An uninstall that ended this session: uninstalled, or stopped with the reason.

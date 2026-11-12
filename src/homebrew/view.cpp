@@ -51,6 +51,7 @@
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+#include "platform/console_name.h"
 
 namespace playden::homebrew
 {
@@ -1361,7 +1362,7 @@ class Render::Impl
         const char *title = "Account name and password";
         const char *detail = state.stay_signed_in
             ? "Playden sends your password to Steam, encrypted, and never saves it. It keeps Steam's sign-in token "
-              "on this PS5 so you stay signed in."
+              "on this " PLAYDEN_CONSOLE_NAME " so you stay signed in."
             : "Playden sends your password to Steam, encrypted, and never saves it. It keeps Steam's sign-in token "
               "only until you close Playden. You will sign in again next time.";
         if (form.step == SignInStep::Submitting)
@@ -2256,7 +2257,7 @@ class Render::Impl
                     ui::text(scene_, fonts_.semibold, label, right, top + 44.0F, 24.0F, kBlue, gfx::Align::right);
                     ui::text(scene_, fonts_.regular, fit(fonts_.regular, entry->note.empty() ? "Starting…" : entry->note, 24.0F, 1100.0F),
                              text_x, top + 88.0F, 24.0F, kText);
-                    ui::text(scene_, fonts_.regular, entry->leftover || entry->uninstall ? "Removing from this PS5" : "Setting up for this PS5", right,
+                    ui::text(scene_, fonts_.regular, entry->leftover || entry->uninstall ? "Removing from this " PLAYDEN_CONSOLE_NAME : "Setting up for this " PLAYDEN_CONSOLE_NAME, right,
                              top + 88.0F, 21.0F, kSecondary, gfx::Align::right);
                 }
                 focus_ring(scene_, box, amount, true);
@@ -3226,9 +3227,9 @@ class Render::Impl
         else if (cloud != nullptr && cloud->after_play)
             note = "The game may be running. Playden syncs its saves once it stops.";
         else if (status == CloudStatus::Conflict)
-            note = cloud->first_sync ? "Never synced on this PS5, and both sides already have saves. Pick which to keep; the other side is backed up first."
+            note = cloud->first_sync ? "Never synced on this " PLAYDEN_CONSOLE_NAME ", and both sides already have saves. Pick which to keep; the other side is backed up first."
                    : cloud->first_overwrite
-                       ? "Saves here would replace the ones in Steam Cloud, and this PS5 hasn't uploaded any for this game before. If the game didn't show your progress, keep the Cloud saves. Either side is backed up first."
+                       ? "Saves here would replace the ones in Steam Cloud, and this " PLAYDEN_CONSOLE_NAME " hasn't uploaded any for this game before. If the game didn't show your progress, keep the Cloud saves. Either side is backed up first."
                        : "Both changed since the last sync. Pick which saves to keep; saves replaced here are backed up first.";
         else if (status == CloudStatus::NeedsAccount)
             note = "Saves here were never synced with this Steam account. Confirm to upload them.";
@@ -3237,7 +3238,7 @@ class Render::Impl
         else if (status == CloudStatus::Synced || status == CloudStatus::UpToDate)
             note = "Matches Steam Cloud.";
         else if (status == CloudStatus::Unsupported)
-            note = "This game doesn't use Steam Cloud. Its saves exist only on this PS5.";
+            note = "This game doesn't use Steam Cloud. Its saves exist only on this " PLAYDEN_CONSOLE_NAME ".";
         else if (status == CloudStatus::Waiting)
             note = installed ? cloud->message + ". Steam Cloud has saves this console doesn't; Sync now or Play brings them down."
                              : "Steam Cloud has newer saves. They come down when you reinstall the game or press Sync now.";

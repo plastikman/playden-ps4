@@ -13,6 +13,7 @@
 #include <limits>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "platform/console_name.h"
 
 namespace playden::web {
 namespace {
@@ -21,7 +22,7 @@ namespace json = steam::json;
 constexpr std::string_view kTitlePrefix = "title-";
 constexpr std::string_view kSteamIdPrefix = "7656119";
 constexpr std::string_view kKitId = "playden-kit";
-constexpr std::string_view kRedacted = "Steam account name, SteamIDs, family group ID, PS5 user ID and home network addresses";
+constexpr std::string_view kRedacted = "Steam account name, SteamIDs, family group ID, " PLAYDEN_CONSOLE_NAME " user ID and home network addresses";
 // What Playden's "Store name in PS5 titles" setting adds to a title name; imported games get none.
 constexpr std::string_view kStoreSuffixes[] = {" (Steam)", " (GOG)", " (Epic)"};
 

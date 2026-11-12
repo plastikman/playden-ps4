@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "platform/console_name.h"
 
 namespace playden::runtime {
 
@@ -421,7 +422,7 @@ bool SettingChoiceWaitsForUpdate(const EffectiveSettings& settings, std::string_
 // IsBottleEnvironmentEntry), as the setting's description and a refusal tell the player.
 inline constexpr char kEnvironmentNamesHint[] =
     "Allowed names start with DXVK_, MESA_, RADV_, SDL_, VK_, VKD3D_, ZINK_, GALLIUM_ or PW_, or are WINE_CPU_TOPOLOGY, "
-    "WINE_LARGE_ADDRESS_AWARE, WINE_PS5_PARK_FILES or WINE_PS5_CACHED_FILES.";
+    "WINE_LARGE_ADDRESS_AWARE, WINE_" PLAYDEN_CONSOLE_NAME "_PARK_FILES or WINE_" PLAYDEN_CONSOLE_NAME "_CACHED_FILES.";
 
 // Checks one player value for one setting; used by the UI before saving an override.
 bool ValidateSettingValue(const GameRecipe& recipe, std::string_view id, std::string_view value, std::string* reason);

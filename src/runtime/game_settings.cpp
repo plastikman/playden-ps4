@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
+#include "platform/console_name.h"
 
 namespace playden::runtime {
 namespace {
@@ -103,7 +104,7 @@ std::vector<SettingDefinition> BuildCatalogue() {
                         "back to 60 Hz.",
                         "[display] refresh", G::kDisplay,
                         {{"60", "60 Hz", "The TV refreshes 60 times a second."},
-                         {"120", "120 Hz", "Needs a TV with 120 Hz and the PS5's 120 Hz output on."}},
+                         {"120", "120 Hz", "Needs a TV with 120 Hz and the " PLAYDEN_CONSOLE_NAME "'s 120 Hz output on."}},
                         "60"));
   // With a display-120hz runtime the display paces the cap ([display] frame_rate); otherwise DXVK does.
   list.push_back(Choice("frame_limit", "Frame limit", "Caps the frame rate for steadier motion and less heat.",
@@ -229,7 +230,7 @@ std::vector<SettingDefinition> BuildCatalogue() {
   // Compatibility › Graphics.
   // "OpenGL worker thread" ([display] opengl_thread) was the PS5 OpenGL SDK's; Zink has none, so the row is gone.
   // Saved values for it are dropped when the record loads (RecordFromValue).
-  list.push_back(Choice("graphics", "Graphics", "How Direct3D is drawn on the PS5 GPU.", "[application] graphics",
+  list.push_back(Choice("graphics", "Graphics", "How Direct3D is drawn on the " PLAYDEN_CONSOLE_NAME " GPU.", "[application] graphics",
                         G::kGraphics,
                         {{"auto", "Automatic", ""}, {"gdi", "GDI", "2D only."}, {"dxvk", "DXVK", "Direct3D 9-11 on Vulkan."},
                          {"opengl", "OpenGL", ""}},
@@ -398,7 +399,7 @@ bool WithPixelShaderEnvironment(const std::string& entries, const std::string& w
     start = end + 1;
     const auto equals = entry.find('=');
     const auto name = TrimSpaces(equals == std::string::npos ? entry : entry.substr(0, equals));
-    if (equals != std::string::npos && name == "RADV_PS5_PS_WAVE64") continue;
+    if (equals != std::string::npos && name == "RADV_" PLAYDEN_CONSOLE_NAME "_PS_WAVE64") continue;
     if (equals != std::string::npos && name == "RADV_PERFTEST") {
       // Options split as RADV's parse_debug_string splits them: at commas, spaces and newlines. Written back with
       // commas.
@@ -443,7 +444,7 @@ bool WithPixelShaderEnvironment(const std::string& entries, const std::string& w
     }
     first = "RADV_PERFTEST=" + perftest;
   } else {
-    first = "RADV_PS5_PS_WAVE64=1";
+    first = "RADV_" PLAYDEN_CONSOLE_NAME "_PS_WAVE64=1";
   }
   *out = first.empty() ? rest : rest.empty() ? first : first + ";" + rest;
   return true;
@@ -570,7 +571,7 @@ std::string Unavailable(const SettingDefinition& definition, const std::string& 
     if (!kit.dxvk_config) return "Needs a runtime kit that reads dxvk.conf.";
     // Checked on the console (results/20261005-dxvk-conf-probe): the cap works, DXVK applies
     // latency and VRAM, VSync off does not change the display's pacing.
-    if (id == "vsync" && !kit.dxvk_present) return "The PS5 display always waits for the TV; VSync cannot be turned off yet.";
+    if (id == "vsync" && !kit.dxvk_present) return "The " PLAYDEN_CONSOLE_NAME " display always waits for the TV; VSync cannot be turned off yet.";
   }
   if (id == "steam_input") {
     const auto steam = values.find("steam_features");
@@ -1189,7 +1190,7 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
       return refuse("WINE_LARGE_ADDRESS_AWARE", kit.large_address_aware_needs_update);
     if (names("PW_NSIPROXY_DISABLE") && !kit.nsiproxy_switch)
       return refuse("PW_NSIPROXY_DISABLE", kit.nsiproxy_switch_needs_update);
-    for (const char* budget : {"WINE_PS5_PARK_FILES", "WINE_PS5_CACHED_FILES"})
+    for (const char* budget : {"WINE_" PLAYDEN_CONSOLE_NAME "_PARK_FILES", "WINE_" PLAYDEN_CONSOLE_NAME "_CACHED_FILES"})
       if (names(budget) && !kit.environment_file_budgets)
         return refuse(budget, kit.environment_file_budgets_needs_update);
   }

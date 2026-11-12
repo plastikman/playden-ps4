@@ -22,6 +22,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include "platform/console_name.h"
 
 namespace playden::steam::cloud {
 namespace {
@@ -804,7 +805,7 @@ CloudOutcome CloudSync::Apply(const StoredSession& session, const GameSaveLocati
       if (!response.ok() || response.status_code != 200) {
         // A DNS server that blocks the storage host (a sinkhole address) fails here every time.
         failure = response.error == HttpError::kNameResolutionFailed
-                      ? "The PS5 couldn't reach Steam Cloud's storage. Check its DNS settings, then try again."
+                      ? "The " PLAYDEN_CONSOLE_NAME " couldn't reach Steam Cloud's storage. Check its DNS settings, then try again."
                       : "A Cloud save could not be downloaded. Try again.";
         detail = named + " http error=" + HttpFailureName(response) + " status=" + std::to_string(response.status_code) +
                  " host=" + ticket->host + " file_size=" + std::to_string(ticket->file_size) +

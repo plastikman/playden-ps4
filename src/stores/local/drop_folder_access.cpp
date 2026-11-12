@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#include "platform/console_name.h"
 
 namespace playden::stores::local {
 namespace {
@@ -235,7 +236,7 @@ class Walk {
     // A title has neither readlinkat with a descriptor nor readlink (a libkernel_sys-only import,
     // null in the title): where the link leads can't be checked, so it fails like one that leaves.
     (void)folder;
-    Fail(relative, "the link " + Console(relative) + " can't be checked on the PS5 (remove it over FTP)",
+    Fail(relative, "the link " + Console(relative) + " can't be checked on the " PLAYDEN_CONSOLE_NAME " (remove it over FTP)",
          "link=unchecked");
 #else
     char target[4096];

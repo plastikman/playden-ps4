@@ -16,6 +16,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include "platform/console_name.h"
 
 namespace playden::runtime {
 namespace {
@@ -677,7 +678,7 @@ GameDefaults DefaultsFor(const GameProbe& probe, const RuntimeAbilities& runtime
   // engine defaults below are still worked out for a player who tries anyway.
   std::string soft;
   if (probe.shared_section && !runtime.shared_sections)
-    soft = "This game's program needs a shared memory section the PS5 can't map yet.";
+    soft = "This game's program needs a shared memory section the " PLAYDEN_CONSOLE_NAME " can't map yet.";
   else if (probe.dotnet && !runtime.wine_mono)
     soft = "This game needs .NET, which Playden's runtime kit doesn't include yet.";
   if (probe.steam_stub && !probe.steam_stub_supported) {

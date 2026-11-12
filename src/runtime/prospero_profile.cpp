@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <set>
 #include <vector>
+#include "platform/console_name.h"
 
 namespace playden::runtime {
 namespace {
@@ -193,7 +194,7 @@ bool IsProsperoEnvironmentEntry(std::string_view name, std::string_view value) {
   // title whose kit has wine-large-address-aware, nsiproxy-switch or environment-file-budgets: BuildEffectiveSettings
   // checks that.
   const bool zero_or_one = name == "WINE_LARGE_ADDRESS_AWARE" || name == "PW_NSIPROXY_DISABLE";
-  const bool file_budget = name == "WINE_PS5_PARK_FILES" || name == "WINE_PS5_CACHED_FILES";
+  const bool file_budget = name == "WINE_" PLAYDEN_CONSOLE_NAME "_PARK_FILES" || name == "WINE_" PLAYDEN_CONSOLE_NAME "_CACHED_FILES";
   if (zero_or_one) return value == "0" || value == "1";
   if (file_budget) return value.size() <= 4 && value.find_first_not_of("0123456789") == std::string_view::npos;
   if (!(starts("DXVK_") || starts("MESA_") || starts("RADV_") || starts("SDL_") || name == "WINE_CPU_TOPOLOGY")) return false;
