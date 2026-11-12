@@ -7,6 +7,7 @@
 #include "homebrew_live.hpp"
 
 #include "app/diagnostic_log.h"
+#include "platform/managed_directory.h"
 #include "app/experimental_features.h"
 #include "community/endpoints.h"
 #include "community/recipe_service.h"
@@ -70,6 +71,17 @@ namespace playden::ps4 {
 namespace {
 
 constexpr const char *kCaBundle = "/app0/assets/cacert.pem";
+
+// Every durable read and write under the title's data root goes through this. The root the system
+// gives a PS4 title is 0711, not the 0700 the private policy wants, so without this a durable read
+// fails before it reaches the file ("imports could not be read", 02.73) -- the first PS4 launcher
+// does the same for each of its stores.
+std::unique_ptr<playden::Storage> TitleStorage(const std::filesystem::path &root)
+{
+    auto storage = std::make_unique<playden::Storage>(root.string());
+    storage->AllowTraversableRoot();
+    return storage;
+}
 constexpr const char *kDataDirectory = "/data/PLDN10001";
 
 std::mutex content_language_lock;
@@ -216,6 +228,29 @@ void probe_listing_methods()
                       fdopendir_errno, fdopen_entries);
     (void)n;
     log_line(line);
+}
+
+// What the durable journal path needs from the title's data root: the private policy wants 0700 and
+// the traversable one accepts 0711, which is what the system gives a PS4 title; and a durable read
+// of an absent file also has to fsync the folder.
+void probe_durable_root()
+{
+    const std::filesystem::path root = kDataDirectory;
+    const auto report = [&](const char *name, playden::platform::DirectoryPolicy policy) {
+        errno = 0;
+        const auto opened = playden::platform::ManagedDirectory::Open(root, policy);
+        const int failure = opened ? 0 : errno;
+        int sync_rc = -1, sync_errno = 0;
+        if (opened) {
+            errno = 0;
+            sync_rc = ::fsync(opened->fd());
+            sync_errno = sync_rc == 0 ? 0 : errno;
+        }
+        log_line(std::string("durable root ") + name + ": open=" + (opened ? "ok" : std::to_string(failure)) +
+                 " fsync=" + std::to_string(sync_rc) + "/" + std::to_string(sync_errno));
+    };
+    report("private", playden::platform::DirectoryPolicy::kPrivate);
+    report("traversable", playden::platform::DirectoryPolicy::kPrivateTraversable);
 }
 
 void probe_bottle_chain()
@@ -371,6 +406,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
 
     probe_directory_identity();
     probe_listing_methods();
+    probe_durable_root();
     probe_bottle_chain();
     std::string settings_reason;
     const auto settings_file = playden::runtime::PrepareGameSettingsStorage(data, &settings_reason);
@@ -383,7 +419,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
             log_line(line);
 
     s.steam_cm = playden::steam::MakeCmSharedSession();
-    s.auth_storage = std::make_unique<playden::Storage>(data.string());
+    s.auth_storage = TitleStorage(data);
     s.auth_cm = std::make_unique<playden::steam::CmClient>(kCaBundle, *s.auth_storage);
     s.auth_cm->SetOwner("auth");
     s.auth_cm->SetSharedSession(s.steam_cm);
@@ -419,7 +455,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     };
     s.owned_library = std::make_unique<playden::steam::LibraryClient>(kCaBundle);
     s.library_sessions = session_repository();
-    s.library_storage = std::make_unique<playden::Storage>(data.string());
+    s.library_storage = TitleStorage(data);
     s.cm_client = std::make_unique<playden::steam::CmClient>(kCaBundle, *s.library_storage);
     s.cm_client->SetOwner("library");
     s.cm_client->SetSharedSession(s.steam_cm);
@@ -527,7 +563,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     adopt_launcher_installs(data / "games");
     std::vector<playden::steam::VolumeCandidate> candidates = {
         {playden::steam::InstallService::kPrimaryVolumeId, "PS4 storage", data.string(), (data / "games").string()}};
-    s.import_storage = std::make_unique<playden::Storage>(data.string());
+    s.import_storage = TitleStorage(data);
     s.imports = std::make_unique<playden::stores::local::ImportStore>(*s.import_storage);
     playden::stores::local::LocalCopyOptions copy_options;
     copy_options.log = [log_directory](const std::string &line) {
@@ -588,7 +624,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     s.stores->Add(std::make_unique<playden::stores::SteamLibrarySource>(*s.library_service));
     s.stores->Add(std::make_unique<playden::stores::SteamDetailsSource>(*s.app_details));
     playden::stores::local::LocalLibraryConfig import_config;
-    import_config.volumes = {{playden::steam::InstallService::kPrimaryVolumeId, data.string(), "playden-import", false}};
+    import_config.volumes = {{playden::steam::InstallService::kPrimaryVolumeId, "/data", "playden-import", false}};
     import_config.log = [log_directory](const std::string &line) {
         playden::app::AppendLogLine(log_directory, "install.log", line);
     };

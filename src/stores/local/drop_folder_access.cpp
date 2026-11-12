@@ -134,9 +134,20 @@ class Walk {
       if (::fchmod(fd, mode) == 0) return true;
       return Fail(relative, Console(relative) + " can't be changed", "chmod=" + Error(errno));
     }
-    const int owned = keep_fd ? ::dup(fd) : fd;
-    if (owned < 0) return Fail(relative, Console(relative) + " can't be changed", "dup=" + Error(errno));
-    pending_.push_back({owned, mode, relative});
+    if (keep_fd) {
+      // PS4 titles cannot duplicate a directory descriptor. Change the held folder before
+      // listing it; files still use the short batched root raises below.
+      int error = 0;
+      const bool changed = AsRoot([&] {
+        if (::fchmod(fd, mode) == 0) return true;
+        error = errno;
+        return false;
+      });
+      if (changed) return true;
+      return Fail(relative, Console(relative) + " can't be changed",
+                  error ? "chmod=" + Error(error) : options_.as_root ? "root=refused" : "root=unavailable");
+    }
+    pending_.push_back({fd, mode, relative});
     return true;
   }
 
@@ -172,11 +183,9 @@ class Walk {
     frame.fd = fd;
     frame.relative = relative;
     frame.depth = depth;
-    const int listing_fd = ::dup(fd);
-    DIR* listing = listing_fd >= 0 ? ::fdopendir(listing_fd) : nullptr;
+    DIR* listing = platform::OpenHeldListing(fd, Host(Console(relative)));
     if (!listing) {
       const int e = errno;
-      if (listing_fd >= 0) ::close(listing_fd);
       ::close(fd);
       return Fail(relative, Console(relative) + " can't be listed", "list=" + Error(e));
     }
@@ -354,6 +363,7 @@ class Removal {
   }
 
   DropFolderRemoval Run(const std::string& drop_folder, const std::string& name) {
+    root_ = fs::path(drop_folder) / name;
     const int parent = platform::OpenDirectoryWalk(drop_folder);
     if (parent < 0) return Done("open-parent=" + Error(errno));
     const int fd = Open(parent, name);
@@ -423,24 +433,24 @@ class Removal {
     frame.fd = fd;
     frame.relative = relative;
     frame.depth = depth;
-    const int listing_fd = ::dup(fd);
-    DIR* listing = listing_fd >= 0 ? ::fdopendir(listing_fd) : nullptr;
+    DIR* listing = platform::OpenHeldListing(fd, root_ / relative);
     if (!listing) {
       const int e = errno;
-      if (listing_fd >= 0) ::close(listing_fd);
       ::close(fd);
       return Fail(relative, "list=" + Error(e));
     }
+    int error = 0;
     for (;;) {
       errno = 0;
       const auto* entry = ::readdir(listing);
-      if (!entry) break;
+      if (!entry) { error = errno; break; }
       const std::string child = entry->d_name;
       if (child == "." || child == "..") continue;
       if (++entries_ > kMaxEntries) { ::closedir(listing); ::close(fd); return Fail(relative, "entries>" + std::to_string(kMaxEntries)); }
       frame.children.push_back({child, static_cast<std::uint64_t>(entry->d_fileno), entry->d_type});
     }
     ::closedir(listing);
+    if (error) { ::close(fd); return Fail(relative, "readdir=" + Error(error)); }
     stack_.push_back(std::move(frame));
     return true;
   }
@@ -481,6 +491,7 @@ class Removal {
 
   const DropFolderPlanned& planned_;
   const runtime::WritableFoldersAsRoot& as_root_;
+  fs::path root_;
   std::vector<Frame> stack_;
   std::size_t entries_ = 0;
   std::string message_;

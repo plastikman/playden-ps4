@@ -40,8 +40,9 @@ cleared=1 played_s=275`. Half-Life: Source and Dreamfall also launch.
   `dup`+`fdopendir` listings read as empty, and the directory walk then took
   every child for a swapped entry and refused it with `ESTALE` — which broke the
   mode repair, the self-heal and the session-evidence read at once. Use
-  `platform::OpenHeldListing(fd, path)`. `drop_folder_access.cpp` still has
-  three raw `dup` listings.
+  `platform::OpenHeldListing(fd, path)`. The Local store scanner and drop-folder
+  access/removal walks now use this helper on PS4. Their native-policy tests
+  simulate directory `dup()` failing with `EPERM`.
 - The SDK's libc directory functions are **link stubs**, and `getdents` and
   `sceKernelGetdents` both live in libkernel. Only the console can answer
   questions about them; `ps4/homebrew_live.cpp`'s probes measure them.
@@ -94,6 +95,65 @@ after each step; do not assume a press landed.
 
 ## What is left
 
+### Latest hardware run — 2026-11-11 post-reboot
+
+The console recovered after reboot. The earlier crash window is retained at
+`/home/zpeirce/codex_scratch/playden-test-20261111-188/klog.log`; it contains no
+guest exception context and no captured dump, so the cause remains unknown.
+
+The Local store test exposed and fixed three separate issues:
+
+1. Playden 02.71 fixed `drop_folder_access.cpp` directory listings, but the
+   scanner still used `dup()` and could not scan on PS4.
+2. Playden 02.72 changed the scanner to `platform::OpenHeldListing`. Native and
+   simulated-PS4 scanner tests passed. Hardware showed `import scan candidates=0`
+   because the PS4 composition mounted the Local store at
+   `/data/PLDN10001/playden-import`, while the folder is `/data/playden-import`.
+3. Playden 02.73 corrected the Local store mount to `/data`. On hardware the
+   Import games screen found `PlaydenSmoke` at
+   `/data/playden-import/PlaydenSmoke` and listed its nested `Smoke.exe`.
+   Selecting it then failed with “Playden's list of imported games could not be
+   read.” The matching `install.log` says `imports load failed` at startup and
+   `imports are not loaded` on Add. Scanning works; adding is still blocked by
+   the import store load and needs investigation. The smoke folder is test data,
+   not a real game.
+
+4. Playden 02.74 fixed the load. Every `Storage` under the title's data root now
+   calls `AllowTraversableRoot()`: the root the system gives a PS4 title is 0711,
+   and `Storage`'s durable journal path wants the 0700 the private policy
+   demands, so the read failed before it reached the file. Verified on hardware
+   2026-11-12: startup no longer logs `imports load failed`; Import games lists
+   `PlaydenSmoke` with its path (not "could not be read"); Add succeeds
+   (`import added id=bb43f986-d1c9-48e7-8d89-0f83030fedd9
+   folder=playden-import/PlaydenSmoke program=Nested/Smoke.exe`); and "Move to
+   storage" succeeds (`import move renamed from=/data/playden-import/PlaydenSmoke
+   to=/data/PLDN10001/games/local-bb43f986-...`, `import move complete files=1`),
+   with the drop folder left empty and the detail page showing Location: PS4
+   storage. Uninstall then completed the cycle (`import copy uninstalled
+   id=bb43f986-...`): `games/local-bb43f986-...` is gone and `.playden-games`
+   shrank from 286 to 228 bytes. Scan, load, add, move and uninstall all pass on
+   hardware; the Local store gate is done.
+
+   02.74's `/app0/dev.conf` network logging did **not** connect: the package was
+   built with `PS4_DEV_CONF=10.168.2.188:9300` and `ps5logd` was listening, but
+   no connection arrived, so the `durable root private/traversable` probe lines
+   could not be read. The fix is confirmed by behavior instead. Worth chasing
+   before the next run that depends on the network log.
+
+The installed test build is Playden 02.74,
+`IV0000-PLDN10001_00-PLDN100010000000-0274.pkg`, SHA-256
+`421477ec16d6ba1f00d119ed60dba1ec0e43ddcab1432568c9c5c2601a5a01f7` (02.73 was
+`d3bc23f9...`). Its
+package parity gate passed against 02.70. Package hashes, matching UI symbols,
+klog, import logs and the earlier 02.70–02.73 build records are under
+`/home/zpeirce/codex_scratch/playden-test-20261111-postreboot/`; see
+`PROVENANCE.md` there. The Local store fixes are uncommitted in
+`cmake/PlaydenCore.cmake`, `ps4/homebrew_live.cpp`,
+`src/stores/local/drop_folder_access.cpp`, `src/stores/local/scanner.cpp`, and
+their two tests. On Linux the full host preset cannot configure because the
+direct UI build currently supports macOS only; the targeted native-policy
+scanner and drop-folder tests passed.
+
 In the order I would take it:
 
 1. **Remove the first PS4 launcher** — `ps4/ui.cpp`, the page state in
@@ -104,10 +164,11 @@ In the order I would take it:
    only shared services not constructed.
 3. **Recover from a kit change without Recreate bottle**, and stop
    `.set-aside-*` bottles accumulating.
-4. **Exercise with real evidence** (the gates in the parity plan): Cloud sync
-   before and after play, uninstall, Manage installed games, game updates, the
-   Local store — replace `drop_folder_access.cpp`'s `dup` listings first — and a
-   legacy-prefix migration for a game with an existing save.
+4. **Finish the Local store test** — find why the import store cannot load on
+   PS4, then verify Add/remove and copy/move behavior with a controlled folder.
+   After that, exercise the other parity gates: Cloud sync before and after play,
+   uninstall, Manage installed games, game updates, and a legacy-prefix
+   migration for a game with an existing save.
 5. **Offer the PS4 seams upstream** where they are general: the time-text patch,
    and the artwork banner fallback (Steam has no `library_hero.jpg` for older
    games such as Half-Life: Source, and only the cover has a fallback today).

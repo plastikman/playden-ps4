@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <dirent.h>
+#include <filesystem>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -80,12 +81,10 @@ void Close(Frame& frame) {
 }
 
 // Takes `fd`. False (errno set) when the folder can't be listed.
-bool OpenFrame(int fd, std::string relative, int level, Frame* frame) {
-  const int listing_fd = ::dup(fd);
-  DIR* listing = listing_fd >= 0 ? ::fdopendir(listing_fd) : nullptr;
+bool OpenFrame(int fd, const std::filesystem::path& absolute, std::string relative, int level, Frame* frame) {
+  DIR* listing = platform::OpenHeldListing(fd, absolute);
   if (!listing) {
     const int error = errno;
-    if (listing_fd >= 0) ::close(listing_fd);
     ::close(fd);
     errno = error;
     return false;
@@ -192,7 +191,7 @@ FolderScan ScanGameFolder(const std::string& folder_path) {
   std::vector<Frame> stack;
   stack.reserve(kMaxProgramDepth + 1);
   Frame first;
-  if (!OpenFrame(root, {}, 0, &first)) {
+  if (!OpenFrame(root, folder, {}, 0, &first)) {
     scan.error = errno;
     scan.status = StatusForOpen(scan.error);
     return scan;
@@ -217,7 +216,10 @@ FolderScan ScanGameFolder(const std::string& folder_path) {
         }
         Frame next;
         const auto relative = frame.relative.empty() ? name : frame.relative + "/" + name;
-        if (!OpenFrame(child, relative, frame.level + 1, &next)) { ++scan.unreadable; continue; }
+        if (!OpenFrame(child, std::filesystem::path(folder) / relative, relative, frame.level + 1, &next)) {
+          ++scan.unreadable;
+          continue;
+        }
         stack.push_back(std::move(next));  // `frame` is not used after this
         continue;
       }
@@ -325,7 +327,7 @@ CandidateScan ScanImportRoot(const std::string& root_path) {
     return scan;
   }
   Frame frame;
-  if (!OpenFrame(root, {}, 0, &frame)) {
+  if (!OpenFrame(root, Trimmed(root_path), {}, 0, &frame)) {
     scan.error = errno;
     scan.status = StatusForOpen(scan.error);
     return scan;

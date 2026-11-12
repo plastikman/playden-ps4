@@ -4,6 +4,7 @@
 #include "platform/directory_walk.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -19,11 +20,22 @@ namespace fs = std::filesystem;
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #x); std::exit(1); } } while (0)
 
+#if defined(PLAYDEN_TEST_DUP_DIR_EPERM)
+extern "C" int __real_dup(int fd);
+extern "C" int __wrap_dup(int fd) {
+  struct stat info{};
+  if (::fstat(fd, &info) == 0 && S_ISDIR(info.st_mode)) { errno = EPERM; return -1; }
+  return __real_dup(fd);
+}
+#endif
+
 namespace {
 
 struct TemporaryDirectory {
   TemporaryDirectory() {
-    auto pattern = (fs::temp_directory_path() / "playden-local-scanner-XXXXXX").string();
+    const char* scratch = std::getenv("SCRATCH_ROOT");
+    auto pattern = ((scratch ? fs::path(scratch) : fs::temp_directory_path()) /
+                    "playden-local-scanner-XXXXXX").string();
     std::vector<char> writable(pattern.begin(), pattern.end());
     writable.push_back('\0');
     CHECK(::mkdtemp(writable.data()) != nullptr);

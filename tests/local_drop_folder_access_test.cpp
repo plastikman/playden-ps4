@@ -4,6 +4,7 @@
 #include "stores/local/drop_folder_access.h"
 
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,14 @@ using namespace playden::stores::local;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #x); std::exit(1); } } while (0)
 
 namespace fs = std::filesystem;
+#if defined(PLAYDEN_TEST_DUP_DIR_EPERM)
+extern "C" int __real_dup(int fd);
+extern "C" int __wrap_dup(int fd) {
+  struct stat info{};
+  if (::fstat(fd, &info) == 0 && S_ISDIR(info.st_mode)) { errno = EPERM; return -1; }
+  return __real_dup(fd);
+}
+#endif
 namespace {
 // The console's walk (by path) can't read a link, so every link fails it there.
 #if defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5
@@ -41,10 +50,13 @@ bool Has(const std::string& text, const std::string& part) { return text.find(pa
 }  // namespace
 
 int main() {
-  char name[] = "/tmp/playden-drop-folder-XXXXXX";
-  CHECK(mkdtemp(name));
+  const char* scratch = std::getenv("SCRATCH_ROOT");
+  const std::string pattern = ((scratch ? fs::path(scratch) : fs::path("/tmp")) / "playden-drop-folder-XXXXXX").string();
+  std::vector<char> name(pattern.begin(), pattern.end());
+  name.push_back('\0');
+  CHECK(mkdtemp(name.data()));
   // /tmp is a link on macOS; the walk never follows one.
-  const fs::path root = fs::canonical(name);
+  const fs::path root = fs::canonical(name.data());
   const fs::path drop = root / "data/playden-import";
   fs::create_directories(drop);
   CHECK(chmod(drop.c_str(), 0777) == 0);
@@ -228,6 +240,26 @@ int main() {
   // The callback form: empty on success, the sentence otherwise.
   const auto opener = MakeDropFolderOpener(options);
   CHECK(opener("/data/playden-import/Game").empty() && !opener("/data/playden/Game").empty());
+
+  // A copied entry can be pruned even when directory descriptors cannot be duplicated.
+  // Files outside the copy plan and links stay in the drop folder.
+  {
+    const auto copied = drop / "Copied";
+    Write(copied / "owned.txt", 0644);
+    Write(copied / "Sub/owned.bin", 0644);
+    Write(copied / "keep.txt", 0644);
+    CHECK(symlink("keep.txt", (copied / "link").c_str()) == 0);
+    const DropFolderPlanned planned = [](const std::string& relative, const struct stat&) {
+      return relative == "owned.txt" || relative == "Sub/owned.bin";
+    };
+    const auto partial = RemoveDropFolderEntry(drop.string(), "Copied", planned, options.as_root);
+    CHECK(!partial.ok && partial.files == 2 && partial.kept >= 2);
+    CHECK(!fs::exists(copied / "owned.txt") && !fs::exists(copied / "Sub/owned.bin"));
+    CHECK(fs::exists(copied / "keep.txt") && fs::is_symlink(copied / "link"));
+    CHECK(unlink((copied / "link").c_str()) == 0 && unlink((copied / "keep.txt").c_str()) == 0);
+    const auto finished = RemoveDropFolderEntry(drop.string(), "Copied", planned, options.as_root);
+    CHECK(finished.ok && !fs::exists(copied));
+  }
 
   std::error_code ignored;
   fs::remove_all(root, ignored);
