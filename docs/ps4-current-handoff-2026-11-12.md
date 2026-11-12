@@ -5,10 +5,10 @@ Ten commits on `ps4/features-0206`, `ad895ea`..`c1414d3`.
 
 ## Where the port is
 
-Installed and verified on hardware: Playden **02.79**
-(`IV0000-PLDN10001_00-PLDN100010000000-0279.pkg`). Note 02.79 is a **test
-build**: it reports 2 GiB of video memory, an A/B value that proved nothing
-(below). Rebuild at the default before treating it as a baseline.
+Latest build: Playden **02.81** (`…-0281.pkg`) on **Orbis-Win 01.75**
+(`pkgout/wine-app-relocatable`, manifest `app_ver=01.75`), carrying the
+per-page executable-range migration. 02.79 was a throwaway A/B that reported
+2 GiB of video memory and proved nothing; do not use it as a baseline.
 
 What now works that did not yesterday:
 
@@ -78,72 +78,69 @@ than finding them one game at a time:
   game's files: OpenGL"); the recipe can override it. It is not guesswork and
   it got Isaac right.
 
-## Open: Isaac and Hollow Knight are one Orbis-Win problem
+## Hollow Knight: the shadow-memory crash is fixed (Orbis-Win `7df46bd`)
 
-Both are platform-level, with Titan Quest. Neither is a Playden bug, and
-neither is a renderer or capability problem.
+**Two facts from Zak that made this tractable**, and that bound the whole
+problem: Hollow Knight is the **first 64-bit game** to run on Orbis-Win, and it
+**works on PS5**. So this is PS4-only, and 32-bit games never reached it
+because WoW64 maps their images low and in smaller pieces.
 
-**Hollow Knight (367520)** — hangs the console ~8 s into launch, *before any
-game code and before Mono loads*. It is a hang with recovery, not a crash: the
-compositor stalls behind it, the system kills the title after ~30 s and the UI
-is back about two minutes later. Retesting is cheap; no power cycle.
-
-The one hard fact, from the fatal register dump:
+The chain, fully established:
 
 ```
-mmap(addr=0x6ffffb404000, len=0x570000 (5.5 MiB), flags=0x1012 PRIVATE|FIXED|ANON)
-→ 0xa0020327 SYSTEM_DEBUG_RUNTIME_SHADOW_MEMORY_ALLOC_ERROR   (×126, over 113 s)
-r12 = 0x6ffffb974000 = addr + len
+NtMapViewOfSection -> virtual_map_section -> map_image_into_view_impl
+  -> set_vprot -> mprotect_range -> counted_mprotect -> __wine_ps5_mprotect
+  -> migrate a 5.5 MiB executable range, direct memory -> flexible, in ONE request
+  -> 0xa0020327 SYSTEM_DEBUG_RUNTIME_SHADOW_MEMORY_ALLOC_ERROR
 ```
 
-This is the **same class** as `docs/HANDOFF-2026-10-26.md`'s 1062 finding —
-`0xc0000` at `0x6ffffff30000`, flags `0x1012` — already recorded there as *"the
-full flexible-mapping fallback is not viable on this PS4 runtime"*. Per-page
-(16 KiB) flexible mappings do work, so there is a size threshold worth finding
-between 16 KiB and 768 KiB.
+**The shadow pool is exhausted by cumulative bytes, not by request size.** A
+first attempt split the request into 256 KiB pieces; it did not fix anything
+but it measured the limit exactly — seven pieces (1.75 MiB) landed and the
+eighth failed, with `rsi` showing the chunk size, `rdi` the cursor and
+`r13`/`r12` the original range. That ruled chunking out, and the chunking was
+reverted.
 
-**The caller is a PE image mapping.** With the correct symbols:
+The fix: above `PW_PS4_EXEC_MIGRATE_RANGE_MAX` (256 KiB) a range falls to the
+existing per-page path, which the surrounding code already calls "the proven
+per-page behavior". Measured on hardware with 02.81 / Orbis-Win 01.75:
 
-```
-__wine_syscall_dispatcher
-NtMapViewOfSection          virtual.c:7368
-virtual_map_section         virtual.c:4198
-map_image_into_view_impl    virtual.c:3882
-set_vprot                   virtual.c:2512
-counted_mprotect            virtual.c:229
-```
+| | before | after |
+|---|---|---|
+| `SHADOW_MEMORY_ALLOC_ERROR` | 126 | **0** |
+| compositor timeouts | 22 | **0** |
+| survives | ~8 s then a 113 s hang | **minutes** |
+| `exec-range-per-page` | — | 17 ranges, `0x44000`–`0x90000`, all `prot=0x5` |
 
-The guest maps a 5.5 MiB PE image at a fixed address; `mono-2.0-bdwgc.dll` is
-almost exactly that size, which fits Hollow Knight being the only Mono game
-tested.
+**Still open: Hollow Knight now hangs later.** It reaches thread creation
+(`supplied stack=…`) and then emits **zero** guest records, with no
+`play finished`. A different stopping point, not this one. A fresh run with a
+healthy receiver should capture the whole startup.
 
-⚠ **Symbolize against the ELF that built the shipped PRX.** There are two Wine
-trees with different `ntdll.shared.elf`:
-`worktrees/playden-ps4-0170/.deps/wine-ps5/prx/` (2026-11-11, **the one 0173
-ships**) and `prospero-win/.deps/wine-ps5/prx/` (2026-11-04). Using the wrong
-one produced a plausible but entirely fictitious backtrace
-(`set_page_vprot_exec_write_protect`, `__wine_ps5_wait_for_exec_migration`,
-`anon_mmap_fixed`) and sent a whole investigation down an exec-migration path
-that never ran — which the absence of any `exec-migrate` record should have
-flagged sooner. Both have text base 0, so offsets map directly either way and
-nothing warns you.
+**Isaac (250900)** — Zak found `--luaheapsize=0` stops it dying; it then runs
+without crashing but the screen stays black. Note Isaac never produced a single
+`SHADOW_MEMORY_ALLOC_ERROR`, so that was always a different failure from Hollow
+Knight's, even though both are large-allocation stories. With the crash gone,
+Isaac is now a **rendering** problem, which is where `opengl-zink` finally gets
+a chance to matter. Worth checking whether Zink's `opengl32.dll` actually
+reached its bottle (the capability only exists from 02.78, so it may need a
+repair).
 
-Also note `trace_vm_api()` only fills a ring buffer a fault handler later
-dumps, so a call that never returns is never recorded. That is why `api-mmap`
-and `map-fault-history` show 0 records for the fatal mapping. Immediate
-`sceKernelDebugOutText` is required to trace a call that can kill the process.
+## Tooling: do not trust the klog receiver
 
-**The fix under test** (Orbis-Win `src/native/pw_wine_dmem_glue_ps4.c`): large
-`MAP_FIXED|MAP_ANON` requests are now placed in 256 KiB pieces
-(`PW_SHADOW_SAFE_CHUNK`) by `mmap_fixed_anon_chunked()`, with an immediate
-`big-fixed-anon begin/end` klog line naming address, size, flags and caller.
-The range migration's replacement mapping uses the same helper, since it has
-the same hazard.
+It **silently stalled three times** on 2026-11-12, each time with an
+established socket to `:3232`, so `ss` showed it healthy while it captured
+nothing. It cost the first Hollow Knight crash and a whole startup trace. Check
+that the **file has grown** in the last N seconds, not that the socket exists,
+and re-check it immediately before any launch worth capturing.
 
-**Isaac (250900)** — `played_s=24` on every build. Opens a window with the
-correct title and version, never paints, exits. Its only discriminator against
-a working game is 80 × `exec-protect-verify` (HL2: 0) — the same
-executable-memory subsystem. Needs Orbis-Win work, not settings.
+Two related traps, both cost time today:
+
+- `trace_vm_api()` fills a ring buffer a fault handler dumps later, so a call
+  that kills the process is **never traced**. Use `sceKernelDebugOutText`
+  directly to trace anything that can be fatal.
+- A guest record's timestamp can be the time of a **buffered flush**, not when
+  it happened. 205 records sharing one timestamp is a flush, not a burst.
 
 ## Dead ends — do not re-walk these
 
