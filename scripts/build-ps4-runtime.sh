@@ -238,6 +238,12 @@ mkdir -p "$PREFIX/drive_c/Games"
 USER=prospero LOGNAME=prospero WINEARCH=win64 WINEPREFIX="$PREFIX" WINEDEBUG=-all \
     WINEDLLOVERRIDES='winemenubuilder.exe=d;mshtml=;mscoree=' \
     "$WINE" wineboot --init
+# The PS4 kit view advertises PS5 audio when wineps5.prx is staged. Recipes such as HL2's
+# require the matching Wine driver selection in the template bottle too; the game bottles are
+# cloned from this prefix and recipe requirements are admission checks, not per-game registry
+# mutations. Keep the capability and the template registry in sync.
+USER=prospero LOGNAME=prospero WINEARCH=win64 WINEPREFIX="$PREFIX" WINEDEBUG=-all \
+    "$WINE" reg add 'HKCU\Software\Wine\Drivers' /v Audio /t REG_SZ /d ps5 /f
 for dll in $DXVK_DLLS; do
     cp "$DXVK_262_DIR/$dll.dll" "$PREFIX/drive_c/windows/syswow64/$dll.dll"
     cp "$DXVK_262_X64_DIR/$dll.dll" "$PREFIX/drive_c/windows/system32/$dll.dll"
