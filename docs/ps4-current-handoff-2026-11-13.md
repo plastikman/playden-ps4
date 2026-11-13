@@ -150,3 +150,24 @@ the warning disposition are under
 Installing 02.87 changes the runtime kit ID. Treat existing game kit markers
 as stale and follow Playden's update/recreate prompts before testing HL2.
 The klog, coredump, PLDN10001 and ps5log watchers remain armed.
+
+## Follow-up: sampler opt-in test (2026-11-13)
+
+A controlled test package using Wine patch 1075 and the newer PS4 memory glue
+with the periodic guest signal sampler disabled by default was built and uploaded
+as `IV0000-PLDN10001_00-PLDN100010000000-sampler-opt-in.pkg`. Its SHA-256 is
+`6d77b7d1126065e4b9b6d3685684f1894d0faa0aa2226ed9bd38f3efdc509b8a`;
+console readback matched. It retains Playden 02.87 version metadata and the
+`PLDN10001-02.87-pw47f0cef` runtime marker. Parity passed with zero failures,
+and package validation passed. The NTDLL baseline warning covers six diagnostic
+strings omitted by the 02.03-based Wine source used for this controlled test.
+
+The user confirmed Half-Life 2 and Mafia work with this package, after recreating
+Mafia's bottle. Mafia launched at 10:32 using descriptor `steam-40990`, native
+`wow64native.dll`, and session `889256d9-3b0c-4443-ae4d-487a8e97a182`; runtime
+logs are in `/home/zpeirce/codex_scratch/playden-test-20261111-postreboot/ps5logd-supervisor-0273.log`.
+HL2's heartbeat reported `guest_samples=0` while frames were presented. The
+sampler change is committed on Slackian branch `codex/ps4-sampler-opt-in` at
+`f318960`; Wine patch 1075 is on `codex/v006-playden-test-1075` at `e3e9c6e`.
+These results support the sampler as a cause of the previous signal-path crash;
+they do not independently prove the exact signal transition.
