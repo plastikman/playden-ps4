@@ -359,6 +359,7 @@ set(PLAYDEN_PS4_LIVE_SOURCES
     platform/ps5/title_database.cpp platform/ps5/title_registry.cpp platform/ps5/title_remover.cpp
     platform/ps5/title_runtime.cpp
     runtime/dotnet_heap.cpp runtime/game_install.cpp runtime/install_service.cpp runtime/launch_service.cpp
+    runtime/online_session.cpp runtime/steam_client_install.cpp runtime/steam_library.cpp
     runtime/layout_migration.cpp runtime/leftover_titles.cpp runtime/package_installer.cpp
     runtime/publication_backup.cpp runtime/publication_contract.cpp runtime/publication_transaction.cpp
     runtime/self_heal.cpp runtime/session_reconciler.cpp runtime/session_storage.cpp runtime/settings_publication.cpp
