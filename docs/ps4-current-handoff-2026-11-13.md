@@ -116,3 +116,37 @@ is non-zero and retry HL2. The fresh klog and coredump watchers remain armed und
 - Moving the runtime commit invalidates existing game installs — nine games prompted for
   a kit update and HL2 needed a full Recreate. That is a release decision, not a
   packaging detail.
+
+## Follow-up: Playden 02.87 descriptor runtime build (2026-11-13)
+
+Built a Playden package with the committed Orbis-Win Playden runtime group from
+`codex/v006-playden-runtime` at `47f0cefb4e5c39aad0e60e7a3ba1dfcc50376adf`.
+The app PRX was compiled on Slackian from the recovered v0.0.6 Wine build
+snapshot. The Playden source was `ps4/upstream-ports` at `73a7e5b` (the
+02.86 handoff commit); no Playden source code changed for this package.
+
+The 02.87 package uses the exact Orbis-Win 02.10 runtime payload from
+`candidate-0210`, matching the 02.86 package. It changes the relocated app PRX
+and kit/version metadata only. The Playden UI PRX, icon, Wine template and
+`Audio=ps5` registry setting were preserved byte-for-byte from 02.86. The new
+kit ID is `orbis-win-ps4-47f0cefb4e5c-1ef8823a3838`.
+
+The installer is
+`IV0000-PLDN10001_00-PLDN100010000000-0287.pkg`, SHA-256
+`5ddde23aa575f7f3dafefbecb2be5fb5b20343a54b86366942a1043875cda324`,
+1,001,783,296 bytes. Package parity against 02.86 exited 0 with no missing or
+added payload files; `PkgTool.Core pkg_validate` passed all 27 checks. The
+package was uploaded to `/data/pkg/` and read back; the console copy matched
+the local SHA-256 exactly. It has **not yet been installed or tested**.
+
+The parity report warns that ntdll/wineserver export and signal-mask checks
+were skipped because their matching unstripped 02.10 ELFs are unavailable.
+Those PRXs were reused unchanged from the 02.86 baseline; their package copies
+match byte-for-byte. The 32-bit `kernelbase.dll` contains 25 `PW_EXCEPTION32`
+strings, and the no-debugger path reachability check passes. Build reports and
+the warning disposition are under
+`/home/zpeirce/codex_scratch/playden-runtime-build-0287/`.
+
+Installing 02.87 changes the runtime kit ID. Treat existing game kit markers
+as stale and follow Playden's update/recreate prompts before testing HL2.
+The klog, coredump, PLDN10001 and ps5log watchers remain armed.
