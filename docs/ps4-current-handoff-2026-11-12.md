@@ -426,3 +426,42 @@ payload and web page, including its sort key. The PS4 page has four remaining
 columns (the upstream page has an extra Store column), so the empty-row span is
 four here. API fixture data no longer supplies the removed field. No tests or
 builds were run.
+
+## Orbis-Win v0.0.6 artifact / Playden 02.83 build
+
+The successful Orbis-Win CI artifact is run `43354514410` (`work-20261112`,
+root `0e11c00`, `prospero-win` `3cca6a0`). Its Orbis-Win package is
+`IV0000-GLDS10043_00-GLDS100430000000.pkg`, app version 02.03, SHA-256
+`5d606d16bf5be85bcc351f334e849bc6a24a0ec15783dc39322e7f310baa77a3`. The CI
+package validation and Orbis-Win parity report pass.
+
+Built Playden **02.83** from `ps4/upstream-ports` at `e37433e`, using that
+artifact, the matching host Wine and DXVK 2.6.2. Installer:
+`IV0000-PLDN10001_00-PLDN100010000000.pkg`, SHA-256
+`2e3dc11a5ec8d851d1f8578a3a44364c5a99f3579a177f884d2dffc16e1fbf13`. The
+build added three missing PS4 CMake source entries across commits `847537c`,
+`ace7aa7`, and `e37433e` (Steam friends, online-session/client/library helpers,
+and the `pw_steam_view` helper).
+
+The package parity command against the preserved Playden 02.82 stage exited 0.
+It reported two PS4 baseline strings absent from this runtime:
+`big-fixed-anon` and `exec-range-per-page`. The latter is the known per-page
+executable-range fix from Orbis-Win `7df46bd`; the artifact's build provenance
+says that fix was reverted because Fallout: New Vegas faulted at `0x1f88`.
+The local check also could not match runtime PRX build symbols because the CI
+artifact contains the package but not its unstripped ELF intermediates. The
+CI parity report independently passes its exact PRX export and signal-mask
+checks; it does not account for the dropped 02.82 behavior.
+
+The generated kit view advertises only `input-keyboard-stick`,
+`input-touchpad`, `opengl-zink`, `settings-dxvk-config`, and `title-any-id`.
+It does **not** advertise `helper-process`, `title-notify`, or
+`steam-library-path`; Steam network features therefore remain unavailable
+through the kit gate. The Playden package contains the Steam host payload, but
+that does not supply the missing Orbis-Win capabilities.
+
+The 02.83 package has not been uploaded or installed. Before installing, either
+use an Orbis-Win artifact that restores the known 02.82 behavior and advertises
+the required Steam capabilities, or explicitly scope the install as an A/B
+that accepts the reverted per-page fix and records that Steam network play
+will remain gated off. No gameplay launch or tests were run.
