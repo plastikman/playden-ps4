@@ -462,10 +462,11 @@ that does not supply the missing Orbis-Win capabilities.
 
 At Zak's direction, the validated 02.83 installer was uploaded to the PS4 at
 `/data/pkg/IV0000-PLDN10001_00-PLDN100010000000.pkg` for the broad integration
-test. GoldHEN FTP reports the expected size, 1,001,717,760 bytes, and the local
-PKG validates. The package has not been installed yet. The available
-`ps5mcp install` path requires Web File Manager on port 8888, which is not
-running on this PS4; the installer is staged for the console's HDD package
-source. This test knowingly includes the missing `exec-range-per-page` fix and
-does not enable Steam network play because the required capabilities are
-absent. No gameplay launch or tests were run.
+test. GoldHEN FTP reported the expected size, 1,001,717,760 bytes, and the
+local PKG validates. The console log then confirmed `app_version='02.83'`,
+`interactive launcher shell displayed`, and runtime startup loaded 8 records
+with services up at 18:47 on 2026-11-12. The matching log is
+`/home/zpeirce/codex_scratch/playden-test-20261111-postreboot/ps4-klog-20261112-082143-watch.log`.
+This confirms the launcher UI starts; no game has been launched yet. This test
+knowingly includes the missing `exec-range-per-page` fix and does not enable
+Steam network play because the required capabilities are absent.
