@@ -336,6 +336,7 @@ add_library(playden_ps4_publication STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/orbis-win/native/pw_title_publication_native.c"
     "${PW_SRC}/src/pw_title_publication.c"
     "${PW_SRC}/src/pw_title_launch.c"
+    "${PW_SRC}/src/pw_steam_view.c"
     "${PW_SRC}/src/pw_game_profile.c"
     "${PW_SRC}/src/pw_wine_launch.c"
     "${PW_SRC}/src/pw_publication_sha256.c"
