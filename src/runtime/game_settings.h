@@ -11,6 +11,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include "platform/console_name.h"
 
@@ -30,9 +31,11 @@ namespace playden::runtime {
 // arguments the game needs and the library overrides each have a row the player can change.
 
 // Where the Game settings sheet lists a setting, in sheet order. Button mapping and Controller tuning are submenus of
-// Controls; Compatibility (with its Graphics and Windows parts) and Advanced start collapsed.
+// Controls; Compatibility (with its Graphics, Steam and Windows parts) and Advanced start collapsed.
+// In the order the Game settings sheet lists them.
 enum class SettingGroup {
   kGame,
+  kOnline,  // Online play (needs online-steam); without it these rows go under Compatibility › Steam
   kDisplay,
   kControls,
   kButtonMapping,
@@ -40,6 +43,7 @@ enum class SettingGroup {
   kSound,
   kCompatibility,
   kGraphics,
+  kSteam,
   kWindows,
   kAdvanced,
 };
@@ -60,6 +64,10 @@ struct KitCapabilities {
   bool title_any_id = false;     // one title shell for every game; no fixed set of titles
   // The title finds a USB game's drive when it starts, so it can be published naming no mount.
   bool game_root_usb_search = false;
+  // [steam] install_dir: the title shows a Steam game in steamapps\common (kKitSteamLibraryPath), when the game's Steam
+  // library folder row is Steam's folder. Counts only for a title that runs this kit's runtime, like display_120hz.
+  bool steam_library_path = false;
+  bool steam_library_path_needs_update = false;
   bool game_root_unowned = false;  // games start from drives that record no file owners (exFAT)
   bool bottle_profile_shared = false;  // the bottle's 4 folders to its user profile may be 0711
   bool opengl_zink = false;        // OpenGL games draw through Mesa's Zink, not the PS5 OpenGL SDK
@@ -103,6 +111,10 @@ struct KitCapabilities {
   bool environment_file_budgets_needs_update = false;
   bool launcher_mode = false;  // [launcher]: the game starts through a launcher (kKitLauncherMode)
   bool launcher_mode_needs_update = false;  // the kit has it, but the game's title still runs an older runtime
+  // [launcher] chain = off: holding the touchpad swaps to a second preset, without a launcher (kKitTouchpadSwitch).
+  // Counts only for a title that runs this kit's runtime, like launcher_mode.
+  bool touchpad_switch = false;
+  bool touchpad_switch_needs_update = false;
   bool display_framegen_needs_update = false;
   // [input] mode = playstation: the game finds the DualSense as a DualShock 4 on its HID bus, and no XInput
   // controller. Counts only for a title that runs this kit's runtime, like display_120hz.
@@ -112,6 +124,14 @@ struct KitCapabilities {
   bool input_touchpad = false;
   // [input] keyboard_stick: a stick sends the four direction keys, W A S D by default (prospero-win #736).
   bool input_keyboard_stick = false;
+  // The title shows a PS5 notification a program asks for and answers an invite with L3 + R3 (kKitTitleNotify), so
+  // Game invites can ask or only show. Counts only for a title that runs this kit's runtime, like display_120hz.
+  bool title_notify = false;
+  bool title_notify_needs_update = false;
+  // The title runs a second program beside the game ([helper], kKitHelperProcess): the Steam host of Steam features =
+  // Online. Counts only for a title that runs this kit's runtime, like display_120hz.
+  bool helper_process = false;
+  bool helper_process_needs_update = false;
 };
 
 struct SettingChoice {
@@ -124,7 +144,9 @@ struct SettingDefinition {
   std::string id;
   std::string label;
   std::string effect;       // one-line description under the name
-  std::string also_called;  // technical names: profile keys, DXVK options
+  // Names a player finds in Wine, DXVK or Steam tips online (WINEDEBUG, dxgi.maxFrameRate, a Steam launch option);
+  // empty for Playden's own settings, whose profile keys mean nothing outside Playden.
+  std::string also_called;
   SettingGroup group = SettingGroup::kGame;
   int phase = 1;            // roadmap phase that ships it
   ApplyMode apply = ApplyMode::kNextLaunch;
@@ -141,10 +163,21 @@ const SettingDefinition* FindSetting(std::string_view id);
 // (EffectiveValue::available). Button rows live under Button mapping.
 bool SettingShown(const SettingDefinition& definition, const KitCapabilities& kit);
 
+// online-steam in features.txt (app/experimental_features.h), set once at startup before any settings are evaluated.
+// Off: Steam features has no Online choice, Steam sign-in and Steam network are not listed, and the emulator stays off
+// the network.
+void SetOnlineSteamEnabled(bool enabled);
+bool OnlineSteamEnabled();
+// Whether a setting's choice is offered at all (Steam features = Online only with online-steam).
+bool SettingChoiceOffered(std::string_view id, std::string_view value);
+
 // The 17 controller buttons prospero-win binds, as setting ids "button.<name>".
 // The rows a controller preset sets, by preset id: setting id → value.
 const std::map<std::string, std::map<std::string, std::string>>& ControllerPresetInputs();
 const std::map<std::string, std::map<std::string, std::string>>& ControllerPresetButtons();
+// Touchpad hold's menu preset, the [launcher] buttons it writes: the Mouse preset's clicks, the D-pad as keyboard
+// arrows and Triangle as Esc.
+const std::map<std::string, std::string>& TouchpadMenuButtons();
 const std::vector<std::string>& ProsperoButtons();
 
 struct LaunchEntry {
@@ -222,6 +255,8 @@ struct GameRecipe {
   // Files Playden ships in runtime/recipes/files/<recipe id>, placed at these paths in the game folder when its files
   // are prepared, for a game that can't run on the console without them (runtime/recipe_files.h). Shipped recipes only.
   std::vector<std::string> game_files;
+  // Files an earlier recipe placed with game_files, and their shipped SHA-256; remove only Playden's unchanged copy.
+  std::vector<std::pair<std::string, std::string>> retired_game_files;
   // What the kit's template bottle must provide ("audio": "ps5"); see UnmetRecipeRequirements.
   std::map<std::string, std::string> requirements;
   // A community recipe's identity besides its id: the SHA-256 (64 lowercase hex) of its file as
@@ -371,6 +406,14 @@ struct EffectiveSettings {
   bool input_touchpad = false;
   // The runtime takes [input] keyboard_stick (KitCapabilities::input_keyboard_stick).
   bool input_keyboard_stick = false;
+  // The title's runtime shows a program's notifications (KitCapabilities::title_notify): Game invites Ask and
+  // Only show need it.
+  bool title_notify = false;
+  bool title_notify_needs_update = false;
+  // The title's runtime runs the Steam host beside the game (KitCapabilities::helper_process): Steam features = Online
+  // needs it.
+  bool helper_process = false;
+  bool helper_process_needs_update = false;
 };
 
 // The launch entry id of a program the player chose from the game folder.
@@ -378,6 +421,17 @@ inline constexpr const char* kProgramEntryId = "program";
 // Override key prefix for "Change anyway" on a row the recipe locks: "unlock.<setting id>" = "on".
 inline constexpr const char* kUnlockPrefix = "unlock.";
 bool IsUnlockKey(std::string_view key);
+// Override key prefix for the game's own Playden default of a row: "default.<setting id>" = value. Playden sets it, not
+// the player (a Steam game installed by this Playden: Steam library folder = Steam's folder), so the row shows the value
+// as Playden's default (ValueSource::kPlayden): not a change, never shared or put in a preset, and kept by Reset and by
+// a switch of preset or recipe. Only the rows in IsGameDefaultKey take one.
+inline constexpr const char* kGameDefaultPrefix = "default.";
+bool IsGameDefaultKey(std::string_view key);
+// The game's own defaults among its overrides (the IsGameDefaultKey entries), which a baseline of the game's settings
+// without the player's changes keeps.
+std::map<std::string, std::string> GameDefaultOverrides(const std::map<std::string, std::string>& overrides);
+// Whether the overrides hold a choice of the player's: anything but the game's own defaults.
+bool HasPlayerOverrides(const std::map<std::string, std::string>& overrides);
 
 struct SettingsError {
   std::string setting_id;
@@ -410,7 +464,9 @@ std::map<std::string, std::string> PresetSettingsFromGame(const GameRecipe& reci
                                                           PresetCapture capture);
 
 // Why one choice of a row cannot apply with the other effective values (Frame limit 120 and 40 need 120 Hz output,
-// Controller PlayStation a kit with input-playstation), or empty when it can. BuildEffectiveSettings turns such a saved choice into the Playden default, with this reason.
+// Controller PlayStation a kit with input-playstation, Game invites Ask and Only show a runtime with title-notify), or
+// empty when it can. BuildEffectiveSettings turns such a saved choice into the Playden default (Game invites: Ask and
+// Only show into Off), with this reason.
 // On a title that still runs an older runtime, a choice that needs the kit's (Frame limit 120 with 120 Hz output
 // chosen) is not unavailable: it waits for the update (SettingChoiceWaitsForUpdate).
 std::string SettingChoiceUnavailable(const EffectiveSettings& settings, std::string_view id, std::string_view value);
@@ -432,6 +488,10 @@ struct ProfileTarget {
   std::string install_root;  // console path of the game files
   // What the profile names instead, when not that: a USB game's search form (/mnt/usb/<folder>).
   std::string published_root;
+  // A Steam game's folder in steamapps\common, for a title whose runtime shows it there ([steam], kit capability
+  // steam-library-path); empty: the game is seen at its real path only. The profile names it only while the game's
+  // Steam library folder row is Steam's folder.
+  std::string steam_install_dir;
 };
 
 // The full prospero profile: [application], [display], [input] and [debug].
@@ -485,7 +545,8 @@ bool IsGeneratedRecipeId(std::string_view id);
 // program's files: arguments, graphics and what those imply. Its id, version and programs stay, and what the player
 // changed is kept apart from the recipe, so it still wins. False when nothing changed, also when the program can't be
 // read now (a drive not plugged in): the next Play tries again. A 32-bit recipe set up before Watcom programs got
-// Translator takes only that default when its program is one (WatcomProgram).
+// Translator takes only that default when its program is one (WatcomProgram). A generated recipe whose first program
+// is Steam's and only starts the game can be refreshed to put the game's own program first.
 bool RefreshRecipeDefaults(const std::string& install_root, const KitCapabilities& kit, GameRecipe* recipe);
 // A community recipe (docs/community-recipes.md): community-<store>-<key>-<slug>, or community-<store>-<key> as Export
 // as recipe writes it before the author picks a slug (CommunityRecipeRefusals refuses that form). Only the shape is
@@ -731,6 +792,8 @@ CommunityRecipe BuildSettingsOnlyRecipe(const CommunityRecipe& base, const Effec
 // The rows that choose the program or how it starts, which a settings-only recipe takes from Playden's recipe: a
 // player's change to one makes a share name its program.
 bool IsProgramRow(std::string_view id);
+// Player-specific rows are not included in community recipes or counted as share changes.
+bool IsPersonalSettingRow(std::string_view id);
 // A community recipe as the recipe of one installed game: recipe.app_id its runtime number, recipe.game the game.
 void BindCommunityRecipe(CommunityRecipe* community, const GameId& game, std::uint32_t runtime_number);
 // A settings-only recipe (IsSettingsOnlyRecipe) is written without the fields Playden fills in, as format_version 2.
@@ -819,6 +882,9 @@ inline constexpr const char* kKitDisplayFpsCounter = "display-fps-counter";
 // The title reads [launcher]: the exec chain only for a game that asks for it, a second input for the first
 // program, and the touchpad hold that swaps them. Runtimes without it refuse a profile with the section.
 inline constexpr const char* kKitLauncherMode = "launcher-mode";
+// The title reads [launcher] chain = off: no exec chain, the game starts on [input], and holding the touchpad swaps to
+// the [launcher] lines and back (Touchpad hold). Runtimes without it refuse the profile key.
+inline constexpr const char* kKitTouchpadSwitch = "touchpad-switch";
 // The title takes [input] mode = playstation: the game's Wine finds the DualSense as a wired DualShock 4 on its HID
 // bus, with the controller's own reports, and XInput reports no controller. Runtimes without it refuse the value.
 inline constexpr const char* kKitInputPlaystation = "input-playstation";
@@ -828,6 +894,18 @@ inline constexpr const char* kKitInputTouchpad = "input-touchpad";
 // The title takes [input] keyboard_stick = left_stick|right_stick: one stick sends W A S D (prospero-win #736), for
 // keyboard games that walk with the keys and look with the mouse. Runtimes without it refuse the key.
 inline constexpr const char* kKitInputKeyboardStick = "input-keyboard-stick";
+// The title shows a PS5 notification a program in the game's bottle asks for, and while that program holds an invite
+// open, L3 + R3 answers it without reaching the game or opening the in-game menu. Without it Game invites offers only
+// Join at once and Off.
+inline constexpr const char* kKitTitleNotify = "title-notify";
+// The title reads [helper]: a second Windows program beside the game, in a local process on the same Wine server, and
+// holds the game until that program is ready. The Steam host (Steam features = Online) runs this way. Runtimes without
+// it refuse a profile with the section.
+inline constexpr const char* kKitHelperProcess = "helper-process";
+// The title reads [steam] install_dir and shows a Steam game to Wine in C:\Program Files (x86)\Steam\steamapps\common,
+// where some games look for themselves before they use Steam (The Talos Principle). Runtimes without it refuse a
+// profile with the section.
+inline constexpr const char* kKitSteamLibraryPath = "steam-library-path";
 const std::vector<std::string>& SettingsKitCapabilityNames();
 
 // Settings gates from a verified kit's capabilities. bottle_access: the adapter can edit the
@@ -837,9 +915,12 @@ KitCapabilities KitCapabilitiesFromManifest(const std::vector<std::string>& capa
 // The installed kit's capabilities for one game's title. A prepared title keeps its own copy of the runtime until
 // Update, so a capability that adds profile keys counts only when the title runs this kit's runtime
 // (title_runtime_current: the title's owner markers name this kit, PackageInstaller::TitleCurrent). Otherwise
-// display_120hz, profile_version_2, input_rumble, display_framegen, display_fps_counter and input_playstation are off
-// and their _needs_update say why.
+// display_120hz, profile_version_2, input_rumble, display_framegen, display_fps_counter, input_playstation,
+// touchpad_switch and title_notify are off and their _needs_update say why.
 KitCapabilities KitForTitleRuntime(KitCapabilities kit, bool title_runtime_current);
+// Whether any capability the kit has counts only for a title on its runtime: whether KitForTitleRuntime would turn
+// something off for an older title. Reading the title's markers is worth it only then.
+bool KitDependsOnTitleRuntime(const KitCapabilities& kit);
 
 // Everything one game's settings put on disk for its next launch.
 struct SettingsLaunchPlan {
@@ -899,6 +980,11 @@ bool LoadGameSettingsFile(const std::string& path, std::map<GameId, GameSettings
                           std::string* reason);
 bool SaveGameSettingsFile(const std::string& path, const std::map<GameId, GameSettingsRecord>& records,
                           std::string* reason);
+// Without online-steam, a game's Steam features = Online, its Steam sign-in and Game invites go back to the game's
+// default, so Online has to be chosen again once the feature is back. True when the record changed.
+bool DropOnlineSteamSettings(GameSettingsRecord* record);
+// The same for every game in the file, saved only when one changed. *changed counts the games.
+bool DropOnlineSteamSettingsFile(const std::string& path, std::size_t* changed, std::string* reason);
 // One-time import from the legacy approved state tree into an already-created
 // private settings root. The owned legacy file must be 0600/0644; the private
 // destination must be absent and is published as 0600. The source is preserved.

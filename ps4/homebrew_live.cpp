@@ -22,15 +22,21 @@
 #include "installs/install_record.h"
 #include "library/cache.h"
 #include "runtime/game_probe.h"
+#include "runtime/game_settings.h"
 #include "runtime/artifact_hash.h"
 #include "runtime/private_directories.h"
 #include "runtime/settings_storage.h"
 #include "runtime/steamworks.h"
+#include "runtime/title_root.h"
 #include "runtime_ps4/kit_ps4.hpp"
 #include "runtime_ps4/legacy_bottle.hpp"
 #include "wine_runtime.h"
 #include "steam/backend/auth_client.h"
 #include "steam/backend/cm_app_details.h"
+#include "steam/backend/cm_client.h"
+#include "steam/backend/cm_friends_source.h"
+#include "steam/backend/cm_messages.h"
+#include "steam/backend/http_client.h"
 #include "steam/backend/download_server_source.h"
 #include "steam/backend/entitled_library.h"
 #include "steam/backend/library_client.h"
@@ -38,6 +44,8 @@
 #include "steam/backend/steam_install_runner.h"
 #include "steam/install_volumes.h"
 #include "steam/local_session_repository.h"
+#include "steam/secret.h"
+#include "steam/friends_service.h"
 #include "stores/local/copy_runner.h"
 #include "stores/local/library_source.h"
 #include "update/version.h"
@@ -56,6 +64,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <strings.h>
 
 #ifndef PLAYDEN_DEV_BUILD
 #define PLAYDEN_DEV_BUILD 0
@@ -331,6 +340,9 @@ struct LiveServices::State {
     // Declaration order is destruction order in reverse, as in host.cpp.
     std::unique_ptr<playden::Storage> auth_storage;
     std::shared_ptr<playden::steam::CmSharedSession> steam_cm;
+    std::unique_ptr<playden::steam::CmClient> friends_cm;
+    std::unique_ptr<playden::steam::CmFriendsSource> friends_source;
+    std::unique_ptr<playden::steam::FriendsService> friends;
     std::unique_ptr<playden::steam::CmClient> auth_cm;
     std::unique_ptr<playden::steam::AuthClient> auth;
     std::unique_ptr<playden::SessionVault> session_vault;
@@ -403,6 +415,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         playden::app::DefaultExperimentalFeatures(playden::update::CurrentVersion().nightly() || PLAYDEN_DEV_BUILD),
         nullptr);
     simulation.SetCommunityRecipesEnabled(s.features.community_recipes);
+    playden::runtime::SetOnlineSteamEnabled(s.features.online_steam);
 
     probe_directory_identity();
     probe_listing_methods();
@@ -412,13 +425,25 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     const auto settings_file = playden::runtime::PrepareGameSettingsStorage(data, &settings_reason);
     if (!settings_file)
         log_line("private game settings unavailable: " + settings_reason);
+    if (settings_file && !playden::runtime::OnlineSteamEnabled()) {
+        std::size_t dropped = 0;
+        if (!playden::runtime::DropOnlineSteamSettingsFile(settings_file->string(), &dropped, &settings_reason))
+            playden::app::AppendLogLine(log_directory, "launch.log",
+                                        "online Steam settings not reset: " + settings_reason);
+        else if (dropped)
+            playden::app::AppendLogLine(log_directory, "launch.log", "online Steam settings reset for " +
+                                                                        std::to_string(dropped) +
+                                                                        " games: online-steam is off");
+    }
     simulation.SetGameSettingsFile(settings_file.value_or(std::filesystem::path{}));
     if (settings_file)
         for (const auto &line : playden::runtime::MyPresetsLoadLog(
                  simulation.SetMyPresetsFile(playden::runtime::MyPresetsPath(*settings_file))))
             log_line(line);
 
-    s.steam_cm = playden::steam::MakeCmSharedSession();
+    playden::steam::CmSessionOptions steam_cm_options;
+    steam_cm_options.friends = playden::runtime::OnlineSteamEnabled();
+    s.steam_cm = playden::steam::MakeCmSharedSession(steam_cm_options);
     s.auth_storage = TitleStorage(data);
     s.auth_cm = std::make_unique<playden::steam::CmClient>(kCaBundle, *s.auth_storage);
     s.auth_cm->SetOwner("auth");
@@ -471,6 +496,8 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     s.preferences = std::make_unique<playden::PreferencesStore>(*s.library_storage);
     {
         const auto saved = s.preferences->Load().preferences;
+        if (steam_cm_options.friends && saved.steam_invisible)
+            playden::steam::SetCmPersonaState(*s.steam_cm, playden::steam::cm::kPersonaStateInvisible);
         s.download_tuning.downloads_slow_network.store(saved.downloads_slow_network);
         {
             std::lock_guard lock(s.download_tuning.mutex);
@@ -673,6 +700,109 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     };
     runtime_config.runtime_dir = "/app0/homebrew/assets/runtime";
     runtime_config.steamworks_dir = "/app0/runtime/steamworks";
+    runtime_config.online_session = [sessions = s.sessions.get(), storage = s.auth_storage.get()]
+        () -> std::optional<playden::runtime::OnlineSession> {
+        auto loaded = sessions->Load();
+        if (!loaded.ok() || !loaded.value())
+            return std::nullopt;
+        auto &stored = *loaded.value();
+        struct Wipe {
+            playden::StoredSession &session;
+            ~Wipe() {
+                playden::steam::ZeroizeSecret(session.refresh_token);
+                playden::steam::ZeroizeSecret(session.access_token);
+            }
+        } wipe{stored};
+        if (stored.refresh_token.empty())
+            return std::nullopt;
+        const auto device = playden::steam::MakeDeviceIdentity(
+            playden::steam::LoadOrCreateDeviceSeed(*storage));
+        playden::runtime::OnlineSession session;
+        session.steam_id = stored.steam_id;
+        session.account_name = stored.account_name;
+        session.refresh_token = stored.refresh_token;
+        session.machine_name = device.machine_name;
+        session.machine_id = device.machine_id;
+        session.login_id = playden::runtime::BridgeLoginId(device.login_id);
+        session.cell_id = stored.cell_id.value_or(0);
+        return session;
+    };
+    runtime_config.fetch_range = [client = std::make_shared<std::unique_ptr<playden::steam::HttpClient>>()](
+                                     const std::string &url, std::uint64_t offset, std::uint64_t length,
+                                     const std::atomic<bool> &cancel, std::string *error)
+        -> std::optional<std::string> {
+        if (!*client)
+            *client = std::make_unique<playden::steam::HttpClient>(kCaBundle);
+        std::string target = url;
+        for (int hop = 0; hop <= 5; ++hop) {
+            playden::steam::HttpRequest request;
+            request.url = target;
+            request.headers = {{"User-Agent", "Playden"},
+                               {"Range", "bytes=" + std::to_string(offset) + "-" +
+                                             std::to_string(offset + length - 1)}};
+            request.timeout_ms = playden::steam::kMaxHttpTimeoutMs;
+            request.max_response_bytes = static_cast<std::size_t>(length) + 1;
+            const auto response = (*client)->Perform(request, cancel);
+            if (response.status_code == 301 || response.status_code == 302 || response.status_code == 303 ||
+                response.status_code == 307 || response.status_code == 308) {
+                target.clear();
+                for (const auto &[name, value] : response.headers)
+                    if (strcasecmp(name.c_str(), "location") == 0)
+                        target = value;
+                if (target.rfind("https://", 0) != 0) {
+                    *error = "redirected to an address Playden doesn't follow";
+                    return std::nullopt;
+                }
+                continue;
+            }
+            if (!response.ok() || (response.status_code != 206 && !(response.status_code == 200 && offset == 0)) ||
+                response.body.size() != length) {
+                *error = "status " + std::to_string(response.status_code) + " error " +
+                         std::to_string(static_cast<int>(response.error)) + " bytes " +
+                         std::to_string(response.body.size());
+                return std::nullopt;
+            }
+            return std::string(response.body.begin(), response.body.end());
+        }
+        *error = "too many redirects";
+        return std::nullopt;
+    };
+    runtime_config.fetch_text = [client = std::make_shared<std::unique_ptr<playden::steam::HttpClient>>()](
+                                    const std::string &url, std::size_t max_bytes, const std::atomic<bool> &cancel,
+                                    std::string *error) -> std::optional<std::string> {
+        if (!*client)
+            *client = std::make_unique<playden::steam::HttpClient>(kCaBundle);
+        std::string target = url;
+        for (int hop = 0; hop <= 5; ++hop) {
+            if (target.rfind("https://", 0) != 0) {
+                *error = "not an HTTPS address";
+                return std::nullopt;
+            }
+            playden::steam::HttpRequest request;
+            request.url = target;
+            request.headers = {{"User-Agent", "Playden"}};
+            request.timeout_ms = playden::steam::kMaxHttpTimeoutMs;
+            request.max_response_bytes = max_bytes;
+            const auto response = (*client)->Perform(request, cancel);
+            if (response.status_code == 301 || response.status_code == 302 || response.status_code == 303 ||
+                response.status_code == 307 || response.status_code == 308) {
+                target.clear();
+                for (const auto &[name, value] : response.headers)
+                    if (strcasecmp(name.c_str(), "location") == 0)
+                        target = value;
+                continue;
+            }
+            if (!response.ok() || response.status_code != 200) {
+                *error = "status " + std::to_string(response.status_code) + " error " +
+                         std::to_string(static_cast<int>(response.error)) + " bytes " +
+                         std::to_string(response.body.size());
+                return std::nullopt;
+            }
+            return std::string(response.body.begin(), response.body.end());
+        }
+        *error = "too many redirects";
+        return std::nullopt;
+    };
     runtime_config.community_recipe_bytes =
         playden::homebrew::CommunityRecipeBytes(community_objects, s.features.community_recipes);
     runtime_config.log = [log_directory](const std::string &line) {
@@ -754,6 +884,9 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         return written.ok();
     };
     s.runtime_host = std::make_unique<playden::homebrew::RuntimeHost>(std::move(runtime_config));
+    const auto saved_steam_preferences = s.preferences->Load().preferences;
+    s.runtime_host->SetSteamInvisible(saved_steam_preferences.steam_invisible);
+    s.runtime_host->SetSteamOnlineNotice(saved_steam_preferences.steam_online_notice);
     if (!s.runtime_host->Start()) {
         log_line("runtime host could not start");
         s.runtime_host.reset();
@@ -762,6 +895,22 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
                                                                  s.installs.get(), s.cloud.get(), s.runtime_host.get(), auth_log);
     s.services->SetLocalLibrary(local);
     s.services->SetDownloadServers(s.servers.get());
+    if (steam_cm_options.friends) {
+        s.friends_cm = std::make_unique<playden::steam::CmClient>(kCaBundle, *s.library_storage);
+        s.friends_cm->SetOwner("friends");
+        s.friends_cm->SetSharedSession(s.steam_cm);
+        s.friends_source = std::make_unique<playden::steam::CmFriendsSource>(*s.friends_cm, s.steam_cm);
+        s.friends = std::make_unique<playden::steam::FriendsService>(*s.friends_source, *s.sessions);
+        s.friends->SetLog([log_directory](const std::string &line) {
+            playden::app::AppendLogLine(log_directory, "steam-cm.log", line);
+        });
+    }
+    s.services->SetFriends(s.friends.get());
+    s.services->SetSteamPersona([session = s.steam_cm, enabled = steam_cm_options.friends](bool invisible) {
+        if (enabled)
+            playden::steam::SetCmPersonaState(*session, invisible ? playden::steam::cm::kPersonaStateInvisible
+                                                                  : playden::steam::cm::kPersonaStateOnline);
+    });
     s.services->SetStaySignedIn([repository = s.sessions.get(), log_directory](bool stay) {
         const auto moved = repository->SetPersist(stay);
         playden::app::AppendLogLine(log_directory, "auth.log",
@@ -770,6 +919,15 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     });
     s.store_details = std::make_unique<playden::steam::StoreDetailsService>(playden::homebrew::StoreFetch(kCaBundle));
     s.services->SetStoreDetails(s.store_details.get());
+    // "Saved UI data is unavailable" names no file or reason: the log does (ps5.cpp says the same).
+    // Unwired on PS4, the only trace of why was a line the UI PRX happens to send to klog, which is
+    // how the corrupt organization header found on 2026-11-12 stayed invisible in Playden's own logs.
+    s.services->SetShutdownLog([log_directory](const std::string &line) {
+        playden::app::AppendLogLine(log_directory, "launch.log", line);
+    });
+    s.services->SetPersistenceLog([log_directory](const std::string &line) {
+        playden::app::AppendLogLine(log_directory, "launch.log", line);
+    });
 
     if (!s.features.community_recipes) {
         s.services->SetCommunityRecipeCache(community_objects);
@@ -790,6 +948,9 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
             return client->Perform(request, cancel);
         };
         config.log = community_log;
+        config.feature_enabled = [online_steam = s.features.online_steam](const std::string &feature) {
+            return feature == "online-steam" && online_steam;
+        };
         auto keep = std::make_shared<playden::homebrew::CommunityKeepSet>();
         config.referenced = playden::homebrew::CommunityKeepCallback(keep);
         const auto endpoints = config.endpoints;
@@ -805,8 +966,14 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
             return client->Perform(request, cancel);
         };
         sharing_config.log = community_log;
-        sharing_config.logs = playden::web::LogsPaths{log_directory, (data / "homebrew").string(),
-                                                      (data / "kits").string(), data.string()};
+        // ⚠ PS5 shapes: {log_root, "/data/homebrew", <runtime data root>/kits,
+        // "/data/homebrew/<title id>"}. Carrying those literally onto PS4 pointed `homebrew` at
+        // /data/PLDN10001/homebrew and `kits` at /data/PLDN10001/kits, neither of which exists --
+        // the titles live directly under kManagedTitleRoot and the kits under Playden's shared
+        // /data/playden layout, the same mismatch that broke the Local store mount (02.73).
+        sharing_config.logs = playden::web::LogsPaths{log_directory, playden::runtime::kManagedTitleRoot,
+                                                      "/data/playden/kits",
+                                                      playden::runtime::kManagedTitleRoot};
         s.sharing = std::make_unique<playden::homebrew::SharingService>(std::move(sharing_config));
         s.sharing->Start();
         s.services->SetSharing(s.sharing.get());

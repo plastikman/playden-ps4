@@ -52,6 +52,11 @@ std::string FormatDownloadRate(std::optional<std::uint64_t> rate, std::optional<
 }
 
 namespace {
+
+// Steam features = Online on a game the store lists with Valve Anti-Cheat: VAC can ban the account from that game (not
+// from Steam). Named in full, since not every player knows the abbreviation.
+constexpr const char* kVacOnlineWarning =
+    "This game uses Valve Anti-Cheat (VAC). Playing it online could get your account banned from this game.";
 // "Go back to Playden <previous>" is for development: release builds (NDEBUG) don't offer it.
 #ifdef NDEBUG
 constexpr bool kOfferGoBack = false;
@@ -163,6 +168,7 @@ std::string route_name(Route route) {
     case Route::Saves: return "saves";
     case Route::SaveDetails: return "save-details";
     case Route::ManageGames: return "manage-games";
+    case Route::Friends: return "friends";
     }
     return "home";
 }
@@ -710,8 +716,10 @@ std::string BottlePath(std::string path) {
     return path == "." ? std::string() : path;
 }
 
+// Keeps the game's own defaults too (rt::kGameDefaultPrefix): they are Playden's, not the player's.
 void clear_keeping_start_choices(std::map<std::string, std::string>* overrides) {
-    for (auto it = overrides->begin(); it != overrides->end();) it = start_choice(it->first) ? std::next(it) : overrides->erase(it);
+    for (auto it = overrides->begin(); it != overrides->end();)
+        it = start_choice(it->first) || rt::IsGameDefaultKey(it->first) ? std::next(it) : overrides->erase(it);
 }
 
 // "a=n;b=n,b" as its entries, in order.
@@ -726,9 +734,9 @@ std::vector<std::string> split_overrides(const std::string& list) {
     return entries;
 }
 
-// The app ID in an install sheet DLC row's action ("install-dlc-1234"); 0 for anything else.
-std::uint32_t parse_dlc_action(std::string_view action) {
-    constexpr std::string_view prefix = "install-dlc-";
+// The app ID in a DLC row's action ("install-dlc-1234" on the install sheet, "manage-dlc-1234" in Manage DLC); 0 for
+// anything else.
+std::uint32_t parse_dlc_action(std::string_view action, std::string_view prefix = "install-dlc-") {
     if (action.substr(0, prefix.size()) != prefix) return 0;
     const auto digits = action.substr(prefix.size());
     std::uint32_t app = 0;
@@ -741,7 +749,16 @@ std::uint32_t parse_dlc_action(std::string_view action) {
 constexpr const char* kAccountLinkTitle = "Link a Playden account";
 static bool is_account_link_dialog(const ModalEntry& modal) { return modal.id == "confirmation" && modal.title == kAccountLinkTitle; }
 
-bool SheetDecoration(const std::string& key) { return key.rfind("heading-", 0) == 0 || key == "divider"; }
+// Online rows remain reachable when the optional online-steam feature is off, under Compatibility › Steam.
+rt::SettingGroup SheetGroup(const rt::SettingDefinition& definition) {
+    return definition.group == rt::SettingGroup::kOnline && !rt::OnlineSteamEnabled() ? rt::SettingGroup::kSteam
+                                                                                      : definition.group;
+}
+
+// The Game settings summary's lines (summary-*) are text too.
+bool SheetDecoration(const std::string& key) {
+    return key.rfind("heading-", 0) == 0 || key == "divider" || key.rfind("summary-", 0) == 0;
+}
 
 std::string action_label(const std::string& key) {
     static const std::map<std::string, std::string> labels = {
@@ -755,7 +772,7 @@ std::string action_label(const std::string& key) {
         {"cloud-use-local", "Use console saves"}, {"cloud-confirm-account", "Use this account"},
         {"cloud-confirm-account-all", "Upload all"},
         {"saves-delete-confirm", "Delete saves"}, {"manage-saves", "Manage saves"}, {"saves-leftover-confirm", "Remove"}, {"saves-quit-anyway", "Play without syncing"},
-        {"install-confirm", "Install"}, {"install-version", "Version"}, {"install-language", "Language"}, {"install-dlc", "DLC"}, {"install-dlc-all", "All DLC"}, {"install-dlc-done", "Done"}, {"heading-dlc-included", "Included"}, {"heading-dlc-optional", "Optional"}, {"update-confirm", "Download and install"}, {"storage-picker", "Change storage…"},
+        {"install-confirm", "Install"}, {"install-version", "Version"}, {"install-language", "Language"}, {"install-dlc", "DLC"}, {"install-dlc-all", "All DLC"}, {"install-dlc-done", "Done"}, {"manage-dlc", "Manage DLC…"}, {"manage-dlc-apply", "Apply changes"}, {"heading-manage-dlc-installed", "Installed"}, {"heading-manage-dlc-other", "Not installed"}, {"heading-dlc-included", "Included"}, {"heading-dlc-optional", "Optional"}, {"update-confirm", "Download and install"}, {"storage-picker", "Change storage…"},
         {"value-edit", "Edit…"}, {"value-reset", "Reset to recipe"}, {"override-add", "Add an override…"},
         {"unlock-setting", "Change anyway"}, {"export-recipe", "Export as file"}, {"share-recipe", "Share recipe"},
         {"share-send", "Send"}, {"share-send-confirm", "Send"}, {"share-vote", "👍 Vote for it instead"}, {"vote-up", "👍 Good"},
@@ -769,12 +786,12 @@ std::string action_label(const std::string& key) {
         {"share-as-name-edit", "Change your name…"}, {"share-as-account", "Playden account"},
         {"heading-reason", "What went wrong"}, {"heading-report", "Report"}, {"heading-recipe", "Recipe"},
         {"shared-recipe", "Shared recipe"}, {"sharing-reset-confirm", "Reset"}, {"program-scan", "Looking for programs…"},
-        {"preset-picker", "Preset"}, {"game-settings", "Game settings"}, {"game-maintenance", "Maintenance"}, {"run-once", "Run launcher or setup…"}, {"play-detailed-logs", "Play with detailed logs"}, {"run-once-start", "Run once"}, {"game-move", "Move to…"}, {"runtime-check-again", "Check again"}, {"reset-settings", "Reset all to preset"}, {"save-my-preset", "Save as my preset…"},
+        {"preset-picker", "Preset"}, {"game-settings", "Game settings"}, {"game-maintenance", "Maintenance"}, {"run-once", "Run launcher or setup…"}, {"play-detailed-logs", "Play with detailed logs"}, {"run-once-start", "Run once"}, {"game-move", "Move to…"}, {"runtime-check-again", "Check again"}, {"reset-settings", "Reset all to preset"}, {"change-settings", "Change settings…"}, {"heading-your-changes", "Your changes"}, {"save-my-preset", "Save as my preset…"},
         {"my-preset-rename", "Rename…"}, {"my-preset-update", "Update from this game"}, {"my-preset-delete", "Delete…"},
         {"my-preset-delete-confirm", "Delete"}, {"clear-shader-cache", "Clear shader cache"},
         {"section-compatibility", "Compatibility"}, {"section-advanced", "Advanced"}, {"heading-game", "Game"},
-        {"heading-display", "Display"}, {"heading-controls", "Controls"}, {"heading-sound", "Sound"},
-        {"heading-graphics", "Graphics"}, {"heading-windows", "Windows"}, {"heading-sort", "Sort"}, {"heading-filter", "Filter"},
+        {"heading-online", "Online"}, {"heading-display", "Display"}, {"heading-controls", "Controls"}, {"heading-sound", "Sound"},
+        {"heading-graphics", "Graphics"}, {"heading-steam", "Steam"}, {"heading-windows", "Windows"}, {"heading-sort", "Sort"}, {"heading-filter", "Filter"},
         {"divider", ""},
         {"sort-name", "Name"}, {"sort-recent-played", "Recently played"}, {"sort-recent-added", "Recently added"},
         {"sort-playtime", "Playtime"}, {"sort-install-size", "Install size"}, {"filter-installed", "Installed"},
@@ -1723,7 +1740,10 @@ void Simulation::UpdateImportedPrograms(std::map<GameId, std::string> programs) 
 std::map<std::string, std::string> Simulation::reset_overrides(GameId id) const {
     // Reset removes every change of the player's, the program they picked too. An imported game goes back to the
     // program it was added with: that one is saved as a change, but the game has no other way to start.
+    // The game's own defaults (a Steam game this Playden installed shows in Steam's folder) stay: they aren't changes.
     std::map<std::string, std::string> overrides;
+    if (const auto record = state_.game_settings.find(id); record != state_.game_settings.end())
+        overrides = rt::GameDefaultOverrides(record->second.overrides);
     if (const auto imported = imported_programs_.find(id); imported != imported_programs_.end())
         overrides["program"] = imported->second;
     return overrides;
@@ -2949,6 +2969,12 @@ std::map<GameId, std::string> Simulation::TakeRuntimeSetupPrograms() {
     return programs;
 }
 
+std::map<GameId, rt::OnlineLaunch> Simulation::TakeRuntimeOnlineLaunches() {
+    auto launches = std::move(pending_runtime_online_launches_);
+    pending_runtime_online_launches_.clear();
+    return launches;
+}
+
 bool Simulation::TakeRuntimeCleanupRequest() {
     const bool requested = pending_runtime_cleanup_;
     pending_runtime_cleanup_ = false;
@@ -3276,6 +3302,7 @@ void Simulation::UpdateRuntime(RuntimeState runtime, const std::vector<LiveRunti
         const bool waiting = !state_.navigation.modals.empty() && state_.navigation.modals.back().title == quit_wait_title_;
         if (!waiting) {
             state_.quit_waiting = false;
+            finish_setup_game_ = {};  // cancelled
         } else if (std::none_of(state_.runtime_games.begin(), state_.runtime_games.end(),
                                 [](const auto& entry) { return entry.second.status == "Preparing"; })) {
             state_.quit_waiting = false;
@@ -3536,8 +3563,9 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
             }
             const bool update = live_update_jobs_.contains(id);
             if (update && canceled_updates_.erase(id)) continue;
-            push_notice({"install-" + ToKey(id), update ? "Update complete" : "Download complete", "", false, kLiveNoticeSeconds,
-                         false, title(id)});
+            push_notice({"install-" + ToKey(id),
+                         live_dlc_jobs_.contains(id) ? "DLC changed" : update ? "Update complete" : "Download complete", "", false,
+                         kLiveNoticeSeconds, false, title(id)});
             // What Steam said about the update is answered: the details page asks again.
             if (update) {
                 if (auto* game = const_cast<Game*>(find_game(state_, id))) game->update = {};
@@ -3549,7 +3577,8 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
             if (job.state != JobState::Failed || (previous != live_job_states_.end() && previous->second == JobState::Failed)) continue;
             // The queue carries on with the next game and Downloads keeps the failure with Resume, so the
             // player is told in a corner instead of a dialog that stops what they are doing.
-            push_notice({"install-" + ToKey(job.game_id), job.move ? "Move failed" : job.update ? "Update failed" : "Download failed", "", false,
+            push_notice({"install-" + ToKey(job.game_id),
+                         job.move ? "Move failed" : job.dlc_change ? "DLC change failed" : job.update ? "Update failed" : "Download failed", "", false,
                          kLiveNoticeSeconds * 2, true,
                          title(job.game_id) + (job.failure.empty() ? std::string() : " · " + job.failure), false});
         }
@@ -3569,9 +3598,11 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
     live_installs_seen_ = true;
     live_job_states_ = std::move(job_states);
     live_update_jobs_.clear();
+    live_dlc_jobs_.clear();
     live_move_jobs_.clear();
     for (const auto& job : jobs) {
         if (job.update) live_update_jobs_.insert(job.game_id);
+        if (job.update && job.dlc_change) live_dlc_jobs_.insert(job.game_id);
         if (job.move) live_move_jobs_.insert(job.game_id);
     }
     std::erase_if(canceled_updates_, [this](GameId id) { return !live_update_jobs_.contains(id); });
@@ -3596,11 +3627,13 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
             job.eta_seconds = live_job.eta_seconds;
             job.server_name = live_job.server_name;
         }
-        // An update reads "Updating · <state>"; its own steps stand for the state while they run.
+        // An update reads "Updating · <state>"; its own steps stand for the state while they run. A DLC change reads
+        // "Changing DLC".
         job.update = live_job.update;
+        job.dlc_change = live_job.dlc_change;
         job.locked = live_job.locked;
         if (live_job.update) {
-            job.stage_text = "Updating";
+            job.stage_text = live_job.dlc_change ? "Changing DLC" : "Updating";
             if (live_job.state == JobState::Downloading && live_job.checking_files) job.state_text = "Checking files";
             else if (live_job.state == JobState::Downloading && live_job.applying) job.state_text = "Applying";
         }
@@ -3639,7 +3672,7 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
         job.queue_order = order++;
         job.state = JobState::Downloaded;
         // An update lists what it downloaded, not the whole game.
-        job.update = finished.update_bytes > 0;
+        job.update = finished.update || finished.update_bytes > 0;
         job.completed_bytes = job.total_bytes = job.update ? finished.update_bytes : finished.install_bytes;
         job.volume_id = finished.volume_id;
         job.finished_at = finished.finished_at;
@@ -3650,7 +3683,7 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
     for (const auto& game : installed)
         installations.push_back({game.game_id, game.volume_id, game.install_bytes, game.available,
                                  state_.runtime_games.count(game.game_id) && state_.runtime_games.at(game.game_id).ready, false,
-                                 game.finished_at});
+                                 game.finished_at, game.dlc_known, game.installed_dlc, game.excluded_dlc});
     state_.jobs = std::move(projected);
     sync_self_update_job();
     state_.installations = std::move(installations);
@@ -4104,6 +4137,94 @@ std::uint64_t Simulation::install_dlc_on_bytes(GameId id) const {
     return bytes;
 }
 
+std::vector<GameDlc> Simulation::manage_dlc(GameId id) const {
+    std::vector<GameDlc> offered;
+    const auto* game = find_game(state_, id);
+    if (!game) return offered;
+    // Steam's details of an installed game have its record's version and language: no other sizes to pick from.
+    for (const auto& dlc : game->dlc)
+        if (dlc.install_bytes != 0) offered.push_back(dlc);
+    return offered;
+}
+
+bool Simulation::manage_dlc_installed(GameId id, std::uint32_t dlc) const {
+    const auto* installation = find_installation(state_, id);
+    return installation && std::find(installation->installed_dlc.begin(), installation->installed_dlc.end(), dlc) !=
+                               installation->installed_dlc.end();
+}
+
+bool Simulation::manage_dlc_on(GameId id, std::uint32_t dlc) const {
+    const auto chosen = manage_dlc_choice_.find(dlc);
+    return chosen != manage_dlc_choice_.end() ? chosen->second : manage_dlc_installed(id, dlc);
+}
+
+Simulation::ManageDlcPlan Simulation::manage_dlc_plan(GameId id) const {
+    ManageDlcPlan plan;
+    const auto* installation = find_installation(state_, id);
+    // What the record leaves out stays out unless the sheet turns it on; a listed DLC that is off is left out, also one
+    // bought since the install, so it doesn't download with a later update.
+    std::set<std::uint32_t> excluded;
+    if (installation) excluded.insert(installation->excluded_dlc.begin(), installation->excluded_dlc.end());
+    for (const auto& dlc : manage_dlc(id)) {
+        const bool installed = manage_dlc_installed(id, dlc.app_id);
+        const bool on = manage_dlc_on(id, dlc.app_id);
+        if (on) excluded.erase(dlc.app_id);
+        else excluded.insert(dlc.app_id);
+        if (on && !installed) {
+            ++plan.turned_on;
+            plan.download_bytes += dlc.download_bytes;
+            plan.install_bytes += dlc.install_bytes;
+            plan.claims_free = plan.claims_free || dlc.free;
+        } else if (!on && installed) {
+            ++plan.turned_off;
+            plan.freed_bytes += dlc.install_bytes;
+        }
+    }
+    plan.excluded.assign(excluded.begin(), excluded.end());
+    return plan;
+}
+
+std::string Simulation::manage_dlc_blocker(GameId id) const {
+    if (!find_installation(state_, id)) return "Not installed";
+    // Its job, an uninstall, a preparation or the game running; then its drive, as an update checks it.
+    if (auto blocker = installed_blocker(id); !blocker.empty()) return blocker;
+    if (const auto check = update_check(id); !check.allowed) return check.reason;
+    return {};
+}
+
+bool Simulation::manage_dlc_short_of_room(GameId id) const {
+    const auto plan = manage_dlc_plan(id);
+    const auto check = update_check(id);
+    return plan.turned_on && check.free_bytes && plan.install_bytes + steam::kInstallSpaceMargin > *check.free_bytes;
+}
+
+bool Simulation::manage_dlc_offered(GameId id) const {
+    // Steam games only: their install record says which DLC they hold.
+    const auto* installation = find_installation(state_, id);
+    return id.store == Store::kSteam && installation && installation->dlc_known && external_game(id) == nullptr &&
+           !manage_dlc(id).empty();
+}
+
+void Simulation::open_manage_dlc(GameId id) {
+    manage_dlc_choice_.clear();
+    const auto offered = manage_dlc(id);
+    if (offered.empty()) return;
+    // By what the install holds, so a row stays put when it is toggled; one kind needs no headings.
+    const auto held = std::count_if(offered.begin(), offered.end(), [&](const GameDlc& dlc) { return manage_dlc_installed(id, dlc.app_id); });
+    const bool sections = held > 0 && held < static_cast<std::ptrdiff_t>(offered.size());
+    std::vector<std::string> actions;
+    if (sections) actions.push_back("heading-manage-dlc-installed");
+    for (const auto& dlc : offered)
+        if (manage_dlc_installed(id, dlc.app_id)) actions.push_back("manage-dlc-" + std::to_string(dlc.app_id));
+    if (sections) actions.push_back("heading-manage-dlc-other");
+    for (const auto& dlc : offered)
+        if (!manage_dlc_installed(id, dlc.app_id)) actions.push_back("manage-dlc-" + std::to_string(dlc.app_id));
+    actions.push_back("divider");
+    actions.push_back("manage-dlc-apply");
+    actions.push_back("cancel");
+    open_modal({"manage-dlc", "Manage DLC", state_.navigation.focus_key, std::move(actions), sections ? 1 : 0, false});
+}
+
 void Simulation::ResetSizeChecks() {
     size_checks_.clear();
     size_checks_running_.clear();
@@ -4239,10 +4360,10 @@ bool Simulation::UpdateAppDetails(GameId id, std::optional<std::uint64_t> downlo
 }
 
 void Simulation::UpdateStoreDetails(GameId id, std::string description, std::vector<std::string> genres,
-                                    std::string controller_support) {
+                                    std::string controller_support, bool vac) {
     if (!live()) return;
     auto& facts = store_facts_[id];
-    facts = {std::move(description), std::move(genres), std::move(controller_support)};
+    facts = {std::move(description), std::move(genres), std::move(controller_support), vac};
     for (auto& game : state_.games) {
         if (game.id != id) continue;
         if (!facts.description.empty()) game.description = facts.description;
@@ -4526,8 +4647,14 @@ void Simulation::refresh_download_servers(const std::string& focus) {
 
 void Simulation::RequestQuit() {
     if (state_.quit_requested || state_.quit_waiting) return;
+    finish_setup_game_ = {};  // a quit from outside is no game's Finish setup
     quit_to_home();
     rebuild_view();
+}
+
+std::optional<GameId> Simulation::FinishSetupGame() const {
+    if (!state_.quit_requested || !finish_setup_game_.valid()) return std::nullopt;
+    return finish_setup_game_;
 }
 
 void Simulation::ApplyLiveWebAccess(const LiveWebAccess& snapshot) {
@@ -4565,7 +4692,8 @@ playden::Preferences Simulation::ExportPreferences() const {
             state_.downloads_slow_network, state_.stay_signed_in, state_.beta_updates, state_.download_server,
             state_.web_access, state_.content_language, state_.hide_run_once_help, state_.hide_launcher_help,
             state_.runtime_prompt_kit, state_.recipe_votes, state_.sharing_explained, state_.share_name,
-            state_.reports_explained, state_.share_as, state_.ask_after_games};
+            state_.reports_explained, state_.share_as, state_.ask_after_games, state_.steam_invisible,
+            state_.steam_online_notice};
 }
 
 void Simulation::apply_organization_snapshot(const playden::OrganizationSnapshot& snapshot) {
@@ -4805,6 +4933,8 @@ bool Simulation::ApplyPreferences(PersistenceLoadToken token,
         state_.reports_explained = loaded.preferences.reports_explained;
         state_.share_as = loaded.preferences.share_as;
         state_.ask_after_games = loaded.preferences.ask_after_games;
+        state_.steam_invisible = loaded.preferences.steam_invisible;
+        state_.steam_online_notice = loaded.preferences.steam_online_notice;
         state_.share_name = loaded.preferences.share_name;
         captured_preferences_ = loaded.preferences;
         preferences_saved_revision_ = preferences_revision_;
@@ -5079,7 +5209,9 @@ bool Simulation::record_live_persistence() {
                                       after_preferences.share_name != captured_preferences_.share_name ||
                                       after_preferences.reports_explained != captured_preferences_.reports_explained ||
                                       after_preferences.share_as != captured_preferences_.share_as ||
-                                      after_preferences.ask_after_games != captured_preferences_.ask_after_games);
+                                      after_preferences.ask_after_games != captured_preferences_.ask_after_games ||
+                                      after_preferences.steam_invisible != captured_preferences_.steam_invisible ||
+                                      after_preferences.steam_online_notice != captured_preferences_.steam_online_notice);
 
     if (organization_changed && !snapshot_within_model_bounds(after_organization)) {
         apply_organization_snapshot(captured_organization_);
@@ -5116,6 +5248,8 @@ bool Simulation::record_live_persistence() {
                 state_.reports_explained = captured_preferences_.reports_explained;
                 state_.share_as = captured_preferences_.share_as;
                 state_.ask_after_games = captured_preferences_.ask_after_games;
+                state_.steam_invisible = captured_preferences_.steam_invisible;
+                state_.steam_online_notice = captured_preferences_.steam_online_notice;
                 organization_journal_full_ = true;
                 force_organization_reset_ = false;
                 force_organization_selection_ = false;
@@ -5365,7 +5499,7 @@ void Simulation::load_profile() {
             }
             if (const auto* overrides = value->Find("overrides"); overrides && overrides->is_object())
                 for (const auto& [id, text] : overrides->object())
-                    if (text.is_string() && rt::FindSetting(id)) record.overrides[id] = text.text();
+                    if (text.is_string() && (rt::FindSetting(id) || rt::IsGameDefaultKey(id))) record.overrides[id] = text.text();
             state_.game_settings[GameId::Steam(static_cast<std::uint32_t>(*app))] = std::move(record);
         }
     }
@@ -6099,6 +6233,34 @@ bool Simulation::scenario(const std::string& name) {
         state_.navigation.detail_id = id;
         state_.navigation.selected_game_id = id;
         state_.navigation.focus_key = "details-update";
+    } else if (name == "dlc-manage") {
+        // An installed game's Maintenance with Manage DLC: two DLC installed (one turned off would show as not
+        // installed), one left out at install and a free one never claimed. Replay "action focus:manage-dlc" and
+        // "action cross" for the sheet.
+        const auto id = GameId::Steam(900001);
+        state_.account().authentication = AuthState::SignedIn;
+        state_.navigation.modals.clear();
+        std::erase_if(state_.jobs, [id](const Job& job) { return job.game_id == id; });
+        if (auto* game = const_cast<Game*>(find_game(state_, id))) {
+            game->update = {};
+            game->dlc = {{900201, "Soundtrack", 610'000'000, 640'000'000, false},
+                         {900202, "Old Lighthouse Expansion", 3'900'000'000, 4'700'000'000, false},
+                         {900203, "HD Textures", 11'200'000'000, 14'100'000'000, false},
+                         {900204, "Photo Mode Filters", 40'000'000, 52'000'000, true}};
+        }
+        if (auto* installation = find_installation(state_, id)) {
+            installation->runtime_ready = true;
+            installation->dlc_known = true;
+            installation->installed_dlc = {900201, 900202};
+            installation->excluded_dlc = {900203};
+        }
+        state_.navigation.route = Route::Details;
+        state_.navigation.detail_origin = Route::Library;
+        state_.navigation.detail_id = id;
+        state_.navigation.selected_game_id = id;
+        state_.navigation.focus_key = "details-play";
+        open_modal({"game-maintenance", "Maintenance", "details-play", maintenance_actions(), 0, false});
+        state_.navigation.focus_key = "manage-dlc";
     } else if (name == "install-options") {
         // The install sheet of a game in several languages and versions, with owned DLC: its Version,
         // Language and Includes rows.
@@ -6187,6 +6349,12 @@ bool Simulation::scenario(const std::string& name) {
             if (auto* volume = find_volume(state_, "internal")) volume->used_bytes = volume->capacity_bytes - 1'073'741'824;
         }
         open_install_sheet(*state_.navigation.detail_id, install_sheet_actions(*state_.navigation.detail_id));
+    } else if (name == "friends") {
+        // Steam friends (online-steam only): the Friends tab, Join and Invite friends.
+        if (!rt::OnlineSteamEnabled()) { last_error_ = "The friends scenario needs online-steam"; return false; }
+        seed_friends_scenario();
+        // Online runs Steam beside the game, which takes a runtime kit that can.
+        kit_.helper_process = true;
     } else if (name == "my-presets" || name == "my-presets-save" || name == "my-presets-full") {
         seed_my_presets_scenario(name);
     } else if (name.rfind("recipes-", 0) == 0) {
@@ -6322,7 +6490,7 @@ bool Simulation::scenario(const std::string& name) {
             // The recipe as published: nothing new to share, and the vote prompt's recipe.
             rt::ChooseCommunityRecipe(&record, recipe_id, revision);
         }
-        if (state_.game_settings[id].overrides.empty() && state_.game_settings[id].community_recipe.id.empty())
+        if (!rt::HasPlayerOverrides(state_.game_settings[id].overrides) && state_.game_settings[id].community_recipe.id.empty())
             state_.game_settings.erase(id);
         if (name.rfind("feedback-", 0) == 0) {
             // The player quit the game: after ten minutes, or after 40 seconds for "Did it start?".
@@ -6656,13 +6824,14 @@ void Simulation::rebuild_view() {
         // The chooser opened from the Install sheet is for the game being installed.
         const GameId settings_game = modal.id == "preset-picker" && chooser_game_.valid() ? chooser_game_
                                                                                          : state_.navigation.selected_game_id;
-        const bool settings_modal = modal.id == "game-settings" || modal.id == "preset-picker" || modal.id == "button-mapping" ||
+        const bool settings_modal = modal.id == "game-settings" || modal.id == "game-settings-list" ||
+                                    modal.id == "preset-picker" || modal.id == "button-mapping" ||
                                     modal.id == "controller-tuning" ||
                                     modal.id == "game-maintenance" || !modal.setting_id.empty();
         rt::EffectiveSettings settings_values;
         const bool settings_ready = settings_modal && EffectiveSettingsFor(settings_game, &settings_values);
         const auto settings_record = state_.game_settings.find(settings_game);
-        const bool settings_custom = settings_record != state_.game_settings.end() && !settings_record->second.overrides.empty();
+        const bool settings_custom = settings_record != state_.game_settings.end() && rt::HasPlayerOverrides(settings_record->second.overrides);
         // A picker marks the value the game would have without the player's choice.
         rt::EffectiveValue inherited;
         if (settings_ready && !modal.setting_id.empty()) {
@@ -6680,6 +6849,11 @@ void Simulation::rebuild_view() {
                 : "For a game's launcher, settings or installer: pick it from the game folder. It runs one time with the Mouse preset; Play and Game settings stay as they are.";
         if (modal.id == "game-settings" || modal.id == "game-maintenance") {
             if (const auto* game = find_game(state_, settings_game)) view_.subtitle = game->title;
+        } else if (modal.id == "game-settings-list") {
+            // The count follows each change, so the list says how far it is from the preset.
+            if (const auto* game = find_game(state_, settings_game)) view_.subtitle = game->title;
+            const auto changes = settings_summary(settings_game).size();
+            if (changes > 0) view_.subtitle += " \u00b7 " + std::to_string(changes) + " changed";
         } else if (!modal.setting_id.empty()) {
             if (const auto* definition = rt::FindSetting(modal.setting_id)) {
                 // A launch option by the name the picker shows, not its id.
@@ -6797,6 +6971,24 @@ void Simulation::rebuild_view() {
                                    short_of_room});
             view_.facts.push_back({"Download", install_size_text(id, assessment.download_bytes, "Unknown")});
         }
+        if (modal.id == "manage-dlc") {
+            // What Apply does: what downloads, what is deleted, where, and that the game stays playable meanwhile.
+            const auto id = state_.navigation.selected_game_id;
+            const auto plan = manage_dlc_plan(id);
+            const auto check = update_check(id);
+            // The sheet's head has room for the explanation, or for what the change does (at most two figures).
+            if (!plan.changed()) {
+                if (check.free_bytes) view_.facts.push_back({"Free space", format_bytes(*check.free_bytes)});
+                view_.subtitle = "DLC you turn on downloads into the game; the files of DLC you turn off are deleted. On " +
+                                 check.volume_label + ".";
+            }
+            // Steam's figures: depots can share files, so the change can take less.
+            if (plan.turned_on)
+                view_.facts.push_back({"Download", "About " + format_bytes(plan.download_bytes) +
+                                                       (manage_dlc_short_of_room(id) ? " · " + format_bytes(*check.free_bytes) + " free" : std::string()),
+                                       manage_dlc_short_of_room(id)});
+            if (plan.turned_off) view_.facts.push_back({"Frees", "About " + format_bytes(plan.freed_bytes)});
+        }
         if (modal.id == "install-language")
             view_.subtitle = "For this game only. New downloads of other games stay in " +
                              playden::steam::LanguageName(state_.content_language) + ".";
@@ -6892,13 +7084,83 @@ void Simulation::rebuild_view() {
                 view_.subtitle += " A vote sends the recipe, your vote and reason, the runtime kit, firmware and Playden versions and a random "
                                   "sharing ID; no Steam ID or account name.";
         }
+        // Join a friend's lobby: who, which game, and what Join does; or why it can't from here.
+        const Friend* join_person = modal.id == "join-lobby" ? find_friend(join_friend_) : nullptr;
+        const GameId join_game = join_person ? friend_game(*join_person) : GameId{};
+        if (modal.id == "join-lobby") {
+            view_.eyebrow = "Join a friend";
+            const auto* game = find_game(state_, join_game);
+            const std::string title = game ? game->title : "The game";
+            if (join_person) view_.facts.push_back({"Friend", join_person->name});
+            if (game) view_.facts.push_back({"Game", game->title});
+            const auto refusal = join_refusal(join_game);
+            const bool online = game_online(join_game);
+            if (game && refusal.empty()) {
+                const auto* definition = rt::FindSetting("steam_features");
+                rt::EffectiveSettings values;
+                if (definition && EffectiveSettingsFor(join_game, &values))
+                    view_.facts.push_back({"Steam features", choice_label(*definition, values.values["steam_features"].value)});
+            }
+            if (!refusal.empty()) view_.subtitle = refusal;
+            else if (online) view_.subtitle = title + " starts and joins this lobby. If the lobby is full or closed by then, the game says so.";
+            else if (std::count(modal.action_keys.begin(), modal.action_keys.end(), "join-use-online"))
+                view_.subtitle = uses_vac(join_game) ? std::string(kVacOnlineWarning)
+                    : "Joining needs Steam features set to Online. " + title + " keeps it for the next times you play.";
+            else view_.subtitle = "Joining needs Steam features set to Online. This game's recipe sets it: change it in Game settings first.";
+        }
+        // Invite friends: the game's name above; the friends picked get their invite once the game has a lobby.
+        if (modal.id == "invite-friends") {
+            const auto game = state_.navigation.detail_id.value_or(state_.navigation.selected_game_id);
+            if (const auto* found = find_game(state_, game)) view_.eyebrow = found->title;
+            rt::EffectiveSettings values;
+            const bool notify = EffectiveSettingsFor(game, &values) && values.title_notify;
+            view_.subtitle = std::string("Steam sends an invite only for a lobby. The friends you pick get theirs when the game opens or joins its first lobby") +
+                             (notify ? ", and the " PLAYDEN_CONSOLE_NAME " shows who was invited." : ".");
+        }
+        // The Game settings summary, worked out once for its rows.
+        std::optional<std::vector<SettingsSummaryLine>> summary_lines;
+        const auto summary = [&]() -> const std::vector<SettingsSummaryLine>& {
+            if (!summary_lines) summary_lines = settings_summary(settings_game);
+            return *summary_lines;
+        };
         for (const auto& action_key : modal.action_keys) {
             auto& item = row(action_key, RowKind::Action, action_label(action_key), action_key);
             item.dangerous = modal.destructive && action_key != "cancel";
+            if (modal.id == "join-lobby") {
+                if (action_key == "join-start") item.title = "Start game and join";
+                if (action_key == "join-use-online") {
+                    item.title = "Use Online for this game";
+                    item.subtitle = "Then starts the game and joins.";
+                }
+                if (action_key == "cancel" && modal.action_keys.size() == 1) item.title = "Close";
+            }
+            if (modal.id == "invite-friends") {
+                if (action_key.rfind("invite-friend-", 0) == 0) {
+                    const auto id = std::strtoull(action_key.c_str() + std::strlen("invite-friend-"), nullptr, 10);
+                    const auto* person = find_friend(id);
+                    item.kind = RowKind::Toggle;
+                    item.title = person ? person->name : "A friend";
+                    if (person) {
+                        auto [status, tone] = friend_status(*person);
+                        item.subtitle = std::move(status);
+                        item.tone = tone == "good" ? tone : std::string();
+                    }
+                    item.selected = invite_choice_.contains(id);
+                    item.enabled = item.selected || invite_choice_.size() < rt::kOnlineLaunchMaxInvites;
+                } else if (action_key == "invite-play") {
+                    std::size_t chosen = 0;
+                    for (const auto id : invite_choice_) chosen += find_friend(id) != nullptr;
+                    item.title = chosen ? "Play and invite " + std::to_string(chosen) : "Play and invite";
+                    item.enabled = chosen > 0;
+                    if (invite_choice_.size() >= rt::kOnlineLaunchMaxInvites)
+                        item.subtitle = std::to_string(rt::kOnlineLaunchMaxInvites) + " friends at most.";
+                }
+            }
             if (action_key == "runtime-prompt-update")
                 item.title = "Update " + std::to_string(runtime_prompt_games_) + (runtime_prompt_games_ == 1 ? " game" : " games");
             // The preparation sheet's own Cancel takes the game out of the queue; its last row only closes it.
-            if (modal.id == "prep-actions" && action_key == "cancel") item.title = "Close";
+            if ((modal.id == "prep-actions" || modal.id == "game-settings") && action_key == "cancel") item.title = "Close";
+            if (modal.id == "game-settings-list" && action_key == "cancel") item.title = "Back";
             if (modal.id == "job-actions")
                 if (const auto label = move_action_label(action_key); !label.empty())
                     if (const auto* job = find_job(state_, action_key.substr(action_key.find('-', 4) + 1)); job && job->move)
@@ -7034,6 +7296,35 @@ void Simulation::rebuild_view() {
                         item.selected = !install_dlc_off(dlc);
                         if (!dlc.name.empty()) item.title = dlc.name;
                         item.value = (dlc.free ? "Free · " : "") + format_bytes(dlc.install_bytes);
+                    }
+            }
+            // Manage DLC: one check box per DLC, on as installed until the player turns it; Apply says what changes.
+            if (modal.id == "manage-dlc" && action_key == "manage-dlc-apply") {
+                const auto id = state_.navigation.selected_game_id;
+                const auto plan = manage_dlc_plan(id);
+                const auto blocker = manage_dlc_blocker(id);
+                const bool short_of_room = manage_dlc_short_of_room(id);
+                item.enabled = plan.changed() && blocker.empty() && !short_of_room;
+                const auto* game = find_game(state_, id);
+                if (!blocker.empty()) item.subtitle = blocker;
+                else if (!plan.changed()) item.subtitle = "Nothing changed";
+                else if (short_of_room) item.subtitle = "Not enough space";
+                // The job selects the content Steam has now: a pending update of the game comes with it.
+                else if (game && game->update.newer) item.subtitle = "With the game's update";
+                else item.subtitle = "Runs in Queue";
+            } else if (modal.id == "manage-dlc" && action_key.rfind("manage-dlc-", 0) == 0) {
+                const auto id = state_.navigation.selected_game_id;
+                const auto app = parse_dlc_action(action_key, "manage-dlc-");
+                item.kind = RowKind::Toggle;
+                item.title = "DLC " + std::to_string(app);
+                for (const auto& dlc : manage_dlc(id))
+                    if (dlc.app_id == app) {
+                        const bool installed = manage_dlc_installed(id, app);
+                        item.selected = manage_dlc_on(id, app);
+                        if (!dlc.name.empty()) item.title = dlc.name;
+                        item.value = (dlc.free && !installed ? "Free · " : "") + format_bytes(dlc.install_bytes);
+                        if (item.selected && !installed) item.subtitle = dlc.free ? "Downloads, and Steam adds it to your account" : "Downloads";
+                        else if (!item.selected && installed) item.subtitle = "Its files are deleted";
                     }
             }
             if (modal.id == "install" && action_key == "install-language") {
@@ -7303,12 +7594,12 @@ void Simulation::rebuild_view() {
                 const auto base = base_of(settings_game);
                 const std::string name = base_name(settings_game, base);
                 item.value = settings_custom ? "Custom · from " + name : name;
-                item.subtitle = "What the settings below start from.";
+                item.subtitle = "What the settings start from.";
                 if (!base.community.id.empty()) {
                     // A recipe's title is long: the value is the title alone, the subtitle says the rest.
                     constexpr std::string_view prefix = "Community: ";
                     item.value = name.rfind(prefix, 0) == 0 ? name.substr(prefix.size()) : name;
-                    item.subtitle = settings_custom ? "A community recipe, with your changes." : "A community recipe. The settings below start from it.";
+                    item.subtitle = settings_custom ? "A community recipe, with your changes." : "A community recipe. The settings start from it.";
                     // Another game's: which one, and the program it starts here.
                     if (const auto note = ProgramNoteFor(settings_game, base.community.revision); !note.empty())
                         item.lines.push_back(note);
@@ -7480,6 +7771,12 @@ void Simulation::rebuild_view() {
                 item.modified = value.source == rt::ValueSource::kUser || value.unlocked;
                 if (value.unlocked) item.subtitle = value.reason;
                 if (id == "architecture") item.subtitle = "Follows the program you choose.";
+                if (id == "steam_features" && value.value == "online" && uses_vac(settings_game)) item.subtitle = kVacOnlineWarning;
+                // Another store's game has no Steam folder to be shown in (the runtime host checks the store too).
+                if (id == "steam_library_path" && settings_game.store != Store::kSteam) {
+                    item.enabled = false;
+                    item.subtitle = "Only for Steam games.";
+                }
                 if (id == "start_check") {
                     const auto setup = game_setups_.find(settings_game);
                     std::string problem = setup != game_setups_.end() && setup->second.draft ? setup->second.refusal : std::string();
@@ -7539,15 +7836,50 @@ void Simulation::rebuild_view() {
             } else if (settings_ready && (action_key == "section-compatibility" || action_key == "section-advanced")) {
                 item.kind = RowKind::Heading;
                 const bool advanced = action_key == "section-advanced";
+                const auto inside = [advanced](rt::SettingGroup group) {
+                    return advanced ? group == rt::SettingGroup::kAdvanced
+                                    : group == rt::SettingGroup::kCompatibility || group == rt::SettingGroup::kGraphics ||
+                                          group == rt::SettingGroup::kSteam || group == rt::SettingGroup::kWindows;
+                };
                 int count = 0;
-                for (const auto& definition : rt::SettingsCatalogue()) {
-                    const bool inside = advanced ? definition.group == rt::SettingGroup::kAdvanced
-                                                 : definition.group == rt::SettingGroup::kCompatibility ||
-                                                       definition.group == rt::SettingGroup::kGraphics ||
-                                                       definition.group == rt::SettingGroup::kWindows;
-                    if (inside && game_settings_row_shown(definition, settings_game)) ++count;
+                for (const auto& definition : rt::SettingsCatalogue())
+                    if (inside(SheetGroup(definition)) && game_settings_row_shown(definition, settings_game)) ++count;
+                const bool expanded = expanded_settings_sections_.count(action_key) != 0;
+                item.value = expanded ? "Hide" : "Show " + std::to_string(count);
+                // Collapsed, it names the changes inside: the summary's lines can't be selected to go there.
+                if (!expanded) {
+                    std::string names;
+                    int changed = 0;
+                    for (const auto& line : summary())
+                        if (inside(line.group)) names += (changed++ == 0 ? "" : ", ") + line.label;
+                    if (changed > 0) {
+                        item.subtitle = std::to_string(changed) + " changed: " + names;
+                        item.tone = "attention";
+                    }
                 }
-                item.value = expanded_settings_sections_.count(action_key) ? "Hide" : "Show " + std::to_string(count);
+            } else if (settings_ready && action_key == "heading-your-changes") {
+                item.kind = RowKind::Separator;
+                item.action.clear();
+                item.enabled = false;
+                const auto changes = summary().size();
+                if (changes > 0) item.value = std::to_string(changes);
+            } else if (settings_ready && action_key.rfind("summary-", 0) == 0) {
+                // A line of the summary: the setting and its value, as text (the focus passes over it).
+                item.kind = RowKind::Status;
+                item.action.clear();
+                item.enabled = false;
+                if (action_key == "summary-none") {
+                    item.title = "Every setting follows";
+                    item.value = base_name(settings_game, base_of(settings_game));
+                } else {
+                    for (const auto& line : summary())
+                        if (line.key == action_key) {
+                            item.title = line.label;
+                            item.value = line.value;
+                        }
+                }
+            } else if (settings_ready && action_key == "change-settings") {
+                item.subtitle = "Every setting, by section.";
             } else if (SheetDecoration(action_key)) {
                 // Names the rows below it, or (a divider) only sets them apart; never focused (move skips it).
                 item.kind = RowKind::Separator;
@@ -7576,6 +7908,8 @@ void Simulation::rebuild_view() {
                         item.enabled = false;
                     } else if (rt::SettingChoiceWaitsForUpdate(settings_values, modal.setting_id, value)) {
                         item.subtitle = rt::kAppliesAfterKitUpdate;
+                    } else if (modal.setting_id == "steam_features" && value == "online" && uses_vac(settings_game)) {
+                        item.subtitle = kVacOnlineWarning;
                     }
                 }
                 const bool button = modal.setting_id.rfind("button.", 0) == 0;
@@ -7607,6 +7941,8 @@ void Simulation::rebuild_view() {
                 item.dangerous = true;
             } else if (settings_ready && action_key == "reset-settings") {
                 item.enabled = can_reset_settings(settings_game);
+                item.subtitle = item.enabled ? "Removes your changes; the preset stays."
+                                             : "Nothing to reset: the settings follow the preset.";
             } else if (settings_ready && action_key == "effective-command") {
                 item.kind = RowKind::Text;
                 item.title = "Effective command";
@@ -7667,6 +8003,21 @@ void Simulation::rebuild_view() {
                 item.subtitle = "Like dinput8=n,b: n uses the game's copy, b Wine's.";
             } else if (settings_ready && action_key == "unlock-setting") {
                 item.dangerous = true;
+            } else if (modal.id == "game-maintenance" && action_key == "manage-dlc") {
+                // The game's DLC, installed or not: the same check boxes as the install sheet's.
+                const auto offered = manage_dlc(settings_game);
+                const auto held = std::count_if(offered.begin(), offered.end(), [&](const GameDlc& dlc) {
+                    return manage_dlc_installed(settings_game, dlc.app_id);
+                });
+                item.value = std::to_string(held) + " of " + std::to_string(offered.size());
+                const auto blocker = manage_dlc_blocker(settings_game);
+                const auto* game = find_game(state_, settings_game);
+                const std::string title = game && !game->title.empty() ? game->title : "the game";
+                item.enabled = blocker.empty();
+                if (blocker == "Playing") item.subtitle = "Quit " + title + " to change its DLC.";
+                else if (blocker == "In Queue") item.subtitle = "Wait for its job in Queue to finish.";
+                else if (!blocker.empty()) item.subtitle = blocker + ".";
+                else item.subtitle = "Install DLC you left out or bought later, or remove DLC to free space.";
             } else if (modal.id == "game-maintenance" && action_key == "game-move") {
                 // The game's move to another drive: the same Queue job as the Move tab's.
                 const auto* installation = find_installation(state_, settings_game);
@@ -7930,12 +8281,19 @@ void Simulation::rebuild_view() {
                 const auto id = state_.navigation.selected_game_id;
                 const auto record = state_.game_settings.find(id);
                 const std::string name = base_name(id, base_of(id));
-                item.value = record != state_.game_settings.end() && !record->second.overrides.empty() ? "Custom · from " + name : name;
+                item.value = record != state_.game_settings.end() && rt::HasPlayerOverrides(record->second.overrides) ? "Custom · from " + name : name;
                 if (live()) {
                     const auto runtime_game = state_.runtime_games.find(id);
                     if (record != state_.game_settings.end() && runtime_game != state_.runtime_games.end() &&
                         record->second.revision > runtime_game->second.settings_revision)
                         item.subtitle = "Changes apply on next launch";
+                    // Settings changed now would miss the game's first start; it launches when Finish setup returns to
+                    // the console's Home screen.
+                    if (runtime_game != state_.runtime_games.end() && runtime_game->second.awaiting_registration) {
+                        item.enabled = false;
+                        item.value = "After Finish setup";
+                        item.subtitle = "Opens once setup is finished";
+                    }
                 }
             } else if (action_key == "play-detailed-logs") {
                 const auto runtime_game = state_.runtime_games.find(state_.navigation.selected_game_id);
@@ -8118,7 +8476,8 @@ void Simulation::rebuild_view() {
                 if (const auto offer = chooser_offer(settings_game, focused.substr(7))) build_recipe_comparison(settings_game, *offer);
         }
         view_.legends = {"Cross Select", "Circle Cancel"};
-        if (modal.id == "game-settings") view_.legends = {"Cross Change", "Triangle Reset", "L1/R1 Jump", "Circle Close"};
+        if (modal.id == "game-settings") view_.legends = {"Cross Select", "Circle Close"};
+        else if (modal.id == "game-settings-list") view_.legends = {"Cross Change", "Triangle Reset", "L1/R1 Jump", "Circle Back"};
         else if (modal.id == "preset-picker")
             view_.legends = modal.action_keys[static_cast<std::size_t>(modal.focused_action)].rfind("mypreset-my-", 0) == 0
                                 ? std::vector<std::string>{"Cross Choose", "Triangle Manage", "L1/R1 Jump", "Circle Back"}
@@ -8131,6 +8490,8 @@ void Simulation::rebuild_view() {
         else if (modal.id == "steam-programs") view_.legends = {"Cross Choose", "Circle Cancel"};
         else if (modal.id == "content-language") view_.legends = {"Cross Use this language", "L1/R1 Jump", "Circle Back"};
         else if (modal.id == "install-dlc") view_.legends = {"Cross Turn on or off", "L1/R1 Jump", "Circle Back"};
+        else if (modal.id == "manage-dlc") view_.legends = {"Cross Turn on or off", "L1/R1 Jump", "Circle Cancel"};
+        else if (modal.id == "invite-friends") view_.legends = {"Cross Select", "Circle Cancel"};
         else if (modal.id == "install-language") view_.legends = {"Cross Use this language", "L1/R1 Jump", "Circle Back"};
         else if (modal.id == "install-version") view_.legends = {"Cross Use this version", "L1/R1 Jump", "Circle Back"};
         else if (modal.id == "vote-recipe") view_.legends = {"Cross Choose", "Circle Not now"};
@@ -8350,7 +8711,7 @@ void Simulation::rebuild_view() {
                 if (job->state == JobState::Downloading && job->state_text.empty() && job->total_bytes > 0)
                     progress = std::to_string(static_cast<int>(100.0 * static_cast<double>(job->completed_bytes) /
                                                                static_cast<double>(job->total_bytes))) + "%";
-                auto& note = row("details-updating", RowKind::Status, "Updating", "");
+                auto& note = row("details-updating", RowKind::Status, job->dlc_change ? "Changing DLC" : "Updating", "");
                 note.value = progress;
                 if (!job->failure.empty()) note.subtitle = job->failure;
                 note.enabled = false;
@@ -8710,10 +9071,48 @@ void Simulation::rebuild_view() {
                              (listed->second.reports == 1 ? " player" : " players");
             cell.enabled = false;
         }
+        // Invite friends, beside Play, for a game set to Online (online-steam).
+        if (game && invite_offered(game->id)) {
+            const auto play = std::find_if(view_.rows.begin(), view_.rows.end(), [](const ViewRow& item) { return item.key == "details-play"; });
+            if (play != view_.rows.end() && play->enabled && !play->action.empty()) {
+                ViewRow invite;
+                invite.key = "details-invite";
+                invite.kind = RowKind::Action;
+                invite.title = "Invite friends";
+                invite.action = "invite-friends";
+                invite.game_id = game->id;
+                view_.rows.insert(play + 1, std::move(invite));
+            }
+        }
         row("details-favorite", RowKind::Toggle, "Favorite", "favorite").selected = game && state_.library.favorites.contains(game->id);
         if (!live()) row("details-simulate-launch", RowKind::Action, "Simulate launch", "launch");
         row("details-more", RowKind::Action, "More", "context");
         view_.legends = {"Cross Select", "Options Actions", "Circle Back"};
+        // Friends playing this game (online-steam): Join for those in a lobby.
+        if (game && rt::OnlineSteamEnabled()) {
+            std::vector<const Friend*> playing;
+            for (const auto* person : friends_in_section(1))
+                if (friend_game(*person) == game->id) playing.push_back(person);
+            if (!playing.empty()) {
+                auto& heading = row("friends-playing", RowKind::Status, "Friends playing", "");
+                heading.value = std::to_string(playing.size());
+                heading.enabled = false;
+                for (const auto* person : playing) {
+                    auto& card = row("friend-" + std::to_string(person->steam_id), person->lobby_id ? RowKind::Action : RowKind::Status,
+                                     person->name, person->lobby_id ? "friend-join" : "");
+                    const auto [status, tone] = friend_status(*person, false);
+                    card.subtitle = status;
+                    card.tone = tone;
+                    card.game_id = game->id;
+                    if (person->lobby_id && join_refusal(game->id).empty()) card.value = "Join";
+                    else card.enabled = false;
+                }
+                const auto focused = std::find_if(view_.rows.begin(), view_.rows.end(),
+                                                  [this](const ViewRow& item) { return item.key == state_.navigation.focus_key; });
+                if (focused != view_.rows.end() && focused->action == "friend-join")
+                    view_.legends = {focused->value == "Join" ? "Cross Join " + focused->title : std::string("Cross Open"), "Circle Back"};
+            }
+        }
     } else if (state_.navigation.route == Route::Downloads) {
         // Queue: Downloads, then Preparation, one expanded at a time, then the drives. Rows come in screen
         // order (heading, card, the expanded section's rows), so Up and Down follow what is on screen.
@@ -8841,6 +9240,62 @@ void Simulation::rebuild_view() {
         view_.legends = {"Cross Open", job.kind == SavesJobKind::None ? "Triangle Sync all" : "Triangle Stop", "Circle Back", "L1/R1 Sections"};
         if (job.kind == SavesJobKind::None && !saves_awaiting_account().empty())
             view_.legends.insert(view_.legends.begin() + 2, "Square Upload all");
+    } else if (state_.navigation.route == Route::Friends) {
+        view_.title = "Friends";
+        static constexpr std::array<const char*, 3> sections = {"Online", "In my games", "All"};
+        auto& section = state_.navigation.friends_filter;
+        section = std::clamp(section, 0, 2);
+        std::size_t online = 0;
+        for (const auto& person : state_.friends) online += person.persona_state != 0;
+        // How the account shows to friends first (Triangle changes it), then the friends' counts.
+        view_.subtitle = state_.steam_invisible ? "You appear invisible" : "You appear online";
+        if (!state_.friends.empty())
+            view_.subtitle += " · " + std::to_string(online) + " online · " + std::to_string(state_.friends.size()) +
+                              (state_.friends.size() == 1 ? " friend" : " friends");
+        for (int index = 0; index < 3; ++index) {
+            auto& entry = row("friends-filter-" + std::to_string(index), RowKind::Choice, sections[static_cast<std::size_t>(index)],
+                              "friends-filter");
+            entry.value = std::to_string(friends_in_section(index).size());
+            entry.selected = index == section;
+        }
+        for (const auto* person : friends_in_section(section)) {
+            const auto game = friend_game(*person);
+            const bool joinable = person->lobby_id && game.valid();
+            auto& tile = row("friend-" + std::to_string(person->steam_id), RowKind::Action, person->name,
+                             joinable ? "friend-join" : game.valid() ? "friend-open" : "");
+            const auto [status, tone] = friend_status(*person);
+            tile.subtitle = status;
+            tile.tone = tone;
+            tile.game_id = game;
+            // Join only where it can start the game; the sheet says why elsewhere.
+            if (joinable && join_refusal(game).empty()) tile.value = "Join";
+        }
+        if (view_.rows.size() == sections.size()) {
+            const char* empty = state_.friends_need_sign_in ? "Sign in to Steam to see your friends."
+                              : !state_.friends_connected && state_.friends.empty() ? "Connecting to Steam…"
+                              : section == 0 ? "No friends online"
+                              : section == 1 ? "No friends are playing your games" : "No friends yet";
+            row("friends-empty", RowKind::Status, empty, "").enabled = false;
+        }
+        // The tab opens on its first friend.
+        if (state_.navigation.focus_key.empty() || std::none_of(view_.rows.begin(), view_.rows.end(), [this](const ViewRow& item) {
+                return item.key == state_.navigation.focus_key;
+            }))
+            state_.navigation.focus_key = view_.rows.size() > sections.size() && view_.rows[sections.size()].kind == RowKind::Action
+                ? view_.rows[sections.size()].key : "friends-filter-" + std::to_string(section);
+        const auto focused = std::find_if(view_.rows.begin(), view_.rows.end(),
+                                          [this](const ViewRow& item) { return item.key == state_.navigation.focus_key; });
+        view_.legends.clear();
+        if (focused != view_.rows.end() && focused->action == "friend-join") {
+            view_.legends.push_back(focused->value == "Join" ? "Cross Join " + focused->title : std::string("Cross Open"));
+            view_.legends.push_back("Square Open game");
+        } else if (focused != view_.rows.end() && focused->action == "friend-open") {
+            view_.legends.push_back("Cross Open game");
+        } else if (focused != view_.rows.end() && focused->kind == RowKind::Choice) {
+            view_.legends.push_back("Cross Select");
+        }
+        view_.legends.push_back(state_.steam_invisible ? "Triangle Appear online" : "Triangle Appear invisible");
+        view_.legends.push_back("Circle Back");
     } else if (state_.navigation.route == Route::SaveDetails) {
         const auto id = state_.navigation.save_id;
         const auto* game = find_game(state_, id);
@@ -8899,6 +9354,16 @@ void Simulation::rebuild_view() {
                 : "Connect Steam";
         if (state_.account().authentication != AuthState::SignedOut)
             add("settings-signout", RowKind::Action, "Sign out…", "signout-confirm").dangerous = true;
+        // Online play (online-steam): a notification as an Online game starts, naming the Steam account it signed in as.
+        if (live() && rt::OnlineSteamEnabled()) {
+            section = "Online play";
+            auto& notice = add("settings-steam-online-notice", RowKind::Toggle, "Steam sign-in notice",
+                               "toggle-steam-online-notice");
+            notice.selected = state_.steam_online_notice;
+            notice.subtitle = state_.steam_online_notice
+                ? "When an Online game starts, a notification shows the Steam account it signed in as."
+                : "Off: Online games start without the notification.";
+        }
         section = "Library";
         {
             // Windows games in a drive's playden/import or the console drop folder: the Import sheet.
@@ -9947,6 +10412,7 @@ void Simulation::cancel() {
         state_.navigation.route = state_.navigation.route == Route::Session ? Route::Details : state_.navigation.detail_origin;
         state_.navigation.focus_key = state_.navigation.route == Route::Details ? "details-play" : game_key(state_.navigation.selected_game_id);
         if (state_.navigation.route == Route::Downloads && !queue_return_focus_.empty()) state_.navigation.focus_key = queue_return_focus_;
+        if (state_.navigation.route == Route::Friends) state_.navigation.focus_key = friends_return_focus_;
         queue_return_focus_.clear();
     } else if (state_.navigation.route != Route::Home) {
         state_.navigation.route = Route::Home;
@@ -9954,10 +10420,21 @@ void Simulation::cancel() {
     }
 }
 
-namespace {
-int route_tab(Route route) {
-    return route == Route::Library ? 1 : route == Route::Downloads ? 2 : route == Route::Saves ? 3 : route == Route::Settings ? 4 : 0;
+std::vector<Route> TabRoutes() {
+    std::vector<Route> routes = {Route::Home, Route::Library, Route::Downloads, Route::Saves};
+    if (rt::OnlineSteamEnabled()) routes.push_back(Route::Friends);
+    routes.push_back(Route::Settings);
+    return routes;
 }
+
+int TabIndex(Route route) {
+    const auto routes = TabRoutes();
+    const auto found = std::find(routes.begin(), routes.end(), route);
+    return found == routes.end() ? 0 : static_cast<int>(found - routes.begin());
+}
+
+namespace {
+int route_tab(Route route) { return TabIndex(route); }
 }  // namespace
 
 void Simulation::move(int delta_x, int delta_y, bool repeat) {
@@ -10020,7 +10497,9 @@ void Simulation::move(int delta_x, int delta_y, bool repeat) {
     if (tab_bar_shown()) {
         auto& navigation = state_.navigation;
         if (navigation.tabs_focused) {
-            if (delta_x != 0) navigation.tab_focus = std::clamp(navigation.tab_focus + (delta_x > 0 ? 1 : -1), 0, 4);
+            if (delta_x != 0)
+                navigation.tab_focus = std::clamp(navigation.tab_focus + (delta_x > 0 ? 1 : -1), 0,
+                                                  static_cast<int>(TabRoutes().size()) - 1);
             else if (delta_y > 0) navigation.tabs_focused = false;
             return;
         }
@@ -10029,9 +10508,11 @@ void Simulation::move(int delta_x, int delta_y, bool repeat) {
             const auto index = navigation.selected_index;
             const auto shelf = navigation.home_shelf;
             const bool library_rail = navigation.library_rail_focused, settings_rail = navigation.settings_rail_focused;
+            const int friends_filter = navigation.friends_filter;
             move_content(delta_x, delta_y);
             if (navigation.focus_key == focus && navigation.selected_index == index && navigation.home_shelf == shelf &&
-                navigation.library_rail_focused == library_rail && navigation.settings_rail_focused == settings_rail) {
+                navigation.library_rail_focused == library_rail && navigation.settings_rail_focused == settings_rail &&
+                navigation.friends_filter == friends_filter) {
                 navigation.tabs_focused = true;
                 navigation.tab_focus = route_tab(navigation.route);
             }
@@ -10045,23 +10526,40 @@ bool Simulation::tab_bar_shown() const {
     const auto route = state_.navigation.route;
     return state_.navigation.modals.empty() && !state_.editor.active &&
            (route == Route::Home || route == Route::Library || route == Route::Downloads || route == Route::Saves ||
-            route == Route::Settings);
+            route == Route::Settings || (route == Route::Friends && rt::OnlineSteamEnabled()));
 }
 
 void Simulation::move_content(int delta_x, int delta_y) {
     if (move_browser(state_, delta_x, delta_y)) return;
     if (state_.navigation.route == Route::Settings && move_settings(delta_x, delta_y)) return;
     if (state_.navigation.route == Route::Saves && move_saves(delta_x, delta_y)) return;
+    if (state_.navigation.route == Route::Friends && move_friends(delta_x, delta_y)) return;
     if (state_.navigation.route == Route::ManageGames && move_manage(delta_x, delta_y)) return;
     const int columns = state_.navigation.route == Route::Library ? 6 : 1;
     const int delta = delta_y != 0 ? delta_y * columns : delta_x;
     if (view_.rows.empty()) return;
     // The game page draws only its buttons in a row; status notes between them are not stops.
     if (state_.navigation.route == Route::Details && delta != 0) {
+        // Friends playing (cards under the buttons) is a row of its own: Down enters it, Up returns to the buttons.
+        const auto card = [](const ViewRow& item) { return item.key.rfind("friend-", 0) == 0; };
         const auto button = [](const ViewRow& item) { return item.kind == RowKind::Action || item.kind == RowKind::Toggle; };
-        int target = view_.focused_row;
-        for (int next = view_.focused_row + delta; next >= 0 && next < static_cast<int>(view_.rows.size()); next += delta)
-            if (button(view_.rows[static_cast<std::size_t>(next)])) { target = next; break; }
+        const int here = std::clamp(view_.focused_row, 0, static_cast<int>(view_.rows.size()) - 1);
+        const bool on_card = card(view_.rows[static_cast<std::size_t>(here)]);
+        int target = here;
+        if (delta_y > 0 && !on_card) {
+            for (int index = 0; index < static_cast<int>(view_.rows.size()) && target == here; ++index)
+                if (button(view_.rows[static_cast<std::size_t>(index)]) && card(view_.rows[static_cast<std::size_t>(index)])) target = index;
+        } else if (delta_y < 0 && on_card) {
+            for (int index = 0; index < static_cast<int>(view_.rows.size()); ++index) {
+                const auto& item = view_.rows[static_cast<std::size_t>(index)];
+                if (!button(item) || card(item)) continue;
+                if (target == here || item.key == "details-play") target = index;
+                if (item.key == "details-play") break;
+            }
+        }
+        for (int next = here + delta; target == here && next >= 0 && next < static_cast<int>(view_.rows.size()); next += delta)
+            if (button(view_.rows[static_cast<std::size_t>(next)]) && card(view_.rows[static_cast<std::size_t>(next)]) == on_card)
+                target = next;
         if (target == view_.focused_row) return;
         state_.navigation.selected_index = target;
         state_.navigation.focus_key = view_.rows[static_cast<std::size_t>(target)].key;
@@ -10122,12 +10620,12 @@ void Simulation::change_route(int delta) {
     if (state_.editor.active || !state_.navigation.modals.empty()) return;
     // The password form and its Steam Guard steps are left with Cancel, which stops the sign-in and wipes them.
     if (state_.navigation.route == Route::SignIn && state_.sign_in.step != SignInStep::Qr) return;
-    constexpr Route routes[] = {Route::Home, Route::Library, Route::Downloads, Route::Saves, Route::Settings};
-    constexpr int count = static_cast<int>(std::size(routes));
-    auto found = std::find(std::begin(routes), std::end(routes), state_.navigation.route);
-    int index = found == std::end(routes) ? 0 : static_cast<int>(std::distance(std::begin(routes), found));
+    const auto routes = TabRoutes();
+    const int count = static_cast<int>(routes.size());
+    auto found = std::find(routes.begin(), routes.end(), state_.navigation.route);
+    int index = found == routes.end() ? 0 : static_cast<int>(std::distance(routes.begin(), found));
     index = ((index + delta) % count + count) % count;
-    state_.navigation.route = routes[index];
+    state_.navigation.route = routes[static_cast<std::size_t>(index)];
     state_.navigation.selected_index = 0;
     state_.navigation.focus_key.clear();
     state_.navigation.settings_rail_focused = false;
@@ -10279,7 +10777,10 @@ void Simulation::settle_quit_sync(GameId id, std::optional<CloudStatus> status) 
                          state_.navigation.modals.back().action_keys.size() == 2 &&
                          state_.navigation.modals.back().action_keys.front() == "saves-quit-anyway";
     quit_sync_game_ = {};
-    if (!waiting) return;  // the player cancelled
+    if (!waiting) {  // the player cancelled
+        finish_setup_game_ = {};
+        return;
+    }
     if (status && (*status == CloudStatus::Synced || *status == CloudStatus::UpToDate || *status == CloudStatus::Unsupported)) {
         state_.navigation.modals.clear();
         quit_to_home();
@@ -10314,6 +10815,18 @@ void Simulation::NotifyCloudRefused(GameId id) {
 
 
 void Simulation::open_game_settings() {
+    // A game awaiting registration has its settings published, but changing them now would miss its first start.
+    if (live()) {
+        const auto id = state_.navigation.selected_game_id;
+        if (const auto runtime_game = state_.runtime_games.find(id);
+            runtime_game != state_.runtime_games.end() && runtime_game->second.awaiting_registration) {
+            const auto* game = find_game(state_, id);
+            push_notice({"settings-" + ToKey(id), "Game settings opens after Finish setup", "", false, kLiveNoticeSeconds, false,
+                         (game ? game->title : std::string("The game")) +
+                             " · Changes made now would miss its first start. Finish setup, then open Playden again to change them."});
+            return;
+        }
+    }
     expanded_settings_sections_.clear();
     const auto opened = state_.game_settings.find(state_.navigation.selected_game_id);
     settings_opened_record_ = opened == state_.game_settings.end() ? rt::GameSettingsRecord{} : opened->second;
@@ -10326,14 +10839,25 @@ void Simulation::open_game_settings() {
     // A shared recipe's pull request: its state, asked again at most every few minutes.
     request_submission_status(state_.navigation.selected_game_id, false);
     request_program_scan_for_other_recipes(state_.navigation.selected_game_id);
-    // From Game actions it opens on top of that sheet, so Circle returns there.
-    open_modal({"game-settings", "Game settings", state_.navigation.focus_key, game_settings_actions(), 0, false});
+    // From Game actions it opens on top of that sheet, so Circle returns there. It opens on the summary with the
+    // focus on Change settings…: the changes are right above it, and every setting is one press away.
+    auto actions = game_settings_actions();
+    const auto change = std::find(actions.begin(), actions.end(), "change-settings");
+    const int focused = change == actions.end() ? 0 : static_cast<int>(change - actions.begin());
+    open_modal({"game-settings", "Game settings", state_.navigation.focus_key, std::move(actions), focused, false});
+}
+
+// Every setting, by section, over the summary: Circle comes back to it, and closing the summary applies the changes.
+void Simulation::open_settings_list() {
+    // Only over the summary: Game settings may have refused to open while setup is pending.
+    if (state_.navigation.modals.empty() || state_.navigation.modals.back().id != "game-settings") return;
+    open_modal({"game-settings-list", "Change settings", state_.navigation.focus_key, game_settings_list_actions(), 0, false});
 }
 
 void Simulation::activate() {
     if (tab_bar_shown() && state_.navigation.tabs_focused) {
         // Cross opens the focused tab and moves focus onto its page.
-        const int target = std::clamp(state_.navigation.tab_focus, 0, 4);
+        const int target = std::clamp(state_.navigation.tab_focus, 0, static_cast<int>(TabRoutes().size()) - 1);
         const int current = route_tab(state_.navigation.route);
         state_.navigation.tabs_focused = false;
         if (target != current) change_route(target - current);
@@ -10708,6 +11232,7 @@ void Simulation::activate() {
         if (live()) {
             if (live_install_allowed(assessment.readiness, free_space_supported_)) {
                 save_install_choice();
+                set_new_install_defaults(id);
                 if (id.valid())
                     pending_install_requests_.push_back({InstallRequestKind::Install, id, install_volume_id_, false, install_language_,
                                                          install_version(id) ? install_version_ : std::string(),
@@ -10730,6 +11255,7 @@ void Simulation::activate() {
             });
             if (existing == state_.jobs.end()) {
                 save_install_choice();
+                set_new_install_defaults(state_.navigation.selected_game_id);
                 const auto required = assessment.required_bytes.value_or(0);
                 state_.jobs.push_back({next_job_id(), state_.navigation.selected_game_id, "install", next_queue_order(state_), JobStage::Download, JobState::Queued, 0, *assessment.download_bytes, std::nullopt, std::nullopt, {}, JobStage::Download, selected_volume_id_, 0, required, true, false});
                 reconcile_storage(state_);
@@ -10916,6 +11442,55 @@ void Simulation::activate() {
         completed.clear();
         // Finished uninstalls go too; stopped ones still need the player.
         std::erase_if(state_.ended_uninstalls, [](const EndedUninstall& ended) { return ended.stopped.empty(); });
+    } else if (action_name == "friends-filter") {
+        state_.navigation.friends_filter = std::clamp(std::atoi(selected.key.c_str() + std::strlen("friends-filter-")), 0, 2);
+        state_.navigation.focus_key.clear();  // its first friend
+    } else if (action_name == "friend-join") {
+        open_join_sheet(std::strtoull(selected.key.c_str() + std::strlen("friend-"), nullptr, 10));
+    } else if (action_name == "friend-open") {
+        open_friend_game(selected.game_id);
+    } else if (action_name == "invite-friends") {
+        open_invite_sheet(state_.navigation.detail_id.value_or(state_.navigation.selected_game_id));
+    } else if (action_name.rfind("invite-friend-", 0) == 0) {
+        const auto id = std::strtoull(action_name.c_str() + std::strlen("invite-friend-"), nullptr, 10);
+        if (!invite_choice_.erase(id) && invite_choice_.size() < rt::kOnlineLaunchMaxInvites) invite_choice_.insert(id);
+    } else if (action_name == "invite-play") {
+        const auto game = state_.navigation.detail_id.value_or(state_.navigation.selected_game_id);
+        rt::OnlineLaunch online;
+        for (const auto* person : friends_in_section(2))
+            if (invite_choice_.contains(person->steam_id)) online.invites.push_back(person->steam_id);
+        if (online.invites.empty() || !invite_offered(game)) return;
+        play_online(game, std::move(online));
+    } else if (action_name == "join-start" || action_name == "join-use-online") {
+        const auto* person = find_friend(join_friend_);
+        const auto game = person ? friend_game(*person) : GameId{};
+        if (!person || !person->lobby_id || !join_refusal(game).empty()) return;
+        if (action_name == "join-use-online" && !game_online(game)) {
+            // Steam features applies with the game closed; the sheet asked the console whether it runs.
+            std::string refusal;
+            if (!game_closed(game, &refusal)) {
+                push_notice({"join-" + ToKey(game), "Online can't be set now", "", false, kLiveNoticeSeconds, false, refusal});
+                return;
+            }
+            const auto previous_game = state_.navigation.selected_game_id;
+            state_.navigation.selected_game_id = game;
+            const auto had = state_.game_settings.find(game);
+            const std::optional<rt::GameSettingsRecord> before =
+                had == state_.game_settings.end() ? std::nullopt : std::make_optional(had->second);
+            set_game_setting("steam_features", "online");
+            // Play reads the settings from disk: without them the game would start without the Steam session.
+            if (!game_online(game) || !save_profile()) {
+                if (before) state_.game_settings[game] = *before;
+                else state_.game_settings.erase(game);
+                state_.navigation.selected_game_id = previous_game;
+                close_modal();
+                show_alert("The setting could not be saved", "Steam features is not set to Online. Try again from Game settings.");
+                return;
+            }
+        } else if (!game_online(game)) {
+            return;
+        }
+        play_online(game, rt::OnlineLaunch{person->lobby_id, {}});
     } else if (action_name == "saves-filter") {
         state_.navigation.saves_filter = std::clamp(std::atoi(selected.key.c_str() + std::strlen("saves-filter-")), 0,
                                                     static_cast<int>(kSavesFilters.size()) - 1);
@@ -11071,6 +11646,7 @@ void Simulation::activate() {
                 previous->second.play_detail.clear();
             pending_runtime_play_requests_.push_back(id);
             pending_runtime_setup_programs_.erase(id);
+            pending_runtime_online_launches_.erase(id);
         }
     } else if (action_name == "details-update") {
         const auto id = state_.navigation.detail_id.value_or(state_.navigation.selected_game_id);
@@ -11273,6 +11849,9 @@ void Simulation::activate() {
                            (cloud == state_.cloud.end() || cloud->second.status != CloudStatus::Unsupported);
         state_.navigation.modals.clear();
         ready_prompt_game_ = {};
+        const auto runtime_game = state_.runtime_games.find(id);
+        finish_setup_game_ = runtime_game != state_.runtime_games.end() && runtime_game->second.awaiting_registration
+            ? id : GameId{};
         if (!syncs) {
             quit_to_home();
         } else {
@@ -11320,6 +11899,7 @@ void Simulation::activate() {
             state_.navigation.selected_game_id = game;
             if (action_name == "start-failed-settings") {
                 open_game_settings();
+                open_settings_list();
             } else {
                 // Straight to the report, as after "No, it didn't start": no question first, logs included.
                 open_feedback(game, true, false);
@@ -11746,6 +12326,31 @@ void Simulation::activate() {
         refresh_game_settings(); save_profile();
     } else if (live() && action_name == "run-once-start") {
         start_setup_program();
+    } else if (action_name == "manage-dlc") {
+        const auto game = state_.navigation.selected_game_id;
+        if (manage_dlc_offered(game) && manage_dlc_blocker(game).empty()) open_manage_dlc(game);
+    } else if (action_name == "manage-dlc-apply") {
+        const auto game = state_.navigation.selected_game_id;
+        const auto plan = manage_dlc_plan(game);
+        if (!plan.changed() || !manage_dlc_blocker(game).empty() || manage_dlc_short_of_room(game)) return;
+        if (live()) {
+            InstallRequest request{InstallRequestKind::ChangeDlc, game};
+            request.excluded_dlc = plan.excluded;
+            if (plan.install_bytes) request.install_bytes = plan.install_bytes;
+            pending_install_requests_.push_back(std::move(request));
+        }
+        manage_dlc_choice_.clear();
+        // Back on the game's page, where Play says what the change is doing.
+        while (!state_.navigation.modals.empty()) close_modal();
+        const auto* known = find_game(state_, game);
+        push_notice({"update-" + ToKey(game), "DLC change queued", "", false, kLiveNoticeSeconds, false,
+                     live() ? (known && !known->title.empty() ? known->title : std::string("The game")) + " · Follow it in Queue"
+                            : std::string("Fixture: nothing downloads")});
+    } else if (const auto manage_app = parse_dlc_action(action_name, "manage-dlc-")) {
+        const auto game = state_.navigation.selected_game_id;
+        const auto offered = manage_dlc(game);
+        if (std::any_of(offered.begin(), offered.end(), [manage_app](const GameDlc& dlc) { return dlc.app_id == manage_app; }))
+            manage_dlc_choice_[manage_app] = !manage_dlc_on(game, manage_app);
     } else if (action_name == "game-move") {
         const auto game = state_.navigation.selected_game_id;
         if (move_blocker(game, {}).empty() && move_volumes().size() >= 2) open_move_picker(game);
@@ -11947,6 +12552,8 @@ void Simulation::activate() {
                 modal.action_keys = setting_value_actions("dll_overrides");
                 modal.focused_action = std::min(modal.focused_action, static_cast<int>(modal.action_keys.size()) - 1);
                 state_.navigation.focus_key = modal.action_keys[static_cast<std::size_t>(modal.focused_action)];
+                // The summary and the list under the picker follow (a last override removed is no change).
+                refresh_game_settings();
             }
         }
     } else if (action_name == "value-reset" && !state_.navigation.modals.empty()) {
@@ -12024,6 +12631,8 @@ void Simulation::activate() {
             set_game_setting(id, launch ? recipe.launch_entries[index].id : definition->choices[index].value);
         }
         close_modal(); refresh_game_settings(); save_profile();
+    } else if (action_name == "change-settings") {
+        open_settings_list();
     } else if (action_name == "section-compatibility" || action_name == "section-advanced") {
         if (!expanded_settings_sections_.erase(action_name)) expanded_settings_sections_.insert(action_name);
         refresh_game_settings();
@@ -12074,6 +12683,10 @@ void Simulation::activate() {
     else if (action_name == "toggle-motion") { state_.reduced_motion = !state_.reduced_motion; save_profile(); }
     else if (action_name == "toggle-title-store") { state_.title_store_suffix = !state_.title_store_suffix; save_profile(); }
     else if (action_name == "toggle-cloud-saves") { state_.cloud_saves_auto = !state_.cloud_saves_auto; save_profile(); }
+    else if (action_name == "toggle-steam-online-notice" && live() && rt::OnlineSteamEnabled()) {
+        state_.steam_online_notice = !state_.steam_online_notice;
+        save_profile();
+    }
     else if (action_name == "toggle-web-access") { state_.web_access = !state_.web_access; save_profile(); }
     else if (action_name == "toggle-recipe-votes") {
         state_.recipe_votes = state_.recipe_votes == playden::RecipeVotesPreference::kOn ? playden::RecipeVotesPreference::kOff
@@ -12227,6 +12840,7 @@ void Simulation::activate() {
         feedback_.reset();
         state_.navigation.selected_game_id = game;
         open_game_settings();
+        open_settings_list();
     }
     else if (feedback_ && action_name == "feedback-send") {
         if (!state_.reports_explained && feedback_->ticket == 0) open_feedback_privacy();
@@ -12426,7 +13040,7 @@ void Simulation::activate() {
     }
     else if (kOfferGoBack && live() && action_name == "self-update-back-confirm") { close_modal(); request_self_update_restart("rollback"); }
     else if (action_name == "scenario-picker") open_modal({"scenarios", "Fixture scenarios", state_.navigation.focus_key,
-        {"scenario-default", "scenario-leftover-titles", "scenario-download-servers", "scenario-first-run", "scenario-signed-out", "scenario-qr-waiting", "scenario-offline", "scenario-empty", "scenario-no-results", "scenario-delayed-art", "scenario-failed-art", "scenario-install-ready", "scenario-install-options", "scenario-update-available", "scenario-dlc-available", "scenario-updating", "scenario-unknown-size", "scenario-insufficient-space", "scenario-storage-disconnect", "scenario-paused", "scenario-download-failed", "scenario-verification-failed", "scenario-restart-recovery", "scenario-save-failure", "scenario-runtime-unavailable", "scenario-launch-failure", "scenario-crash", "scenario-stop-failure", "scenario-controller-disconnected", "scenario-reduced-motion", "scenario-stress", "scenario-import-empty", "scenario-import-candidates", "scenario-import-programs", "scenario-import-choice", "scenario-import-storage", "scenario-import-drop-choice", "scenario-import-drop-storage", "scenario-import-details", "scenario-import-copying", "scenario-import-library", "cancel"}, 0, false});
+        {"scenario-default", "scenario-leftover-titles", "scenario-download-servers", "scenario-first-run", "scenario-signed-out", "scenario-qr-waiting", "scenario-offline", "scenario-empty", "scenario-no-results", "scenario-delayed-art", "scenario-failed-art", "scenario-install-ready", "scenario-install-options", "scenario-update-available", "scenario-dlc-available", "scenario-dlc-manage", "scenario-updating", "scenario-unknown-size", "scenario-insufficient-space", "scenario-storage-disconnect", "scenario-paused", "scenario-download-failed", "scenario-verification-failed", "scenario-restart-recovery", "scenario-save-failure", "scenario-runtime-unavailable", "scenario-launch-failure", "scenario-crash", "scenario-stop-failure", "scenario-controller-disconnected", "scenario-reduced-motion", "scenario-stress", "scenario-import-empty", "scenario-import-candidates", "scenario-import-programs", "scenario-import-choice", "scenario-import-storage", "scenario-import-drop-choice", "scenario-import-drop-storage", "scenario-import-details", "scenario-import-copying", "scenario-import-library", "cancel"}, 0, false});
     else if (action_name.rfind("scenario-", 0) == 0) { state_.navigation.modals.clear(); scenario(action_name.substr(9)); }
     else if (action_name == "session-fixture-controls") open_modal({"session-controls", "Session fixture controls", state_.navigation.focus_key,
         {"advance-clock", "inject-stop-failure", "inject-crash", "cancel"}, 0, false});
@@ -12624,6 +13238,7 @@ bool Simulation::action(const std::string& logical_action, bool repeat) {
                 && value.state != JobState::Downloaded && value.state != JobState::Failed;
         });
         if (existing == state_.jobs.end()) {
+            set_new_install_defaults(id);
             state_.jobs.push_back({next_job_id(), id, "install", next_queue_order(state_), JobStage::Download, JobState::Queued, 0, *assessment.download_bytes, std::nullopt, std::nullopt, {}, JobStage::Download, volume_id, 0, assessment.required_bytes.value_or(0), true, false});
             reconcile_storage(state_);
         }
@@ -12662,6 +13277,7 @@ bool Simulation::action(const std::string& logical_action, bool repeat) {
         else if (route == "downloads") state_.navigation.route = Route::Downloads;
         else if (route == "settings") state_.navigation.route = Route::Settings;
         else if (route == "saves") state_.navigation.route = Route::Saves;
+        else if (route == "friends" && rt::OnlineSteamEnabled()) state_.navigation.route = Route::Friends;
         else { last_error_ = "Unknown route: " + route; return false; }
         clear_sign_in_secrets();
         state_.navigation.modals.clear(); state_.editor.active = false; state_.navigation.focus_key.clear(); rebuild_view(); return true;
@@ -12746,11 +13362,12 @@ bool Simulation::action(const std::string& logical_action, bool repeat) {
     else if (logical_action == "l2") move(0, -4);
     else if (logical_action == "r2") move(0, 4);
     else if ((logical_action == "l1" || logical_action == "r1") && !state_.navigation.modals.empty() &&
-             (state_.navigation.modals.back().id == "game-settings" || state_.navigation.modals.back().id == "preset-picker" ||
+             (state_.navigation.modals.back().id == "game-settings-list" || state_.navigation.modals.back().id == "preset-picker" ||
               state_.navigation.modals.back().id == "game-maintenance" ||
               state_.navigation.modals.back().id == "content-language" ||
               state_.navigation.modals.back().id == "install-language" ||
               state_.navigation.modals.back().id == "install-dlc" ||
+              state_.navigation.modals.back().id == "manage-dlc" ||
               state_.navigation.modals.back().id == "install-version" ||
               state_.navigation.modals.back().id == "button-mapping" || state_.navigation.modals.back().id == "controller-tuning" ||
               !state_.navigation.modals.back().setting_id.empty()))
@@ -12768,6 +13385,13 @@ bool Simulation::action(const std::string& logical_action, bool repeat) {
                                                                                      : CloudRequestKind::StopJob, {}});
     else if (logical_action == "search") { if (!state_.editor.active && state_.navigation.route == Route::Library && state_.navigation.modals.empty()) start_editor("Search", state_.library.query); }
     else if (logical_action == "triangle" && !state_.editor.active && state_.navigation.modals.empty() &&
+             state_.navigation.route == Route::Friends) {
+        // Appear invisible / Appear online: the controller passes it on to Steam (online-steam's session and the Steam
+        // host of the next Online game).
+        state_.steam_invisible = !state_.steam_invisible;
+        save_profile();
+    }
+    else if (logical_action == "triangle" && !state_.editor.active && state_.navigation.modals.empty() &&
              state_.navigation.route == Route::ManageGames) {
         // Triangle runs the open tab's action from anywhere on the screen; the dialog returns to the row.
         if (state_.navigation.manage_tab == ManageTab::Uninstall) ask_manage_uninstall();
@@ -12779,7 +13403,7 @@ bool Simulation::action(const std::string& logical_action, bool repeat) {
              state_.navigation.modals.back().id == "preset-picker" && state_.navigation.focus_key.rfind("mypreset-my-", 0) == 0)
         open_my_preset_menu(state_.navigation.focus_key.substr(9));
     else if (logical_action == "triangle" && !state_.editor.active && !state_.navigation.modals.empty() &&
-             (state_.navigation.modals.back().id == "game-settings" || state_.navigation.modals.back().id == "controller-tuning" ||
+             (state_.navigation.modals.back().id == "game-settings-list" || state_.navigation.modals.back().id == "controller-tuning" ||
               !state_.navigation.modals.back().setting_id.empty())) {
         // Triangle returns the focused setting (or the open picker's setting) to the preset value.
         const auto& modal = state_.navigation.modals.back();
@@ -12862,6 +13486,11 @@ bool Simulation::action(const std::string& logical_action, bool repeat) {
             save_profile();
         } else if (live() && state_.navigation.modals.empty() && state_.navigation.route == Route::Saves) {
             ask_upload_all();
+        } else if (state_.navigation.modals.empty() && state_.navigation.route == Route::Friends &&
+                   state_.navigation.focus_key.rfind("friend-", 0) == 0) {
+            const auto found = std::find_if(view_.rows.begin(), view_.rows.end(),
+                                            [this](const ViewRow& item) { return item.key == state_.navigation.focus_key; });
+            if (found != view_.rows.end()) open_friend_game(found->game_id);
         } else if (state_.navigation.modals.empty() && state_.navigation.route == Route::ManageGames) {
             manage_select_all();
         }
@@ -13771,6 +14400,11 @@ std::optional<GameRef> Simulation::sharing_ref(GameId id) const {
     return SharingGameRef(id, steam_app_of(id), game ? game->title : std::string());
 }
 
+bool Simulation::uses_vac(GameId id) const {
+    const auto facts = store_facts_.find(id);
+    return facts != store_facts_.end() && facts->second.vac;
+}
+
 const std::vector<CommunityRecipeOffer>* Simulation::community_offers(GameId id) const {
     if (!community_enabled_) return nullptr;
     const auto ref = community_ref(id);
@@ -14492,7 +15126,6 @@ bool Simulation::EffectiveSettingsFor(GameId id, rt::EffectiveSettings* settings
 }
 
 std::vector<std::string> Simulation::game_settings_actions() const {
-    using G = rt::SettingGroup;
     const auto game = state_.navigation.selected_game_id;
     std::vector<std::string> actions = {"preset-picker"};
     // A chosen community recipe that isn't used, a switch that didn't finish, a newer revision.
@@ -14500,15 +15133,18 @@ std::vector<std::string> Simulation::game_settings_actions() const {
     else if (const auto runtime = state_.runtime_games.find(game);
              runtime != state_.runtime_games.end() && !runtime->second.recipe_switch_failure.empty())
         actions.push_back("recipe-status");
-    // Community recipes: a newer revision, the vote for the recipe in use, and the state of this game's shared recipe.
+    // Community recipes: a newer revision and the vote for the recipe in use.
     // Off (features.txt), none of them: a recipe the game already uses stays its base, with no update or vote.
     if (community_enabled_) {
         if (updated_offer(game)) actions.push_back("recipe-update");
         if (VoteTargetFor(game)) actions.push_back("recipe-vote");
-        if (const auto record = state_.game_settings.find(game);
-            record != state_.game_settings.end() && !record->second.shared_recipe.submission_id.empty())
-            actions.push_back("shared-recipe");
     }
+    // What the player changed on top of the preset, as text the focus passes over; then every setting, one press away.
+    actions.push_back("heading-your-changes");
+    const auto summary = settings_summary(game);
+    if (summary.empty()) actions.push_back("summary-none");
+    for (const auto& line : summary) actions.push_back(line.key);
+    actions.push_back("change-settings");
     // My presets: save the game's settings as one, or put its own changes into the one it uses. Save is left out while
     // the presets file can't be read (Playden said so at startup): it could only refuse.
     switch (MyPresetActionFor(game)) {
@@ -14516,9 +15152,24 @@ std::vector<std::string> Simulation::game_settings_actions() const {
         case MyPresetAction::kUpdate: actions.push_back("update-my-preset"); break;
         case MyPresetAction::kNone: break;
     }
+    // Share recipe sends the game's settings for review; Shared recipe follows the one sent.
+    if (community_enabled_) {
+        if (sharing_ref(game)) actions.push_back("share-recipe");
+        if (const auto record = state_.game_settings.find(game);
+            record != state_.game_settings.end() && !record->second.shared_recipe.submission_id.empty())
+            actions.push_back("shared-recipe");
+    }
+    actions.insert(actions.end(), {"divider", "reset-settings", "cancel"});
+    return actions;
+}
+
+std::vector<std::string> Simulation::game_settings_list_actions() const {
+    using G = rt::SettingGroup;
+    const auto game = state_.navigation.selected_game_id;
+    std::vector<std::string> actions;
     const auto rows = [&](G group) {
         for (const auto& definition : rt::SettingsCatalogue())
-            if (definition.group == group && game_settings_row_shown(definition, game)) actions.push_back("setting-" + definition.id);
+            if (SheetGroup(definition) == group && game_settings_row_shown(definition, game)) actions.push_back("setting-" + definition.id);
     };
     // Rows by topic under headings that only label them; Compatibility and Advanced start collapsed.
     actions.push_back("heading-game");
@@ -14527,6 +15178,11 @@ std::vector<std::string> Simulation::game_settings_actions() const {
     if (game.store == Store::kLocal) {
         const auto program = std::find(actions.begin(), actions.end(), "setting-launch_option");
         actions.insert(program == actions.end() ? actions.end() : program + 1, "steam-app-id");
+    }
+    // Online play right after Game, open, so a player finds it.
+    if (rt::OnlineSteamEnabled()) {
+        actions.push_back("heading-online");
+        rows(G::kOnline);
     }
     actions.push_back("heading-display");
     rows(G::kDisplay);
@@ -14541,6 +15197,8 @@ std::vector<std::string> Simulation::game_settings_actions() const {
         rows(G::kCompatibility);
         actions.push_back("heading-graphics");
         rows(G::kGraphics);
+        actions.push_back("heading-steam");
+        rows(G::kSteam);
         actions.push_back("heading-windows");
         rows(G::kWindows);
     }
@@ -14550,11 +15208,66 @@ std::vector<std::string> Simulation::game_settings_actions() const {
         actions.push_back("effective-command");
         actions.push_back("export-recipe");
     }
-    // Share recipe sends the game's settings for review, set apart just above Reset; the file export stays for FTP.
-    if (community_enabled_ && sharing_ref(game)) actions.insert(actions.end(), {"divider", "share-recipe", "divider"});
-    actions.push_back("reset-settings");
-    actions.push_back("cancel");
+    actions.insert(actions.end(), {"divider", "cancel"});
     return actions;
+}
+
+std::vector<Simulation::SettingsSummaryLine> Simulation::settings_summary(GameId id) const {
+    std::vector<SettingsSummaryLine> lines;
+    const auto record = state_.game_settings.find(id);
+    if (record == state_.game_settings.end()) return lines;
+    // Reset's rule: a stored choice is a change unless Reset keeps it (an imported game's own program).
+    const auto kept = reset_overrides(id);
+    std::set<std::string> changed;
+    for (const auto& [setting, value] : record->second.overrides) {
+        const auto found = kept.find(setting);
+        // "Change anyway" on a locked row is a change of that row, even before a value is chosen.
+        const bool unlock = setting.rfind(rt::kUnlockPrefix, 0) == 0;
+        if (found == kept.end() || found->second != value) changed.insert(unlock ? setting.substr(std::string(rt::kUnlockPrefix).size()) : setting);
+    }
+    if (changed.empty()) return lines;
+    rt::EffectiveSettings values;
+    const bool known = EffectiveSettingsFor(id, &values);
+    int buttons = 0, tuning = 0;
+    bool program = false;
+    for (const auto& definition : rt::SettingsCatalogue()) {
+        if (!changed.count(definition.id)) continue;
+        // Button mapping and Controller tuning are one row each in the list: one line each here.
+        if (definition.id.rfind("button.", 0) == 0) { ++buttons; continue; }
+        if (definition.group == rt::SettingGroup::kControllerTuning) { ++tuning; continue; }
+        SettingsSummaryLine line{"summary-" + definition.id, definition.id, definition.label, {}, SheetGroup(definition)};
+        // A launch option and a program from the game folder are both the Program row.
+        if (definition.id == "launch_option" || definition.id == "program") {
+            if (program) continue;
+            program = true;
+            line = {"summary-launch_option", "launch_option", "Program", {}, SheetGroup(definition)};
+            const auto own = record->second.overrides.find(definition.id);
+            line.value = known && values.launch ? values.launch->label
+                       : own != record->second.overrides.end() ? own->second : std::string("Choose a program");
+            lines.push_back(std::move(line));
+            continue;
+        }
+        // What the player chose, even where the runtime kit can't use it yet (the row is hidden or waits for it); an
+        // unlocked row with no choice yet shows the value it has.
+        const auto own = record->second.overrides.find(definition.id);
+        const auto current = known ? values.values.find(definition.id) : values.values.end();
+        const std::string chosen = own != record->second.overrides.end() ? own->second
+                                 : current != values.values.end() ? rt::ChosenValue(current->second) : std::string();
+        if (definition.id == "program_folder") line.value = chosen.empty() ? "Program's folder" : chosen == "." ? "Game folder" : chosen;
+        else if (definition.kind == rt::SettingKind::kText) line.value = chosen.empty() ? "Empty" : chosen;
+        else line.value = choice_label(definition, chosen);
+        lines.push_back(std::move(line));
+    }
+    // Where the list has them: after the Controls rows, before Sound.
+    auto after_controls = std::find_if(lines.begin(), lines.end(), [](const SettingsSummaryLine& line) {
+        return line.group != rt::SettingGroup::kGame && line.group != rt::SettingGroup::kDisplay &&
+               line.group != rt::SettingGroup::kControls;
+    });
+    std::vector<SettingsSummaryLine> controller;
+    if (buttons > 0) controller.push_back({"summary-buttons", "", "Button mapping", std::to_string(buttons) + (buttons == 1 ? " button" : " buttons"), rt::SettingGroup::kButtonMapping});
+    if (tuning > 0) controller.push_back({"summary-tuning", "", "Controller tuning", std::to_string(tuning) + " changed", rt::SettingGroup::kControllerTuning});
+    lines.insert(after_controls, controller.begin(), controller.end());
+    return lines;
 }
 
 // Whether the sheet lists a setting's row: Known problems only for a game that has one.
@@ -14562,6 +15275,11 @@ bool Simulation::game_settings_row_shown(const rt::SettingDefinition& definition
     if (definition.id == "launcher_controller_preset") {
         rt::EffectiveSettings values;
         if (!EffectiveSettingsFor(game, &values) || values.values["start_through_launcher"].value != "on") return false;
+    }
+    // Game invites only for a game set to Steam features = Online.
+    if (definition.id == "game_invites") {
+        rt::EffectiveSettings values;
+        if (!EffectiveSettingsFor(game, &values) || values.values["steam_features"].value != "online") return false;
     }
     return rt::SettingShown(definition, kit_) && (definition.id != "start_check" || known_problem(game));
 }
@@ -14647,6 +15365,8 @@ std::vector<std::string> Simulation::maintenance_actions() const {
                                      "maintenance-backup", "maintenance-recreate", "cancel"};
     // An installed game can move to another drive; imported games have Copy or Move into Playden instead.
     const auto id = state_.navigation.selected_game_id;
+    // Its DLC can be installed or removed later (Manage DLC), beside the move.
+    if (manage_dlc_offered(id)) actions.insert(actions.end() - 1, "manage-dlc");
     if (id.store != Store::kLocal && find_installation(state_, id))
         actions.insert(actions.end() - 1, "game-move");
     return actions;
@@ -14698,6 +15418,24 @@ void Simulation::request_maintenance(GameId id, MaintenanceKind kind) {
     game.maintenance_message.clear();
 }
 
+void Simulation::set_new_install_defaults(GameId id) {
+    // Only a Steam game has a Steam folder; an installed one keeps where it is, as moving it can break it.
+    if (!id.valid() || id.store != Store::kSteam || is_installed(state_, id)) return;
+    if (live() && (settings_load_failed_ || game_settings_file_.empty())) return;
+    const std::string key = std::string(rt::kGameDefaultPrefix) + "steam_library_path";
+    auto& record = state_.game_settings[id];
+    if (const auto found = record.overrides.find(key); found != record.overrides.end() && found->second == "steam") return;
+    // Not a change of the player's: the revision stays, and the preparation after the download reads it.
+    record.overrides[key] = "steam";
+    if (live() || state_.persistence_available) save_profile();
+}
+
+std::map<std::string, std::string> Simulation::game_default_overrides(GameId id) const {
+    const auto record = state_.game_settings.find(id);
+    return record == state_.game_settings.end() ? std::map<std::string, std::string>{}
+                                                : rt::GameDefaultOverrides(record->second.overrides);
+}
+
 std::map<std::string, std::string> Simulation::kept_start_choices(GameId id) const {
     const auto record = state_.game_settings.find(id);
     if (record == state_.game_settings.end()) return {};
@@ -14741,7 +15479,7 @@ void Simulation::build_preset_comparison(GameId id, const std::string& preset_id
             comparison.rows.push_back({"Button mapping", "", std::to_string(buttons) + (buttons == 1 ? " button" : " buttons") + " change"});
     }
     const auto record = state_.game_settings.find(id);
-    const bool custom = record != state_.game_settings.end() && !record->second.overrides.empty();
+    const bool custom = record != state_.game_settings.end() && rt::HasPlayerOverrides(record->second.overrides);
     comparison.note = changes == 0 ? (custom ? "Clears your changes; the values stay the same." : "Nothing changes.")
                     : std::to_string(changes) + (changes == 1 ? " setting changes" : " settings change") +
                       ". All apply on next launch. What the game requires stays.";
@@ -14803,6 +15541,7 @@ void Simulation::open_setting(const std::string& id) {
             if (launch && recipe.launch_entries[index].id == rt::kProgramEntryId &&
                 in_folder(recipe.launch_entries[index].executable))
                 continue;
+            if (!launch && !rt::SettingChoiceOffered(id, definition->choices[index].value)) continue;
             const auto& choice = launch ? recipe.launch_entries[index].id : definition->choices[index].value;
             if (choice == rt::ChosenValue(value) ||
                 (picked && BottlePath(recipe.launch_entries[index].executable) == BottlePath(values.launch->executable)))
@@ -14939,13 +15678,14 @@ std::optional<rt::CommunityRecipe> Simulation::build_shared_recipe(GameId id, bo
     rt::CommunityObjectState state;
     const auto* object = base ? community_object(base->revision, &state) : nullptr;
     if (!object || !rt::IsSettingsOnlyRecipe(*object)) return community;
-    // The base as it applies to this copy, without the player's changes, against the game's settings.
+    // The base as it applies to this copy, without the player's changes (its own defaults stay), against the game's
+    // settings.
     BaseChoice from;
     from.community = *base;
-    static const std::map<std::string, std::string> none;
+    const auto defaults = game_default_overrides(id);
     rt::EffectiveSettings before, after;
     rt::SettingsError error;
-    if (!rt::BuildEffectiveSettings(recipe_for_base(id, from), preset_for_base(from), none, kit_for(id), &before, &error) ||
+    if (!rt::BuildEffectiveSettings(recipe_for_base(id, from), preset_for_base(from), defaults, kit_for(id), &before, &error) ||
         !EffectiveSettingsFor(id, &after))
         return std::nullopt;
     auto shared = rt::BuildSettingsOnlyRecipe(*object, before, after, community->game, community->game_name,
@@ -14964,12 +15704,13 @@ std::string Simulation::share_changes(GameId id, const std::optional<cm::RecipeR
     *differs = false;
     *program_or_graphics = false;
     if (program_changed) *program_changed = false;
-    static const std::map<std::string, std::string> none;
+    // The base without the player's changes; the game's own defaults stay, as they aren't changes.
+    const auto defaults = game_default_overrides(id);
     BaseChoice from;
     if (base) from.community = {base->recipe_id, base->revision};
     rt::EffectiveSettings before, after;
     rt::SettingsError error;
-    if (!rt::BuildEffectiveSettings(recipe_for_base(id, from), preset_for_base(from), none, kit_for(id), &before, &error) ||
+    if (!rt::BuildEffectiveSettings(recipe_for_base(id, from), preset_for_base(from), defaults, kit_for(id), &before, &error) ||
         !EffectiveSettingsFor(id, &after))
         return {};
     // Whether the player changed what starts: the program as it resolves (the same file however its path is written),
@@ -15005,7 +15746,8 @@ std::string Simulation::share_changes(GameId id, const std::optional<cm::RecipeR
     static const std::set<std::string> covered = {"launch_option", "program", "dll_overrides", "library_overrides", "architecture"};
     static const std::set<std::string> program_rows = {"program_folder", "program_arguments", "arguments", "graphics"};
     for (const auto& definition : rt::SettingsCatalogue()) {
-        if (covered.count(definition.id)) continue;
+        // The player's own rows are not shared, so changing one is not a share change either.
+        if (covered.count(definition.id) || rt::IsPersonalSettingRow(definition.id)) continue;
         const auto& value = after.values.at(definition.id);
         // A row the game's title can't use yet (it waits for its runtime kit update) stays out of the recipe, so it
         // isn't a change the share sends either.
@@ -15483,7 +16225,7 @@ bool Simulation::changes_worth_sharing(GameId id) const {
                                                       "performance_overlay", "overlay_detail", "vsync", "scaling",
                                                       "text_scale", "volume", "rumble", "logging", "locale"};
     return std::any_of(record->second.overrides.begin(), record->second.overrides.end(),
-                       [](const auto& item) { return !preferences.count(item.first); });
+                       [](const auto& item) { return !preferences.count(item.first) && !rt::IsGameDefaultKey(item.first); });
 }
 
 std::string Simulation::feedback_kit() const {
@@ -15627,6 +16369,10 @@ void Simulation::send_feedback() {
     if (draft.recipe) request.based_on = draft.recipe;
     request.author = share_as_effective() == playden::ShareAs::kName ? state_.share_name : std::string();
     request.kit = state_.kit.version.empty() ? std::string("unknown") : state_.kit.version;
+    // A game set to Online runs Valve's current Steam client: which version, for a report about it.
+    if (game_online(id))
+        request.versions.emplace_back("Steam client", state_.kit.steam_client.empty() ? std::string("not installed")
+                                                                                     : state_.kit.steam_client);
     request.firmware = console_firmware_.empty() ? std::string("unknown") : console_firmware_;
     request.playden_version = !sharing_playden_version_.empty() ? sharing_playden_version_
                             : !state_.self_update.current.empty() ? state_.self_update.current : std::string("unknown");
@@ -16160,9 +16906,9 @@ std::string Simulation::vote_words(const cm::CastVote* vote) const {
 
 void Simulation::refresh_game_settings() {
     for (auto& modal : state_.navigation.modals) {
-        if (modal.id != "game-settings") continue;
+        if (modal.id != "game-settings" && modal.id != "game-settings-list") continue;
         const auto focused = modal.action_keys[static_cast<std::size_t>(modal.focused_action)];
-        modal.action_keys = game_settings_actions();
+        modal.action_keys = modal.id == "game-settings" ? game_settings_actions() : game_settings_list_actions();
         const auto found = std::find(modal.action_keys.begin(), modal.action_keys.end(), focused);
         modal.focused_action = found == modal.action_keys.end() ? 0 : static_cast<int>(found - modal.action_keys.begin());
         if (&modal == &state_.navigation.modals.back()) state_.navigation.focus_key = modal.action_keys[static_cast<std::size_t>(modal.focused_action)];
@@ -16201,7 +16947,7 @@ void Simulation::announce_settings_saved() {
                                        runtime_game->second.play_status == "Playing")
                                 : !game_closed(game);
     when += running ? " the next time Playden starts the game" : " on next launch";
-    push_notice({"settings-saved", "Settings saved · " + (after.overrides.empty() ? name : "Custom · from " + name), "", false,
+    push_notice({"settings-saved", "Settings saved · " + (!rt::HasPlayerOverrides(after.overrides) ? name : "Custom · from " + name), "", false,
                  kLiveNoticeSeconds, false, when});
     // A prepared title gets the new settings now when it is stopped, a new program or folder
     // included (RuntimeHost::RepublishSettings); otherwise Play applies them.
@@ -16304,6 +17050,261 @@ std::string PreparationProgressWords(bool has_record, const std::string& step) {
     if (words.empty() || words == "Preparing") return words;
     return "Step " + std::to_string(has_record ? PreparationStepNumber(step) : 1) + " of " +
            std::to_string(kPreparationSteps) + " · " + words;
+}
+
+// Friends (online-steam): the Friends tab, Friends playing on a game's page, and the Join and Invite sheets.
+
+void Simulation::UpdateFriends(std::vector<Friend> friends, bool connected, bool need_sign_in) {
+    if (!live()) return;
+    if (!rt::OnlineSteamEnabled()) friends.clear(), connected = false, need_sign_in = false;
+    state_.friends = std::move(friends);
+    state_.friends_connected = connected;
+    state_.friends_need_sign_in = need_sign_in;
+}
+
+GameId Simulation::friend_game(const Friend& person) const {
+    if (person.app_id == 0) return {};
+    if (find_game(state_, GameId::Steam(person.app_id))) return GameId::Steam(person.app_id);
+    // A copy from another store or an imported folder whose Steam app ID is the friend's game.
+    for (const auto& game : state_.games)
+        if (steam_app_of(game.id) == person.app_id) return game.id;
+    return {};
+}
+
+const Friend* Simulation::find_friend(std::uint64_t steam_id) const {
+    const auto found = std::find_if(state_.friends.begin(), state_.friends.end(),
+                                    [steam_id](const Friend& person) { return person.steam_id == steam_id; });
+    return found == state_.friends.end() ? nullptr : &*found;
+}
+
+std::pair<std::string, std::string> Simulation::friend_status(const Friend& person, bool with_game) const {
+    if (person.persona_state == 0) return {"Offline", "quiet"};
+    if (person.app_id != 0 || !person.game_name.empty()) {
+        const auto game = friend_game(person);
+        const auto* found = game.valid() ? find_game(state_, game) : nullptr;
+        if (!with_game) return {person.lobby_id ? "In a lobby" : "Playing", "good"};
+        const std::string name = found ? found->title : !person.game_name.empty() ? person.game_name : std::string("a game");
+        return {"Playing " + name + (person.lobby_id ? " · in a lobby" : ""), "good"};
+    }
+    if (person.persona_state == 2) return {"Busy", "attention"};
+    if (person.persona_state == 3 || person.persona_state == 4) return {"Away", "attention"};
+    return {"Online", ""};
+}
+
+std::vector<const Friend*> Simulation::friends_in_section(int section) const {
+    std::vector<const Friend*> out;
+    for (const auto& person : state_.friends) {
+        if (section == 0 && person.persona_state == 0) continue;
+        if (section == 1 && (person.persona_state == 0 || !friend_game(person).valid())) continue;
+        out.push_back(&person);
+    }
+    // In a lobby of a library game, playing, online, away, offline; then by name.
+    const auto rank = [this](const Friend& person) {
+        if (person.persona_state == 0) return 4;
+        if (person.app_id != 0 || !person.game_name.empty()) return person.lobby_id && friend_game(person).valid() ? 0 : 1;
+        return person.persona_state == 1 || person.persona_state > 4 ? 2 : 3;
+    };
+    const auto folded = [](std::string value) {
+        for (auto& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return value;
+    };
+    std::stable_sort(out.begin(), out.end(), [&](const Friend* left, const Friend* right) {
+        const int a = rank(*left), b = rank(*right);
+        return a != b ? a < b : folded(left->name) < folded(right->name);
+    });
+    return out;
+}
+
+std::string Simulation::join_refusal(GameId game) const {
+    const auto* found = find_game(state_, game);
+    if (!found) return "This game is not in your library.";
+    if (!is_installed(state_, game) && !external_game(game)) return "Install " + found->title + " to join.";
+    if (update_locked(game)) return held_play_text(state_, game);
+    if (live()) {
+        const auto runtime = state_.runtime_games.find(game);
+        if (runtime == state_.runtime_games.end() || !runtime->second.ready)
+            return "Play " + found->title + " once from its page so Playden sets it up. Then you can join.";
+        return {};
+    }
+    const auto* installation = find_installation(state_, game);
+    if (installation && !installation->runtime_ready) return "Playden needs its runtime kit to start games.";
+    return {};
+}
+
+bool Simulation::game_online(GameId game) const {
+    if (!rt::OnlineSteamEnabled()) return false;
+    rt::EffectiveSettings values;
+    return EffectiveSettingsFor(game, &values) && values.values["steam_features"].value == "online";
+}
+
+bool Simulation::invite_offered(GameId game) const {
+    return rt::OnlineSteamEnabled() && !state_.friends.empty() && game_online(game) && join_refusal(game).empty();
+}
+
+// The Friends tab: its rail (Online, In my games, All) and two columns of friends. Up and Down on the rail switch the
+// section; Right enters the friends, Left from the first column returns to the rail. Up from the top reaches the tab bar.
+bool Simulation::move_friends(int delta_x, int delta_y) {
+    if (view_.rows.empty()) return true;
+    const auto rail = [](const ViewRow& item) { return item.key.rfind("friends-filter-", 0) == 0; };
+    std::vector<int> tiles;
+    for (int index = 0; index < static_cast<int>(view_.rows.size()); ++index)
+        if (view_.rows[static_cast<std::size_t>(index)].key.rfind("friend-", 0) == 0) tiles.push_back(index);
+    const int current = std::clamp(view_.focused_row, 0, static_cast<int>(view_.rows.size()) - 1);
+    const auto focus = [this](int index) {
+        state_.navigation.selected_index = index;
+        state_.navigation.focus_key = view_.rows[static_cast<std::size_t>(index)].key;
+    };
+    if (rail(view_.rows[static_cast<std::size_t>(current)])) {
+        if (delta_y != 0) {
+            const int section = std::clamp(state_.navigation.friends_filter + (delta_y > 0 ? 1 : -1), 0, 2);
+            if (section == state_.navigation.friends_filter) return true;
+            state_.navigation.friends_filter = section;
+            state_.navigation.focus_key = "friends-filter-" + std::to_string(section);
+            state_.navigation.selected_index = section;
+        } else if (delta_x > 0 && !tiles.empty()) {
+            focus(tiles.front());
+        }
+        return true;
+    }
+    const auto here = std::find(tiles.begin(), tiles.end(), current);
+    if (here == tiles.end()) return true;
+    const int place = static_cast<int>(here - tiles.begin());
+    const int count = static_cast<int>(tiles.size());
+    if (delta_x < 0 && place % 2 == 0) {
+        state_.navigation.focus_key = "friends-filter-" + std::to_string(state_.navigation.friends_filter);
+        state_.navigation.selected_index = state_.navigation.friends_filter;
+        return true;
+    }
+    int target = place;
+    if (delta_x != 0) target = place + (delta_x > 0 ? 1 : -1);
+    else if (delta_y != 0) target = place + (delta_y > 0 ? 2 : -2);
+    if (delta_x > 0 && place % 2 == 1) target = place;  // the second column is the right edge
+    if (target < 0 || target >= count) {
+        // Down from a row with no friend below lands on the last one.
+        // Up from the top row stays, so the tab bar takes the focus (Simulation::move).
+        if (delta_y > 0 && place / 2 < (count - 1) / 2) target = count - 1;
+        else return true;
+    }
+    if (target != place) focus(tiles[static_cast<std::size_t>(target)]);
+    return true;
+}
+
+void Simulation::open_join_sheet(std::uint64_t steam_id) {
+    const auto* person = find_friend(steam_id);
+    if (!person || !person->lobby_id) return;
+    join_friend_ = steam_id;
+    const auto game = friend_game(*person);
+    std::vector<std::string> actions;
+    if (join_refusal(game).empty()) {
+        const auto* online = rt::FindSetting("steam_features");
+        rt::EffectiveSettings values;
+        // A recipe that sets Steam features keeps it: Game settings' Change anyway is the way past it, not Join.
+        const bool can_set = online && EffectiveSettingsFor(game, &values) &&
+                             !(values.values["steam_features"].locked && !values.values["steam_features"].unlocked) &&
+                             rt::SettingChoiceUnavailable(values, "steam_features", "online").empty();
+        if (game_online(game)) actions.push_back("join-start");
+        else if (can_set) actions.push_back("join-use-online");
+    }
+    actions.push_back("cancel");
+    // The game's title may be running: Use Online for this game asks the console first.
+    if (live() && game.valid()) pending_activity_requests_.push_back(game);
+    open_modal({"join-lobby", "Join " + person->name + "'s lobby", state_.navigation.focus_key, std::move(actions), 0, false});
+}
+
+void Simulation::open_friend_game(GameId game) {
+    if (!game.valid() || !find_game(state_, game)) return;
+    if (live()) force_organization_selection_ = true;
+    friends_return_focus_ = state_.navigation.focus_key;
+    state_.navigation.detail_origin = Route::Friends;
+    state_.navigation.detail_id = game;
+    state_.navigation.selected_game_id = game;
+    state_.navigation.route = Route::Details;
+    details_primary_pending_ = live();
+    state_.navigation.focus_key = live() ? "details-favorite" : (is_installed(state_, game) ? "details-play" : "details-install");
+}
+
+void Simulation::open_invite_sheet(GameId game) {
+    if (!invite_offered(game)) return;
+    // Friends no longer listed drop out of the choice; the rest stay picked while Playden runs.
+    std::erase_if(invite_choice_, [this](std::uint64_t id) { return !find_friend(id); });
+    std::vector<std::string> actions;
+    for (const auto* person : friends_in_section(2)) actions.push_back("invite-friend-" + std::to_string(person->steam_id));
+    actions.push_back("invite-play");
+    actions.push_back("cancel");
+    open_modal({"invite-friends", "Invite friends", "details-invite", std::move(actions), 0, false});
+}
+
+void Simulation::play_online(GameId game, rt::OnlineLaunch online) {
+    while (!state_.navigation.modals.empty()) close_modal();
+    if (!game.valid() || !find_game(state_, game) || update_locked(game)) return;
+    // The game's page shows the start, as Play does.
+    if (state_.navigation.route != Route::Details || state_.navigation.detail_id != game) {
+        if (state_.navigation.route == Route::Friends) friends_return_focus_ = state_.navigation.focus_key;
+        state_.navigation.detail_origin = state_.navigation.route == Route::Details ? state_.navigation.detail_origin
+                                                                                    : state_.navigation.route;
+        state_.navigation.route = Route::Details;
+        state_.navigation.detail_id = game;
+    }
+    state_.navigation.selected_game_id = game;
+    state_.navigation.focus_key = "details-play";
+    pending_runtime_online_launches_[game] = std::move(online);
+    if (live()) {
+        if (auto previous = state_.runtime_games.find(game); previous != state_.runtime_games.end())
+            previous->second.play_detail.clear();
+        pending_runtime_play_requests_.push_back(game);
+        pending_runtime_setup_programs_.erase(game);
+    } else {
+        state_.session_game_id = game;
+        state_.session = SessionState::Preparing;
+        state_.navigation.route = Route::Session;
+        state_.navigation.focus_key = "session-return";
+    }
+}
+
+void Simulation::seed_friends_scenario() {
+    // Amber Valley (installed, set to Online) has two friends in lobbies and one in its menus; Paper Satellites
+    // (installed, Offline emulation) one in a lobby; Łódź Nights (not installed) one; one plays a game not in the
+    // library; the rest are online, away or offline.
+    state_.account().authentication = AuthState::SignedIn;
+    state_.navigation.modals.clear();
+    state_.jobs.clear();
+    state_.friends_connected = true;
+    state_.friends_need_sign_in = false;
+    state_.friends = {
+        {76561198000000001ULL, "Mara", 1, 900009, "", 109775241000000001ULL, ""},
+        {76561198000000002ULL, "tomcat_88", 1, 900009, "", 109775241000000002ULL, ""},
+        {76561198000000003ULL, "Rui", 1, 900009, "", 0, ""},
+        {76561198000000004ULL, "Lena", 1, 900011, "", 109775241000000004ULL, ""},
+        {76561198000000005ULL, "Pia", 1, 900006, "", 109775241000000005ULL, ""},
+        {76561198000000006ULL, "Jun", 1, 4000001, "Harbor Kings", 0, ""},
+        {76561198000000007ULL, "ana.v", 1, 0, "", 0, ""},
+        {76561198000000008ULL, "Kofi", 3, 0, "", 0, ""},
+        {76561198000000009ULL, "Sven", 0, 0, "", 0, ""},
+        {76561198000000010ULL, "Ines", 0, 0, "", 0, ""},
+    };
+    for (const auto app : {900009U, 900011U}) {
+        // Playden's own recipe, as preparing a real install makes, which leaves Steam features to the player.
+        rt::GameRecipe own;
+        own.id = rt::GeneratedRecipeId(app);
+        own.version = 1;
+        own.app_id = app;
+        own.name = find_game(state_, GameId::Steam(app)) ? find_game(state_, GameId::Steam(app))->title : "Game";
+        own.launch_entries = {{"game", own.name, "Game.exe", ""}};
+        own.arguments = "{resolution}";
+        own.graphics = "dxvk";
+        generated_recipes_[GameId::Steam(app)] = std::move(own);
+        std::erase_if(state_.installations, [app](const Installation& item) { return item.game_id == GameId::Steam(app); });
+        state_.installations.push_back({GameId::Steam(app), "internal", 6'000'000'000, true, true, true});
+    }
+    state_.game_settings[GameId::Steam(900009)].overrides["steam_features"] = "online";
+    state_.game_settings.erase(GameId::Steam(900011));
+    invite_choice_.clear();
+    join_friend_ = 0;
+    friends_return_focus_.clear();
+    state_.navigation.route = Route::Friends;
+    state_.navigation.friends_filter = 0;
+    state_.navigation.selected_index = 0;
+    state_.navigation.focus_key.clear();
 }
 
 } // namespace playden::homebrew

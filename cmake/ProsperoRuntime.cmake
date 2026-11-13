@@ -20,6 +20,7 @@ add_library(playden_runtime_publication_verifier STATIC
     "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_title_publication.c"
     "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_title_launch.c"
     "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_game_profile.c"
+    "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_steam_view.c"
     "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_app_profile.c"
     "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_profile_catalog.c"
     "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_wine_launch.c"
@@ -80,6 +81,7 @@ if(BUILD_TESTING AND NOT PLAYDEN_PLATFORM_PS5)
         "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_title_publication.c"
         "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_title_launch.c"
         "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_game_profile.c"
+        "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_steam_view.c"
         "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_app_profile.c"
         "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_profile_catalog.c"
         "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_wine_launch.c"
@@ -102,9 +104,11 @@ if(BUILD_TESTING AND NOT PLAYDEN_PLATFORM_PS5)
             "${PLAYDEN_PROSPERO_SOURCE_DIR}/tests/test_pw_${contract}.c"
             "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_${contract}.c")
         if(contract STREQUAL "game_profile")
-            list(APPEND contract_sources "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_app_profile.c")
+            list(APPEND contract_sources "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_app_profile.c"
+                "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_steam_view.c")
         elseif(contract STREQUAL "profile_catalog")
             list(APPEND contract_sources "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_game_profile.c"
+                "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_steam_view.c"
                 "${PLAYDEN_PROSPERO_SOURCE_DIR}/src/pw_app_profile.c")
         endif()
         add_executable(prospero_${contract}_contract ${contract_sources})
@@ -143,10 +147,12 @@ target_link_libraries(playden_runtime_artifact_hash PRIVATE playden_curl_8_22 pl
 # gbe_fork Steamworks emulation in a game's folder (runtime/steamworks).
 # Also SteamStub unpacking of a game's program (runtime/steam_stub), with mbedtls through curl.
 add_library(playden_runtime_steamworks STATIC "${CMAKE_SOURCE_DIR}/src/runtime/steamworks.cpp"
-    "${CMAKE_SOURCE_DIR}/src/runtime/dotnet_heap.cpp" "${CMAKE_SOURCE_DIR}/src/runtime/steam_stub.cpp")
+    "${CMAKE_SOURCE_DIR}/src/runtime/dotnet_heap.cpp" "${CMAKE_SOURCE_DIR}/src/runtime/steam_stub.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/online_session.cpp" "${CMAKE_SOURCE_DIR}/src/runtime/steam_library.cpp")
 target_compile_features(playden_runtime_steamworks PUBLIC cxx_std_17)
 target_include_directories(playden_runtime_steamworks PUBLIC "${CMAKE_SOURCE_DIR}/src")
-target_link_libraries(playden_runtime_steamworks PUBLIC playden_runtime_artifact_hash playden_steam_content_language)
+target_link_libraries(playden_runtime_steamworks PUBLIC playden_runtime_artifact_hash playden_steam_content_language
+    playden_managed_directory)
 target_link_libraries(playden_runtime_steamworks PRIVATE playden_curl_8_22)
 add_library(playden_runtime_kit_admission STATIC
     "${CMAKE_SOURCE_DIR}/src/runtime/kit_admission.cpp")

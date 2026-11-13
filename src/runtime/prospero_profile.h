@@ -85,12 +85,29 @@ struct ProsperoProfileFeatures {
   bool display_framegen = false;     // [display] framegen = off|2|3|4 (kit capability display-framegen)
   bool display_fps_counter = false;  // [display] fps_counter = true|false (kit capability display-fps-counter)
   bool launcher_section = false;     // [launcher] (kit launcher-mode)
+  bool launcher_chain_off = false;   // [launcher] chain = off (kit capability touchpad-switch)
+  bool helper_section = false;       // [helper] program, ready, wait (kit capability helper-process)
   bool input_playstation = false;    // [input] mode = playstation (kit capability input-playstation)
   bool input_touchpad = false;       // [input] mouse = touchpad (kit capability input-touchpad)
   bool input_keyboard_stick = false; // [input] keyboard_stick (kit capability input-keyboard-stick)
   bool runtime_version = false;      // [runtime] version = 1|2 (kit capability profile-version-2)
   bool long_arguments = false;       // arguments up to 4096 bytes, a profile up to 16384 (launch-arguments-4096)
+  bool steam_section = false;        // [steam] install_dir (kit capability steam-library-path)
 };
+
+// Where a runtime with [steam] shows a Steam game to Wine: kProsperoSteamCommon\\<install_dir>.
+inline constexpr std::string_view kProsperoSteamCommon = "C:\\Program Files (x86)\\Steam\\steamapps\\common";
+// A [steam] install_dir accepted by prospero-win: one Windows path part without separators, reserved characters,
+// controls, or a trailing space/dot, and at most 128 bytes.
+inline bool IsProsperoSteamInstallDir(std::string_view name) {
+  if (name.empty() || name.size() > 128 || name == "." || name == ".." || name.back() == ' ' || name.back() == '.')
+    return false;
+  for (const char c : name) {
+    const auto byte = static_cast<unsigned char>(c);
+    if (byte < 0x20 || byte == 0x7f || std::string_view("\\/:*?\"<>|").find(c) != std::string_view::npos) return false;
+  }
+  return true;
+}
 // A [debug] env variable the runtime takes: PW_, DXVK_, MESA_, GALLIUM_, ZINK_, RADV_ or VK_ names, without the ones
 // the title sets itself or the performance overlay owns.
 bool IsProsperoDebugEnvEntry(std::string_view name, std::string_view value);

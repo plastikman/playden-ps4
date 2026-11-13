@@ -278,6 +278,13 @@ std::vector<std::string> CommunityRecipeRefusals(const CommunityRecipe& communit
     }
   }
 
+  // The sign-in and invites hand the player's Steam account to the game: never from someone else's recipe.
+  // Online itself is shareable: some games only work with it.
+  if (Default(recipe, "steam_sign_in"))
+    refuse("defaults sets steam_sign_in: each player chooses when a game gets their Steam sign-in.");
+  if (Default(recipe, "game_invites"))
+    refuse("defaults sets game_invites: each player chooses what a game does with their Steam invites.");
+
   // Library overrides: named libraries only.
   for (const auto& [where, list] : {std::pair<const char*, const std::string*>{"dll_overrides", &recipe.dll_overrides},
                                     {"defaults library_overrides", Default(recipe, "library_overrides")},
@@ -350,6 +357,14 @@ std::vector<std::string> CommunityRecipeFlags(const CommunityRecipe& community) 
     flags.push_back(AppDefaultsProgram(value.key).empty() ? "publisher registry key, needs review: " + RegistryText(value)
                                                           : "registry: " + RegistryText(value));
   return flags;
+}
+
+std::string CommunityRecipeFeature(const CommunityRecipe& community) {
+  const auto& recipe = community.recipe;
+  if (Default(recipe, "steam_network") || Default(recipe, "steam_sign_in") || Default(recipe, "game_invites"))
+    return "online-steam";
+  if (const auto* steam = Default(recipe, "steam_features"); steam && *steam == "online") return "online-steam";
+  return {};
 }
 
 std::string CommunityRecipeFits(const CommunityRecipe& community, const VerifiedKitView& kit,

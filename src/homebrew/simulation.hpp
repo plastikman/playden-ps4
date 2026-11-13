@@ -14,6 +14,7 @@
 #include "steam/backend/content_language.h"
 #include "runtime/kit_version.h"
 #include "runtime/my_presets.h"
+#include "runtime/online_session.h"
 #include "runtime/package_installer.h"
 #include "runtime/recipe_choice.h"
 
@@ -34,7 +35,12 @@ namespace playden::homebrew {
 
 using GameId = playden::GameId;
 
-enum class Route { Startup, SignIn, Home, Library, Downloads, Settings, Details, Session, Saves, SaveDetails, ManageGames };
+enum class Route { Startup, SignIn, Home, Library, Downloads, Settings, Details, Session, Saves, SaveDetails, ManageGames, Friends };
+// The tab bar's routes, left to right: Home, Library, Queue, Saves, then Friends with online-steam
+// (runtime::OnlineSteamEnabled), then Settings.
+std::vector<Route> TabRoutes();
+// A tab's place in TabRoutes; 0 (Home) for a route that is not a tab.
+int TabIndex(Route route);
 // Manage installed games: one tab per batch action. Each has its own list and selection.
 enum class ManageTab { Updates, Runtimes, Move, Uninstall };
 enum class ModelMode { Simulation, Live };
@@ -87,9 +93,9 @@ enum class SessionState { Idle, Preparing, Launching, Running, Stopping, Failed,
 enum class RuntimeState { Unavailable, Checking, Ready, Failed };
 enum class LogState { Loading, Ready, Failed };
 // Update: an installed game's update (or DLC bought since), from its details page. Move: an installed game to
-// another drive (volume_id).
+// another drive (volume_id). ChangeDlc: an installed game's DLC from Manage DLC, as an update with excluded_dlc.
 enum class InstallRequestKind { Install, Pause, Resume, DownloadNow, MoveUp, MoveDown, Cancel, Uninstall, SetDefaultVolume,
-                                DismissCompleted, ClearCompleted, Update, Move };
+                                DismissCompleted, ClearCompleted, Update, Move, ChangeDlc };
 struct InstallRequest {
     InstallRequestKind kind = InstallRequestKind::Install;
     GameId game_id;
@@ -100,9 +106,9 @@ struct InstallRequest {
     std::string language;
     std::string branch;
     // Install: the install-size estimate of the chosen version (the game's when Steam gives none for it),
-    // which the install service reserves on the drive; empty: unknown.
+    // which the install service reserves on the drive; empty: unknown. ChangeDlc: what the DLC turned on install.
     std::optional<std::uint64_t> install_bytes;
-    // Install: the DLC turned off in the install sheet, sorted.
+    // Install: the DLC turned off in the install sheet, sorted. ChangeDlc: every DLC the game is to leave out, sorted.
     std::vector<std::uint32_t> excluded_dlc;
 };
 // Game maintenance the details page offers (simulated in fixture mode).
@@ -142,6 +148,7 @@ struct LiveInstallJob {
     std::uint64_t checked_files = 0;
     std::uint64_t check_files = 0;
     std::optional<std::uint64_t> estimated_bytes;  // what the job was asked with, DLC choice included
+    bool dlc_change = false;  // an update that changes the game's DLC (Manage DLC)
 };
 struct LiveInstalledGame {
     GameId game_id;
@@ -149,6 +156,10 @@ struct LiveInstalledGame {
     std::string volume_id;
     bool available = true;  // false while the game's drive is absent
     std::int64_t finished_at = 0;  // when it was installed (Unix seconds; a move keeps it), 0 unknown
+    // From its install record (dlc_known): the DLC whose depots it holds, and the DLC the player turned off.
+    bool dlc_known = false;
+    std::vector<std::uint32_t> installed_dlc;
+    std::vector<std::uint32_t> excluded_dlc;
 };
 // A recent finished download, listed in Downloads after the queue.
 struct LiveCompletedDownload {
@@ -157,6 +168,7 @@ struct LiveCompletedDownload {
     std::string volume_id;
     std::int64_t finished_at = 0;  // Unix seconds
     std::uint64_t update_bytes = 0;  // an update: what it downloaded; 0 for an install
+    bool update = false;  // an update, also one that downloaded nothing (a DLC removed)
 };
 // A drive the real install service can use. Space is absent when the platform cannot report it.
 struct LiveVolume {
@@ -176,6 +188,7 @@ struct LiveKitInfo {
     bool source_dirty = false;             // built from uncommitted changes
     std::string unavailable_reason;        // why no kit is in use
     std::string version;                   // "0.13", from its runtime's artifact name; empty for older kits
+    std::string steam_client;              // Valve's Steam client version installed for Online games; empty when none
 };
 // Live: Playden's own update (update/update_service.h), projected for Settings, Downloads and prompts.
 struct LiveSelfUpdate {
@@ -524,6 +537,17 @@ struct LiveCloudGame {
     bool background = false;      // the result of a check the player did not start: no dialogs
 };
 // The Saves tab's check or Sync all, projected from the cloud service.
+// A Steam friend, as the controller projects FriendsService's snapshot (no Steam backend types or credentials).
+struct Friend {
+    std::uint64_t steam_id = 0;
+    std::string name;
+    std::uint32_t persona_state = 0;  // EPersonaState: 0 offline, 1 online, 2 busy, 3 away, 4 snooze, ...
+    std::uint32_t app_id = 0;         // the Steam game being played, 0 for none
+    std::string game_name;            // a non-Steam game's name
+    std::uint64_t lobby_id = 0;       // the lobby they are in, 0 for none
+    std::string avatar_hash;          // 40 lowercase hex digits, or empty for none
+    bool operator==(const Friend&) const = default;
+};
 enum class SavesJobKind { None, QuickCheck, SyncAll };
 struct LiveSavesJob {
     SavesJobKind kind = SavesJobKind::None;
@@ -787,6 +811,11 @@ struct Installation {
     bool runtime_ready = true;
     bool saves_present = true;
     std::int64_t installed_at = 0;  // live: when it was installed (Unix seconds), 0 unknown; Home's Recently installed
+    // What Manage DLC starts from (dlc_known: the install record was read): the DLC whose depots the install holds,
+    // and the DLC the player turned off, which stay off when the sheet doesn't list them.
+    bool dlc_known = false;
+    std::vector<std::uint32_t> installed_dlc;
+    std::vector<std::uint32_t> excluded_dlc;
 };
 
 struct Job {
@@ -813,6 +842,7 @@ struct Job {
     bool checking_licenses = false;  // live: a slow Steam license check before the download starts
     std::string server_name;  // live, while downloading: the download server's display name
     bool update = false;  // an installed game's update (kind stays "install": a game's download)
+    bool dlc_change = false;  // live: the update changes the game's DLC (Manage DLC)
     bool locked = false;  // the update is putting its files in place, or the move must finish: Play waits for it
     bool move = false;    // an installed game moving to volume_id from from_volume_id: Play waits while it runs
     std::string from_volume_id;
@@ -878,6 +908,8 @@ struct Navigation {
     // Saves tab: the filter (0 All, 1 Needs you, 2 In sync, 3 This console only, 4 Not installed)
     // and the game its details page shows.
     int saves_filter = 0;
+    // Friends tab (online-steam): the section its rail shows (0 Online, 1 In my games, 2 All).
+    int friends_filter = 0;
     GameId save_id;
     ManageTab manage_tab = ManageTab::Uninstall;  // Manage installed games: the open tab
 };
@@ -961,6 +993,11 @@ struct State {
     std::vector<LiveImportCandidate> import_candidates; // live: folders on the drives that could be imported
     bool import_scanning = false;                       // live: Playden is looking for games to import
     LiveSavesJob saves_job;                             // live: the Saves tab's running check or Sync all
+    // Steam friends (online-steam only): the Friends tab and a game's Friends playing. friends_connected: Playden's
+    // Steam session is logged on; friends_need_sign_in: no stored Steam sign-in to log it on with.
+    std::vector<Friend> friends;
+    bool friends_connected = false;
+    bool friends_need_sign_in = false;
     UpdateCheckState update_check;                      // live: installed games' updates, the signed-in account's
     CommunityCatalog community;                         // community recipes the chooser offers
     // Sharing and votes: the shared recipes' pull requests by submission id, and what the sharing worker
@@ -975,6 +1012,10 @@ struct State {
     bool reports_explained = false;  // the first report said what it sends
     playden::ShareAs share_as = playden::ShareAs::kNone;  // who shares and reports credit (Settings › Community)
     bool ask_after_games = true;  // Settings › Community › Ask how games ran; "Don't ask again" turns it off
+    // Preference (online-steam): the account appears invisible to Steam friends instead of online (Friends › Triangle).
+    bool steam_invisible = false;
+    // Settings › Online play › Steam sign-in notice (online-steam): an Online game's start names the account. Saved.
+    bool steam_online_notice = true;
     // The Playden account this console is linked to (Settings › Community › Account), as the sharing worker last said.
     struct AccountLink {
         std::string state;  // "" not linked (or not known yet), "linking" (a code shown), "linked"
@@ -1180,6 +1221,8 @@ public:
     void UpdateCloud(const std::vector<LiveCloudGame>& games);
     // Live mode: the Saves tab's running job, and the size of saves of games without Steam Cloud.
     void UpdateSavesJob(LiveSavesJob job);
+    // Live mode, online-steam only: the Steam friends and whether the session that brings them is logged on.
+    void UpdateFriends(std::vector<Friend> friends, bool connected, bool need_sign_in);
     void UpdateSaveSizes(std::map<GameId, std::uint64_t> sizes);
     // Live mode: the answer to a Cloud request the player made (its settled result), or its refusal
     // (the game's title may run). Play waiting to quit to Home goes on from these.
@@ -1195,6 +1238,9 @@ public:
     // The Play requests above that run a program from the game folder once instead of the game (Run a program
     // once…): the program, relative to the game folder. A plain Play request of the same game replaces its entry.
     [[nodiscard]] std::map<GameId, std::string> TakeRuntimeSetupPrograms();
+    // The Play requests above that ask the online bridge to join a friend's lobby or invite friends, once (Join,
+    // Invite friends). A Play request without an entry asks nothing.
+    [[nodiscard]] std::map<GameId, playden::runtime::OnlineLaunch> TakeRuntimeOnlineLaunches();
     [[nodiscard]] bool TakeRuntimeCleanupRequest();
     // Live mode: kept game data, deletions the player confirmed, and why an uninstall stopped.
     void UpdateKeptBottles(std::vector<LiveKeptBottle> kept);
@@ -1271,6 +1317,9 @@ public:
     // Quit Playden from outside the UI (web access). A game being prepared or queued is waited for, with the
     // dialog the TV shows then, since nobody may be in front of the TV to see a half-made title.
     void RequestQuit();
+    // Live mode: the game whose Finish setup is quitting Playden, once the quit is requested (quit_requested): it
+    // starts from Home next, and Playden hands it what Play would first (Controller::HandOverForHome).
+    [[nodiscard]] std::optional<GameId> FinishSetupGame() const;
     [[nodiscard]] std::vector<DownloadServerRequest> TakeDownloadServerRequests();
     // Live mode: the folder holding install.log, auth.log and launch.log for the log viewer.
     void SetLogDirectory(std::filesystem::path directory);
@@ -1289,10 +1338,10 @@ public:
                           std::optional<std::uint64_t> install_bytes, std::optional<bool> windows_installable,
                           std::vector<std::string> languages = {}, std::vector<GameDlc> dlc = {},
                           std::vector<GameVersion> versions = {}, GameUpdate update = {}, bool updates_known = true);
-    // Live mode: the Steam store's description, genres and controller support for one game;
-    // kept across library refreshes.
+    // Live mode: the Steam store's description, genres, controller support and whether it uses Valve Anti-Cheat,
+    // for one game; kept across library refreshes.
     void UpdateStoreDetails(GameId id, std::string description, std::vector<std::string> genres,
-                            std::string controller_support);
+                            std::string controller_support, bool vac = false);
     PersistenceLoadToken BeginOrganizationLoad(std::uint64_t account);
     bool ApplyOrganization(std::uint64_t account, PersistenceLoadToken token,
                            std::optional<playden::OrganizationSnapshot> loaded);
@@ -1397,8 +1446,14 @@ public:
     [[nodiscard]] bool known_problem(GameId id) const;
     void follow_refresh_rate(GameId game);
     [[nodiscard]] bool game_settings_row_shown(const playden::runtime::SettingDefinition& definition, GameId game) const;
-    // The overrides a preset change or a reset keeps: the program choices (simulation.cpp).
+    // The overrides a preset change or a reset keeps: the program choices and the game's own defaults (simulation.cpp).
     [[nodiscard]] std::map<std::string, std::string> kept_start_choices(GameId id) const;
+    // The game's own defaults among its overrides (rt::GameDefaultOverrides): a baseline without the player's changes
+    // keeps them.
+    [[nodiscard]] std::map<std::string, std::string> game_default_overrides(GameId id) const;
+    // A Steam game this Playden installs shows in Steam's folder (Steam library folder) by default; one installed
+    // before keeps its own folder. Called when an install starts; an installed game is left as it is.
+    void set_new_install_defaults(GameId id);
     // Opens the picker, editor or "Change anyway" for one Game settings row.
     void open_setting(const std::string& id);
     // The actions of a row whose value the recipe starts (edit, reset, library override entries).
@@ -1519,6 +1574,7 @@ private:
     // Settings download language resolves to for the game).
     std::string install_language_;
     std::map<std::uint32_t, bool> install_dlc_choice_;  // what the install sheet's player changed (on?), for this install only
+    std::map<std::uint32_t, bool> manage_dlc_choice_;  // Manage DLC: what the player changed (on?) while the sheet is open
     bool page_under_install_sheet_ = false;  // while the page behind the install sheet is built
     // Live: the version (branch) chosen in the install sheet for this one install (empty: public).
     std::string install_version_;
@@ -1799,6 +1855,7 @@ private:
     std::optional<GameId> prepare_next_asked_;
     std::vector<GameId> pending_runtime_play_requests_;
     std::map<GameId, std::string> pending_runtime_setup_programs_;
+    std::map<GameId, playden::runtime::OnlineLaunch> pending_runtime_online_launches_;
     std::string setup_program_choice_;  // Run launcher or setup: the program the confirmation names
     bool pending_runtime_cleanup_ = false;
     bool library_catalog_received_ = false;
@@ -1810,6 +1867,7 @@ private:
     bool live_installs_seen_ = false;
     std::map<GameId, JobState> live_job_states_;
     std::set<GameId> live_update_jobs_;  // the live jobs that are updates, as last projected
+    std::set<GameId> live_dlc_jobs_;     // of those, the DLC changes
     std::set<GameId> live_move_jobs_;    // the live jobs that are moves, as last projected
     std::set<GameId> canceled_updates_;  // updates the player canceled, until their job ends
     std::set<GameId> live_installed_ids_;
@@ -1848,7 +1906,9 @@ private:
     std::string manage_move_from_id_;  // Move: only the games on this drive are listed; empty lists every drive
     std::string manage_uninstall_from_id_;  // Uninstall: only the games on this drive are listed; empty lists every drive
     bool rebuilding_overlay_ = false;  // rebuild_view is building the screen under an open sheet
-    struct StoreFacts { std::string description; std::vector<std::string> genres; std::string controller_support; };
+    struct StoreFacts { std::string description; std::vector<std::string> genres; std::string controller_support; bool vac = false; };
+    // The store says the game uses Valve Anti-Cheat (known once its details were fetched this run).
+    [[nodiscard]] bool uses_vac(GameId id) const;
     std::map<GameId, StoreFacts> store_facts_;  // live: from the Steam store, applied over library refreshes
     std::vector<GameId> ready_prompts_;  // games to announce as ready to play, oldest first
     // settings_game: a game whose refusal Game settings can get past; the dialog offers it.
@@ -1889,6 +1949,7 @@ private:
     std::vector<GameId> update_ready_prompts_;  // games Play updated, whose "is ready" dialog hasn't opened yet
     GameId update_ready_game_;  // the game the open "is ready" dialog is about
     GameId quit_sync_game_;     // Play quits to Home once this game's saves are in step
+    GameId finish_setup_game_;  // the game whose Finish setup (or ready dialog's Play) asked for the quit
     std::string quit_wait_title_;   // the dialog a quit to Home waits in while a game is prepared
     std::string live_log_topic_;
     GameId live_log_game_;
@@ -1898,6 +1959,9 @@ private:
     int queue_focus_index_ = 0;  // Queue: the focused row's place, for when that row goes away
     bool queue_shown_ = false;   // Queue was on screen at the last rebuild
     std::string queue_return_focus_;  // Queue: the row a game page was opened from, focused again on Back
+    std::string friends_return_focus_;  // Friends: the friend a game page was opened from, focused again on Back
+    std::uint64_t join_friend_ = 0;     // the Join sheet's friend
+    std::set<std::uint64_t> invite_choice_;  // the Invite sheet's friends
     // Install sheet size checks by (game, branch, language): asked and not answered, and the answers.
     using SizeCheckKey = std::tuple<GameId, std::string, std::string, std::vector<std::uint32_t>>;
     std::vector<SizeCheckRequest> size_checks_;
@@ -1998,7 +2062,18 @@ private:
     void commit_editor();
     void show_setting_validation(std::string message, std::string detail);
     void advance_jobs();
+    // Game settings opens on a summary (the preset, the player's changes, actions); Change settings… opens the list.
     [[nodiscard]] std::vector<std::string> game_settings_actions() const;
+    [[nodiscard]] std::vector<std::string> game_settings_list_actions() const;
+    // One line per change the player made (Reset's rule): the summary's rows, in catalogue order.
+    struct SettingsSummaryLine {
+        std::string key;    // summary-<setting id>, summary-buttons, summary-tuning
+        std::string id;     // the setting, or empty for Button mapping and Controller tuning
+        std::string label;
+        std::string value;
+        playden::runtime::SettingGroup group = playden::runtime::SettingGroup::kGame;
+    };
+    [[nodiscard]] std::vector<SettingsSummaryLine> settings_summary(GameId id) const;
     [[nodiscard]] std::vector<std::string> kept_manager_actions() const;
     [[nodiscard]] std::vector<std::string> leftover_manager_actions() const;
     [[nodiscard]] bool leftover_queued(const std::string& title_id) const;
@@ -2132,6 +2207,27 @@ private:
     // Asks the controller to uninstall a game; batch: from the Installed games list.
     void request_uninstall(GameId id, bool delete_saves, bool batch);
     void start_setup_program();  // Run launcher or setup: the program chosen, when the game is closed
+    // Friends (online-steam). The library game a friend plays (its Steam app), or none.
+    [[nodiscard]] GameId friend_game(const Friend& person) const;
+    [[nodiscard]] const Friend* find_friend(std::uint64_t steam_id) const;
+    // "Playing Ember Hollow · in a lobby", "Online", "Away", "Offline", and its colour (good, attention, quiet).
+    [[nodiscard]] std::pair<std::string, std::string> friend_status(const Friend& person, bool with_game = true) const;
+    // The friends a section of the Friends tab lists (0 Online, 1 In my games, 2 All), playing first, then by name.
+    [[nodiscard]] std::vector<const Friend*> friends_in_section(int section) const;
+    // Why a friend's lobby can't be joined from here, or empty when Join can start the game: the game is in the
+    // library, installed and ready to play.
+    [[nodiscard]] std::string join_refusal(GameId game) const;
+    // The game's Steam features is Online.
+    [[nodiscard]] bool game_online(GameId game) const;
+    // Details: Invite friends is offered (online-steam, the game set to Online and ready to play, friends listed).
+    [[nodiscard]] bool invite_offered(GameId game) const;
+    bool move_friends(int delta_x, int delta_y);
+    void open_join_sheet(std::uint64_t steam_id);
+    void open_friend_game(GameId game);  // a friend's game page, from the Friends tab
+    void open_invite_sheet(GameId game);
+    // Join and Invite: Play with what the online bridge does once.
+    void play_online(GameId game, playden::runtime::OnlineLaunch online);
+    void seed_friends_scenario();
     bool launcher_mode_kit() const { return kit_.launcher_mode || kit_.launcher_mode_needs_update; }
     void end_uninstall(GameId id, const std::string& stopped);
     [[nodiscard]] const EndedUninstall* uninstall_stop(GameId id) const;
@@ -2183,6 +2279,7 @@ private:
     std::string runtime_prompt_shown_kit_;
     void show_alert(std::string title, std::string body, GameId settings_game = {});
     void open_game_settings();
+    void open_settings_list();
     void show_alert_prompt();
     void open_live_log(const std::string& topic, GameId game_id);
     void load_live_log();
@@ -2211,6 +2308,28 @@ private:
     [[nodiscard]] std::string install_size_text(GameId id, const std::optional<std::uint64_t>& bytes, const char* unknown) const;
     [[nodiscard]] InstallDlcSizes install_dlc_sizes(GameId id) const;
     [[nodiscard]] std::uint64_t install_dlc_on_bytes(GameId id) const;
+    // Manage DLC of an installed Steam game: its DLC with files (as its install's version and language have them),
+    // whether the install holds one, and whether it is on in the sheet (as installed, until the player turns it).
+    [[nodiscard]] std::vector<GameDlc> manage_dlc(GameId id) const;
+    [[nodiscard]] bool manage_dlc_installed(GameId id, std::uint32_t dlc) const;
+    [[nodiscard]] bool manage_dlc_on(GameId id, std::uint32_t dlc) const;
+    // What Apply asks for: every DLC to leave out (the record's that the sheet doesn't list stay), and what changes.
+    struct ManageDlcPlan {
+        std::vector<std::uint32_t> excluded;
+        std::size_t turned_on = 0, turned_off = 0;
+        std::uint64_t download_bytes = 0;  // the DLC turned on (Steam's figures)
+        std::uint64_t install_bytes = 0;
+        std::uint64_t freed_bytes = 0;     // the DLC turned off (files another depot also has stay)
+        bool claims_free = false;          // a free DLC turned on: the download adds it to the account
+        [[nodiscard]] bool changed() const noexcept { return turned_on || turned_off; }
+    };
+    [[nodiscard]] ManageDlcPlan manage_dlc_plan(GameId id) const;
+    // Why the game's DLC can't change now (short, for a row), or empty.
+    [[nodiscard]] std::string manage_dlc_blocker(GameId id) const;
+    // What the DLC turned on install doesn't fit the game's drive (with the install margin).
+    [[nodiscard]] bool manage_dlc_short_of_room(GameId id) const;
+    [[nodiscard]] bool manage_dlc_offered(GameId id) const;
+    void open_manage_dlc(GameId id);
     // A sheet's rows depend on the game's details and on the version and language chosen.
     void refresh_install_sheet(GameId id);
     // The version chosen in the install sheet for `id`, when it is not the public one.

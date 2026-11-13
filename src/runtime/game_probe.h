@@ -37,6 +37,8 @@ struct GameProbe {
   // *-Shipping.exe, or the one program in <Project>/Binaries/Win64), relative to the install
   // root, as spelled on disk.
   std::string unreal_program;
+  // A Unity player beside a bootstrap that starts it as a child process. Relative to the install root.
+  std::string unity_program;
   bool unreal5 = false;  // Unreal Engine 5 (its Shipping program names Nanite's settings)
   bool watcom = false;   // a 32-bit program linked by Watcom, whose runtime reloads FS
 };
@@ -59,7 +61,9 @@ bool ProgramUsesPhysx(const std::string& install_root, const std::string& execut
 // The program a game's last run couldn't start, from the note the title's Wine leaves in the bottle: what a launcher
 // without launcher mode asked for. Relative to host_root, as spelled in the note, when it's a program in the game's
 // folder (console_root on the console, host_root as seen here) that draws or has an engine, so a crash reporter or an
-// updater isn't taken for the game. The note names one run: this removes it.
+// updater isn't taken for the game. The note names one run: this removes it. A title with [steam] shows the game in
+// the bottle's steamapps\common through the links it wrote there (any of their names: the bottle is the game's own),
+// so a program named there counts too.
 std::string TakeRefusedGameProgram(const std::string& prefix_dir, const std::string& console_root,
                                    const std::string& host_root);
 
@@ -67,6 +71,12 @@ std::string TakeRefusedGameProgram(const std::string& prefix_dir, const std::str
 // launcher, which only starts that one as a child process, which the console cannot do; relative to install_root,
 // as spelled on disk. Empty for any other program. GameProbe::unreal_program, without reading the programs.
 std::string UnrealGameProgram(const std::string& install_root, const std::string& executable);
+
+// The Unity player beside a bootstrap, when it has a matching <stem>_Data folder and imports UnityPlayer.dll.
+std::string UnityGameProgram(const std::string& install_root, const std::string& executable);
+
+// UnrealGameProgram, else UnityGameProgram: a child-process launcher to skip, or empty.
+std::string GameProgramInstead(const std::string& install_root, const std::string& executable);
 
 // Which of a game's programs and libraries import Microsoft's MFC library (mfc140*.dll, mfcm140*.dll, directly
 // or delay-loaded), which Wine doesn't provide: Playden installs Microsoft's own into the game's bottle. Every

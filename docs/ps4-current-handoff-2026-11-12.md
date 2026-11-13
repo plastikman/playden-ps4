@@ -173,6 +173,39 @@ Two related traps, both cost time today:
    (`homebrew`, `kits`) that do not exist on PS4.
 5. Remove the first PS4 launcher once the shared path has run a while.
 
+## Steam network play port in progress
+
+The next upstream unit is `8bc63d0` (Play Online games with Valve's Steam
+client), which follows `938026d`. Its shared Playden changes are in the working
+tree: Steam network settings and online gating, friends, the Steam client
+installer/host, online-session handoff, and the shared UI. The PS4 composition
+in `ps4/homebrew_live.cpp` now supplies its account session, HTTPS downloads,
+friends session, and persona preference. Console-facing strings use
+`PLAYDEN_CONSOLE_NAME` where the feature text is shared.
+
+This is not ready to package or install. The upstream Orbis-Win `leo/main`
+already completed the PS5 implementations: `3f07187` (title notifications and
+invites, Nov 9), `3c436a8` (a helper process, Nov 11), and `99a20ad` (helper
+messages and invite questions, Nov 11). The PS4 Orbis-Win branch
+`sync-trial-2` does not contain those commits; its current checkout is at
+`75f2535` with other local changes. The remaining work is to adapt those
+upstream features to PS4 and advertise `helper_process` and `title_notify` in
+the PS4 kit view. The settings stay capability-gated until then. No build or
+tests have been run for this port. The upstream `docs/online-play.md` describes
+the PS5 implementation and still needs reconciliation with PS4 behavior before
+the port is done.
+
+The prerequisite `37e7489` is also in progress: the native parent/child probe
+now has a PS4 OpenOrbis build and packaging path under `probes/local-process/`.
+Its Wine shared-server variant remains PS5-only reference material pending a
+stable PS4 Orbis-Win interface. The PS4 probe has not been built or run.
+
+`33b541b` (Manage DLC on an installed game) is now ported in the working tree:
+Maintenance offers the DLC sheet, applying it queues a DLC-choice update, and
+the choice survives an interrupted update. Turning DLC off can complete with
+zero downloaded bytes, which is still reported as an update. This change has
+not been built or tested.
+
 ## Build and test
 
 ```
@@ -187,3 +220,209 @@ stage> --elf-dir <prx dir>` and require exit 0 before installing. Evidence for
 today's runs, including klog slices, parity logs, per-build symbols and the
 Hollow Knight crash report, is under
 `/home/zpeirce/codex_scratch/playden-test-20261111-postreboot/`.
+
+`8c25557` (Group the Steam settings and trim Also called) has now been ported
+in the working tree: Steam options are grouped under their own Compatibility
+heading, and the matching row-count logic includes that group. Existing PS4
+console-name macros remain in the invite text. This port is unbuilt and
+untested.
+
+`58985c9` (Give online play its own Game settings section) is now ported in
+the working tree: Steam features, sign-in, and invites appear under an open
+Online heading when `online-steam` is enabled. With it disabled, those rows
+fall back under Compatibility › Steam. Invite text continues to use
+`PLAYDEN_CONSOLE_NAME`. This port is unbuilt and untested; `e6a8df0` remains.
+
+`e6a8df0` (Share Online in recipes, keep the overlay out) is now ported in
+the working tree. Community recipes can carry Steam features = Online, while
+Steam sign-in, invites, and personal settings (including the performance
+overlay) are excluded from shared settings and share-change summaries. Online
+defaults are ignored when `online-steam` is disabled. This port is unbuilt and
+untested.
+
+`16a06c6` (Check the title's runtime for every gated capability) is now
+ported in the working tree. `RuntimeHost::TitleKit` asks
+`KitDependsOnTitleRuntime` instead of maintaining a partial capability list,
+so `helper_process` and future gated capabilities trigger the title-runtime
+check. I also repaired the malformed capability-name initializer left by the
+online-play port. This remains unbuilt and untested.
+
+`160fc80` (Close Game settings while a game waits for the PS5) is now ported
+with console-neutral wording: the row stays disabled until Finish setup, and
+trying to open settings explains that changes would miss the game's first
+start. This port is unbuilt and untested.
+
+`3467544` (Open Game settings on a summary of changes) is now ported in the
+working tree. Game settings opens on the preset and the player's changed rows;
+“Change settings…” opens the full editor, and collapsed sections summarize
+changes within them. PS4 online-setting fallback grouping is retained. This
+port is unbuilt and untested.
+
+`08839b6` (Add Touchpad hold to swap to a mouse preset) is ported behind the
+`touchpad-switch` capability: Playden can write and validate the `[launcher]
+chain = off` profile, and older title runtimes defer it until their kit is
+updated. The current PS4 kit does not advertise this capability, so the setting
+remains unavailable until Orbis-Win implements and reports the PS4 behavior.
+The upstream PS5 dependency pin was not applied. This port is unbuilt and
+untested.
+
+`0ec4ece` (Correct BioShock's controller note) is ported: the compatibility
+entry now documents the in-game controller setting and the mouse/launcher ways
+to reach it. This documentation change was not tested on PS4.
+
+`7ec9542` (Remove the Project Zomboid file watcher stub) is partially ported:
+the recipe format can declare retired shipped files, removes only unchanged
+copies by SHA-256 during preparation, and serializes/rejects the field in the
+same cases as other shipped-only recipe data. The PZ stub and its recipe entry
+remain in place, and the dependency pin was not advanced: upstream's required
+Wine patch 1019 is explicitly PS5-only and is not present in this PS4 runtime
+tree. Removing the stub before equivalent PS4 many-directory watch support is
+available would reintroduce PZ's startup failure. This port is unbuilt and
+untested; finish the removal once PS4 runtime support is ported and accepted.
+
+`810a83d` (Turn community recipes on for everyone) is ported: community recipes,
+sharing, votes, test reports and account linking no longer depend on the
+`community-recipes` feature line. `online-steam` remains opt-in. The docs use
+the PS4 data-folder path, and the existing test now expects community recipes
+to be enabled in release defaults. This change is unbuilt and untested.
+
+`91cdb30` (Use Kit 0.24) was audited but its PS5 manifest hashes, wrapper
+revision and runtime artifact revision were not copied into the PS4 lockfile.
+Kit 0.24 includes Wine patch 1019, which the Orbis-Win content audit marks
+absent, plus PS5 package artifacts. Advance the PS4 kit metadata only after its
+matching Orbis-Win changes are present and the candidate package passes parity.
+
+`ed10194` (Start the Unity player, not its bootstrap) is ported: generated
+recipes now detect a Unity bootstrap beside its player and start the player
+directly; recipe refresh moves older generated entries too. Explicitly chosen
+programs remain as chosen. Local imports use the same Unity/Unreal launcher
+selection. This change is unbuilt and untested.
+
+`a86c633` (Start Borderlands 2, not the 2K launcher) is ported: XNA detection
+now requires the Game or Graphics assembly/namespace (or
+`GraphicsDeviceManager`), so the 2K launcher is treated as a launcher. Older
+generated recipes are rebuilt with the game's executable first while preserving
+Steam launch entry ids and folders; a program explicitly selected by the player
+keeps its settings and is marked with the new defaults revision. This change is
+unbuilt and untested.
+
+`621c30f` (Make a game's Cloud save folders before it starts) is ported: the
+Steam app-info mapping records validated folders below the Wine user's profile
+in the per-game Steamworks facts. During preparation, the package layer creates
+missing folders in an existing bottle, matches existing names case-insensitively,
+and logs additions or failures without refusing launch. This change is unbuilt
+and untested.
+
+`1be7fd3` (Let a later install script's value replace an earlier one) is
+ported: install-script registry values now replace earlier values with the
+same case-insensitive hive key and value name, both during language selection
+within a script and when merging scripts in filename order. The Far Cry 3 note
+no longer mentions the duplicate-value preparation failure. This change is
+unbuilt and untested.
+
+`245d64e` (Move prospero-win to the steamapps title shell) is partially
+ported: Playden now pins prospero-win at `2ddfbbf`, and the shared helper
+`pw_steam_view.c` is included in the relevant CMake contract and publication
+targets. The PS4 title shell integration and `steam-library-path` kit
+capability are still pending; no kit metadata was changed. This source and
+build-wiring update is unbuilt and untested.
+
+`c602643` (Let each Steam game choose its library folder) is ported in the
+settings and simulation layers: new Steam installs get Steam's folder as a
+Playden-owned per-game default, while previously installed games stay on their
+existing Z: paths. The Compatibility › Steam row is gated on
+`steam-library-path`, applies after the game closes, and can be overridden by
+the player. Reset, preset/recipe changes, and sharing keep the install default
+separate from player choices. Profile publication writes `[steam]` only when
+Steam's folder is selected. The PS4 kit still lacks the capability, so the row
+is unavailable there for now. The client-library registration step is now
+ported in `f8815de`; it remains dormant until the PS4 runtime advertises the
+needed capabilities. No tests or builds were run for this change.
+
+`f8815de` (Tell Steam's client where a Steam game is installed) is ported: the
+runtime can list each Online game's bottle as a Steam library and write that
+game's app manifest from its install record. The work is gated on Online mode,
+the helper process, an installed Steam client, and the selected Steam folder;
+the PS4 runtime currently supplies neither `helper-process` nor
+`steam-library-path`, so the step cannot run yet. The runtime writer uses
+managed bottle paths and refuses symlinked paths in the shared client folder.
+No tests or builds were run.
+
+`1e3c477` (Show Steam games under `steamapps\\common`) is ported in Playden:
+Steam app details provide the validated `installdir`, preparations persist it
+on the game's install record, and profile publication writes `[steam]` only
+when the verified kit advertises `steam-library-path` and the game's title
+uses that kit's runtime. Existing preparations fall back to the app ID; other
+stores keep their real paths. Refused-launcher detection maps names under the
+Steam common folder back to the game install. The PS4 kit does not advertise
+this capability yet, so the behavior stays dormant until the title shell is
+ported. No tests or builds were run for this change.
+
+`c4b8ac2` advances the `prospero-win` source pin to `df71ecc`, which makes
+virtual-link lookup case-blind in Wine (`ntdll.prx` and `wineserver.prx`). The
+PS4 runtime artifacts and kit metadata remain unchanged: this fix reaches PS4
+only after the matching Orbis-Win/runtime changes are ported and a kit is
+built. This dependency pin is unbuilt and untested.
+
+`050ce11` improves Steam Cloud failure reporting: failed session opens now
+retain the CM stage, transport category, and relevant result code; Cloud checks
+and transfers can show whether DNS failed, Steam asked Playden to wait, Steam
+timed out, or its response could not be read. Cloud logs record the failing
+step without logging endpoints or addresses. Caller-canceled operations are
+marked canceled and are not saved as persistent Cloud failures. The player
+message uses `PLAYDEN_CONSOLE_NAME`, so this PS4 build says PS4. No tests or
+builds were run for this change.
+
+`353382b` updates Project Zomboid's compatibility entry: game version 42.22
+rejects the recipe's unsigned file-watcher shim because the `zombie` package
+is signed. The entry now marks it broken and records that the required
+many-directory watcher support is not in the PS4 runtime. Its Kit column is
+left unset because this PS4 build has not been verified against that game
+version. The compatibility document date is updated to 2026-11-12. No tests
+or builds were run.
+
+`ab20633` updates the inherited PS5 compatibility list from 12 community
+reports: adds five working games and four broken games, refreshes the results
+for The Forest, Silver Pines and Murky Divers, and adds two community-recipe
+reports. These PS5 reports do not establish PS4 compatibility.
+No tests or builds were run.
+
+`080ea53` updates the inherited PS5 compatibility list from 12 reports: adds
+working reports for 3dSen and imported Moadra, updates Euro Truck Simulator 2
+to working on kit 0.23 and Dying Light to kit 0.24, marks Clair Obscur partial,
+adds five other partial reports and three broken reports, including the
+imported Need for Speed III entry. These PS5 kit results don't establish PS4
+compatibility. No tests or builds were run.
+
+`5c62811` updates the inherited PS5 compatibility list with player-report
+counts: Portal 2 now has three reports, and Shadow of the Tomb Raider has one.
+These counts reflect PS5 reports and don't establish PS4 compatibility. No
+tests or builds were run.
+
+`03df916` updates the inherited PS5 compatibility list from player reports:
+adds I Am Bread as working on PS5 kit 0.23, increments Little Nightmares
+Enhanced Edition's report count to two, and removes Far Cry 3's stale duplicate
+registry-value preparation note (fixed by `1be7fd3`). These are PS5 reports;
+they do not establish PS4 compatibility. No tests or builds were run.
+
+`54b4d4e` updates `homebrew_installed_locations_test` to wait for the
+asynchronous startup Cloud check of Steam game 220 before asserting that the
+check covered it. The test keeps its existing 60-second deadline and only
+waits for the Cloud result in the scenario that verifies Cloud behavior. The
+test was updated but not run.
+
+`e46a715` further hardens `homebrew_installed_locations_test`: the imported
+game scenario waits until the Play row is enabled before pressing Cross, and
+timeout diagnostics identify which wait expired and report the open modal and
+notice counts. The test was updated but not run.
+
+`e6c7f84` removes the divider between the game-settings summary and “Change
+settings…”. Other dividers remain. The upstream test assertions for this layout
+aren't present in the PS4 simulation test file, so I changed only the UI action
+list. No tests or builds were run.
+
+`ca42bcb` removes the Windows user-folders byte count from the games-list
+payload and web page, including its sort key. The PS4 page has four remaining
+columns (the upstream page has an extra Store column), so the empty-row span is
+four here. API fixture data no longer supplies the removed field. No tests or
+builds were run.

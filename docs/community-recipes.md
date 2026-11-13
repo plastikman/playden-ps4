@@ -16,15 +16,13 @@ sending one, you agree to that. The recipes Playden ships (`runtime/recipes/`) a
 
 ## Turn them on
 
-Community recipes are an experimental feature. Nightly builds and local dev builds ([docs/building.md](building.md)) have them on. Other builds
-need a line
-`community-recipes` in `features.txt` in Playden's data folder (`/data/playden/features.txt` on the console, which FTP
-and the file manager can write; one feature name per line, `#` starts a comment). Playden reads the file when it
-starts. My presets don't need it.
+Community recipes, sharing, votes, test reports and account linking are available in every build. The line
+`community-recipes` is still accepted in `features.txt` for older builds, but is no longer needed. Steam Online remains
+off unless `online-steam` is listed there; see [Steam network play](online-play.md).
 
-Without it, Playden doesn't download recipes, ask how a game ran, send votes or test reports, or link an account, and
-the screens for them are hidden. A game that already uses a community recipe keeps it: Playden reads it from the copy
-it saved, and the game can still go back to a preset. A nightly or dev build can't turn community recipes off.
+`features.txt` lives in Playden's data folder (`/data/playden/features.txt` on the console); FTP and the file manager
+can write it. Playden reads it at startup. A game that already uses a community recipe keeps it: Playden reads it from
+the saved copy, and the game can still go back to a preset.
 
 ## Share one from Playden
 
@@ -122,6 +120,7 @@ Recipe fields:
 | `ini` | Values the game's own INI files get when the game's files are prepared, written only when the key is missing or empty: `{"BmGame/Config/UserEngine.ini": {"Engine.Engine": {"Language": "int"}}}`. See [INI values](#ini-values). |
 | `steam_api_copies` | Shipped recipes only. Paths in the game folder that get a copy of the game's own Steam library while the emulator answers the game: `["Sandfall/Binaries/Win64/steam_api64.dll"]`. See [Steam library copies](#steam-library-copies). |
 | `game_files` | Shipped recipes only. Paths in the game folder that get a file Playden ships: `["zombie/DebugFileWatcher.class"]`. See [Game files](#game-files). |
+| `retired_game_files` | Shipped recipes only. Files an earlier recipe placed with `game_files`, each paired with the SHA-256 Playden shipped. Playden removes only its unchanged copy. See [Game files](#game-files). |
 
 Community fields:
 
@@ -212,8 +211,8 @@ Sharing a game whose recipe is a settings-only one depends on whether the player
 `dll_overrides` in Game settings):
 
 - **Program kept** (Playden's program, or the one the recipe names): the share is a settings-only recipe too
-  (`BuildSettingsOnlyRecipe`). It has the base's defaults, every other row the player changed (not Extra arguments,
-  the player's own row), and `graphics` when that changed, and the base's own program rows as they are. Picking the
+  (`BuildSettingsOnlyRecipe`). It has the base's defaults, every other row the player changed (not Extra arguments
+  or the performance overlay, the player's own rows), and `graphics` when that changed, and the base's own program rows as they are. Picking the
   same program the recipe names, however its path is written, is no change. The usual rules apply, so Suggest changes is offered
   (and pre-selected unless graphics changed), and the recipe stays settings-only when the change is merged. Without
   changes, Playden offers a thumbs up.
@@ -528,6 +527,11 @@ prepares the game or applies its settings:
 - A game that Playden prepared with the recipe it made itself also gets the files of a recipe that Playden ships for
   the game later.
 - Uninstalling the game removes the file with the rest of the folder.
+
+When a later runtime makes one of these files unnecessary, a shipped recipe can move its path to
+`retired_game_files` with the SHA-256 of the exact file Playden shipped. During preparation Playden removes that file
+only when the bytes still match; a missing file is already retired, while a changed file or link is left alone and
+logged as kept. A path cannot appear in both fields. Community recipes cannot place or retire these files.
 
 Rules: the path is inside the game folder, with `/` between folders and no `.` or `..` part. At most 4 paths, each
 once. A community recipe with this field is refused, for the same reason as `steam_api_copies`. The source of a file

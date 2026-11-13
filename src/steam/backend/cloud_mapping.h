@@ -36,6 +36,9 @@ struct SaveMapping {
 // paths are expanded with steam_id; with steam_id 0 such locations are unresolved.
 SaveMapping BuildSaveMapping(const CloudSaveInfo& info, std::uint32_t app_id, std::uint64_t steam_id);
 
+// Windows Cloud save folders below drive_c/users/prospero, created in an existing bottle before launch.
+std::vector<std::string> ProfileSaveFolders(const CloudSaveInfo& info, std::uint32_t app_id);
+
 struct LocalSavePath {
   SaveRoot root = SaveRoot::kPrefix;
   std::string path;  // relative to the root

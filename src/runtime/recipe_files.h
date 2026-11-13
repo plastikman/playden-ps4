@@ -2,6 +2,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace playden::runtime {
@@ -24,5 +25,9 @@ struct RecipeFilesResult {
 // Links are never followed. Idempotent; the game must be stopped.
 RecipeFilesResult ApplyRecipeFiles(const std::string& game_root, const std::string& source_dir,
                                    const std::vector<std::string>& paths);
+
+// Remove unchanged Playden-shipped files by hash. Never follows links and leaves modified game/player files alone.
+RecipeFilesResult RetireRecipeFiles(const std::string& game_root,
+                                    const std::vector<std::pair<std::string, std::string>>& retired);
 
 }  // namespace playden::runtime

@@ -177,8 +177,9 @@ void ExternalGameRegistersAfterRestartWithoutCloud() {
   }
   fixture.registered = true;  // Playden quit, and ShadowMountPlus registered the title
 
+  // steam_cloud: also wait for the startup Cloud check of the Steam game, which runs on the Cloud worker in its own time.
   const auto run = [&](bool signed_in, bool with_location, const std::function<bool(const RuntimeSnapshot&, hb::Simulation&)>& done,
-                       std::chrono::milliseconds at_least) {
+                       std::chrono::milliseconds at_least, bool steam_cloud = false) {
     hb::Simulation model({}, {}, hb::ModelMode::Live);
     MemorySessions sessions;
     if (signed_in) sessions.value = playden::StoredSession{12345, "Synthetic account", "refresh", "access", {}};
@@ -207,7 +208,9 @@ void ExternalGameRegistersAfterRestartWithoutCloud() {
     for (;;) {
       controller.Tick();
       const auto snapshot = host.Snapshot();
-      if (done(snapshot, model) && std::chrono::steady_clock::now() - started >= at_least) break;
+      if (done(snapshot, model) && std::chrono::steady_clock::now() - started >= at_least &&
+          (!steam_cloud || cloud_runner.Saw(GameId::Steam(220))))
+        break;
       CHECK(std::chrono::steady_clock::now() < deadline);
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
@@ -243,7 +246,7 @@ void ExternalGameRegistersAfterRestartWithoutCloud() {
   CHECK(run(true, true, [&](const RuntimeSnapshot& s, hb::Simulation& model) {
     const auto game = model.state().runtime_games.find(local);
     return ready(s) && game != model.state().runtime_games.end() && game->second.ready;
-  }, std::chrono::milliseconds(0)));
+  }, std::chrono::milliseconds(0), true));
   // Signed out, a preparation the player asks for ends without Cloud too.
   bool asked = false;
   run(false, true, [&](const RuntimeSnapshot& s, hb::Simulation& model) {
@@ -595,13 +598,17 @@ void ImportedGamePlaysInPlace() {
     registry.Add(std::move(source));
     hb::Controller controller(model, registry, nullptr, nullptr, nullptr, &host);
     controller.SetLocalLibrary(local_library);
+    int step = 0;  // which wait of this run timed out, for the message below
     const auto tick_until = [&](const std::function<bool()>& done) {
+      ++step;
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
       for (;;) {
         controller.Tick();
         if (done()) return;
         if (std::chrono::steady_clock::now() >= deadline) {
           const auto local_snapshot = local_library->Snapshot();
+          std::fprintf(stderr, "wait %d of this run timed out; modals=%zu notices=%zu\n", step,
+                       model.state().navigation.modals.size(), model.state().notices.size());
           std::fprintf(stderr, "runtime=%d scanning=%d candidates=%zu games=%zu imports=%zu external=%zu outcomes=%zu\n",
                        (int)model.state().runtime, (int)model.state().import_scanning, model.state().import_candidates.size(),
                        model.state().games.size(), local_snapshot->games.size(), model.state().external_games.size(),
@@ -819,6 +826,8 @@ void ImportedGamePlaysInPlace() {
     CHECK(chmod((sky / "Data/sky.ini").c_str(), 0644) == 0);
     const auto launches = launched.size();
     open_details(model, game);
+    // Just prepared, Play can stay disabled for a few ticks; Cross on it then does nothing.
+    tick_until([&] { const auto* row = row_of(model, "details-play"); return row && row->enabled && row->action == "runtime-play"; });
     CHECK(model.action("focus:details-play") && model.action("cross"));
     tick_until([&] { return launched.size() > launches; });
     CHECK(Mode(sky / "Data/sky.ini") == 0666);

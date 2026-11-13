@@ -20,6 +20,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace playden::steam {
 
@@ -34,6 +36,28 @@ enum class CmError {
 };
 
 const char* CmErrorName(CmError error);
+
+// Where a client's last call stopped, so a caller can tell a blocked name, a closed connection and
+// Steam asking for a pause apart. Never an endpoint, address, token or account identity.
+enum class CmStage {
+  kNone,
+  kBackoff,    // Open() refused at once: Steam asked every client to wait (CmBackoffActive)
+  kDirectory,  // the CM list from api.steampowered.com
+  kConnect,    // the WebSocket to every listed CM
+  kHello,
+  kLogon,
+  kRequest,    // a request on the logged-on session
+};
+struct CmFailure {
+  CmStage stage = CmStage::kNone;
+  HttpError transport = HttpError::kNone;  // directory and connect: the transport's category
+  int transport_code = 0;                  // directory: curl's code
+  int eresult = 0;                         // a request Steam refused: its EResult
+  bool refused = false;  // Steam turned the call away (busy, rate limited, HTTP error) and every client now waits
+};
+const char* CmStageName(CmStage stage);
+// "stage=connect transport=name_resolution_failed", for log lines; empty for kNone.
+std::string CmFailureText(const CmFailure& failure);
 
 // Receives one line per CM logon and per refusal, for steam-cm.log: the owner, the step, the error
 // and Steam's result code. Never a token, account name, the account's SteamID or an endpoint. Family
@@ -190,11 +214,46 @@ struct CmClientHooks {
 // heartbeats, so the session stays logged on while Playden runs; it is opened again only when the
 // credentials change or Steam drops it. Destroying the session logs off.
 class CmSharedSession;
-std::shared_ptr<CmSharedSession> MakeCmSharedSession();
+struct CmSessionOptions {
+  // Keep the friends list and friends' persona states (online-steam only), and set the account's persona state after
+  // each logon (SetCmPersonaState). Off, the pushed friends list is ignored, no ClientRequestFriendData is sent and
+  // no persona state is set.
+  bool friends = false;
+};
+std::shared_ptr<CmSharedSession> MakeCmSharedSession(CmSessionOptions options = {});
 // How many times Steam pushed a license list on the shared session whose packages differ from the
 // account's previous one: a game bought, added to the library or removed while Playden runs. It
 // starts at 0, and a new account's first list never counts. Safe from any thread.
 std::uint64_t CmLicenseChanges(const CmSharedSession& shared);
+
+// A friend as the shared session last heard of it: the friends list and the persona states Steam sent.
+struct CmFriend {
+  std::uint64_t steam_id = 0;
+  std::string name;
+  std::uint32_t persona_state = 0;  // EPersonaState: 0 offline, 1 online, ...
+  std::uint32_t app_id = 0;         // the game played, 0 for none
+  std::uint64_t game_id = 0;
+  std::string game_name;            // a non-Steam game's name
+  std::uint64_t lobby_id = 0;
+  std::string avatar_hash;          // 40 lowercase hex digits, or empty
+  std::vector<std::pair<std::string, std::string>> rich_presence;
+};
+struct CmFriends {
+  std::uint64_t account = 0;  // the SteamID these are the friends of; 0 before any list
+  std::vector<CmFriend> friends;  // relationship Friend only, by SteamID
+};
+// How many times the shared session's friends or their persona states changed. Safe from any thread.
+std::uint64_t CmFriendChanges(const CmSharedSession& shared);
+// The friends as of the last change. They stay after the session drops, until the next logon's list.
+CmFriends CmFriendsOf(const CmSharedSession& shared);
+// Whether the shared session is logged on now, without touching it.
+bool CmSharedSessionLoggedOn(const CmSharedSession& shared);
+// The persona state the shared session sends (ClientChangeStatus, with friends on) after each logon: Online
+// (cm::kPersonaStateOnline) or Invisible (cm::kPersonaStateInvisible), which friends see as offline; 0 sends nothing.
+// Online by default with friends on, since Steam sends friends' online states only to a session that set a status.
+// A change while the session is logged on goes out at its next turn (the idle pump or a call), without a new logon.
+// Safe from any thread.
+void SetCmPersonaState(CmSharedSession& shared, std::uint32_t state);
 
 // Without a shared session, a CM session per call: directory, connect (first four endpoints), hello,
 // logon with the stored refresh token, the pushed license list, then package PICS in batches of 50.
@@ -249,6 +308,10 @@ class CmClient final : public AcquisitionSource {
   CmError WithServiceSession(const StoredSession& session, std::uint32_t deadline_ms, const std::atomic<bool>& cancel,
                              const std::function<CmError(const ServiceCall& call, std::uint64_t steam_id)>& work);
 
+  // Where this client's last call stopped: the session open, or (FetchAppInfo) its PICS requests.
+  // Cleared when a call starts. Read it from the thread that made the call.
+  CmFailure last_failure() const { return last_failure_; }
+
  private:
   AppInfoBuffers FetchAppInfo(const StoredSession& session, const std::vector<std::uint32_t>& app_ids,
                               const std::atomic<bool>& cancel, bool by_hash);
@@ -287,6 +350,7 @@ class CmClient final : public AcquisitionSource {
   const Storage* device_storage_ = nullptr;
   std::optional<cm::DeviceIdentity> device_;
   std::unique_ptr<HttpClient> http_;
+  CmFailure last_failure_;
 };
 
 // Adapts CM renewal to the auth worker: a refused CM logon means the credentials are gone; network

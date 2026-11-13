@@ -130,6 +130,14 @@ void Controller::Start(app::PersistenceService* persistence_service) {
     });
 }
 Controller::~Controller() { Shutdown(); }
+bool Controller::HandOverForHome(const GameId& game) {
+  if (!runtime_) return false;
+  bool busy = false;
+  const auto app = RuntimeApp(*runtime_, game, &busy);
+  if (!app || *app == 0) return false;
+  return runtime_->HandOverForHome(*app, std::chrono::seconds(10));
+}
+
 void Controller::Shutdown() {
   if (shut_down_) return;
   shut_down_ = true;
@@ -160,6 +168,7 @@ void Controller::Shutdown() {
   };
   // The server source may inspect the install snapshot for its fallback payload.
   if(download_servers_) step("download-servers", [&] { download_servers_->Shutdown(); });
+  if(friends_) step("friends", [&] { friends_->Shutdown(); });
   if(web_) step("web", [&] { web_->Shutdown(); });
   if(library_) step("library", [&] { library_->Shutdown(); library_->Tick(); AdvanceClear(); });
   if(persistence_) step("persistence", [&] { persistence_->FlushAndShutdown(); AdvanceOrganizationClear(); });
@@ -399,7 +408,9 @@ void Controller::Tick() {
   TickImports();
   TickInstalls();
   TickDownloadServers();
+  TickFriends();
   TickWebAccess();
+  TickSteamPersona();
   TickSelfUpdate();
   lap(5);
   TickGate();
@@ -1130,9 +1141,12 @@ void Controller::TickRuntime() {
   auto plays = model_.TakeRuntimePlayRequests();
   {
     auto programs = model_.TakeRuntimeSetupPrograms();
+    auto online = model_.TakeRuntimeOnlineLaunches();
     for (const auto id : plays) {
       if (const auto found = programs.find(id); found != programs.end()) setup_programs_[id] = found->second;
       else setup_programs_.erase(id);
+      if (const auto found = online.find(id); found != online.end()) online_launches_[id] = std::move(found->second);
+      else online_launches_.erase(id);
     }
   }
   // A game whose update is putting its files in place doesn't start (the details page says so).
@@ -1416,13 +1430,17 @@ void Controller::TickRuntime() {
       model_.NotifyPlayStopped(id, moving ? "The game is moving to another drive. Play once the move finishes."
                                           : "The game's update is putting its files in place. Play once it finishes.");
       setup_programs_.erase(id);
+      online_launches_.erase(id);
       continue;
     }
     play_queued_.insert(id);
     ++plays_requested_;
     const auto program = setup_programs_.find(id);
-    runtime_->Play(*app, program == setup_programs_.end() ? std::string() : program->second);
+    const auto online = online_launches_.find(id);
+    runtime_->Play(*app, program == setup_programs_.end() ? std::string() : program->second,
+                   online == online_launches_.end() ? playden::runtime::OnlineLaunch{} : std::move(online->second));
     if (program != setup_programs_.end()) setup_programs_.erase(program);
+    if (online != online_launches_.end()) online_launches_.erase(online);
   }
   plays_ready_ = std::move(later);
   {
@@ -1762,6 +1780,7 @@ void Controller::TickRuntime() {
   }
   else
     kit.unavailable_reason = snapshot.status == RuntimeHostStatus::kReady ? snapshot.kit_reason : std::string{};
+  kit.steam_client = snapshot.steam_client_version;
   model_.SetKitInfo(std::move(kit));
   announce_ready();
 }
@@ -1889,6 +1908,9 @@ void Controller::TickUninstalls() {
       case UninstallAction::Kind::kStop: StopUninstall(id, action.reason); break;
       case UninstallAction::Kind::kFinished:
         model_.NotifyUninstallFinished(id);
+        // Steam's details of the installed game had its DLC for that install only: the install sheet asks with every
+        // version's and language's sizes.
+        if (id.store == Store::kSteam) refresh_details_.insert(id);
         ++play_notes_revision_;
         break;
     }
@@ -2152,6 +2174,21 @@ bool Controller::DownloadServerTestAllowed() const {
   }
   return true;
 }
+void Controller::TickSteamPersona() {
+  // Not before the saved choice is known: the default would show an invisible player online.
+  if (persistence_ && !model_.PreferencesLoaded()) return;
+  // Settings › Online play › Steam sign-in notice, for the runtime host's next handoffs.
+  const bool notice = model_.state().steam_online_notice;
+  if (runtime_ && applied_steam_online_notice_ != notice) {
+    applied_steam_online_notice_ = notice;
+    runtime_->SetSteamOnlineNotice(notice);
+  }
+  const bool invisible = model_.state().steam_invisible;
+  if (applied_steam_invisible_ == invisible) return;
+  applied_steam_invisible_ = invisible;
+  if (steam_persona_) steam_persona_(invisible);
+  if (runtime_) runtime_->SetSteamInvisible(invisible);
+}
 void Controller::TickWebAccess() {
   if (!web_) return;
   // Not before the saved choice is known: a player who turned it off must not get an open port at each start.
@@ -2228,8 +2265,6 @@ void Controller::TickWebFiles() {
         if (kept.runtime_number == number) return &entry(kept.game);
       return nullptr;
     };
-    for (const auto& [number, bytes] : runtime->save_bytes)
-      if (auto* game = game_of(number)) game->windows_user_bytes = bytes;
     for (const auto& [number, version] : runtime->physx_needed)
       if (auto* game = game_of(number)) game->physx_needed = version;
     for (const auto& [number, activity] : runtime->activity)
@@ -2338,6 +2373,16 @@ void Controller::TickInstalls() {
           model_.NotifyUpdateRefused(request.game_id, refused);
         break;
       }
+      case InstallRequestKind::ChangeDlc: {
+        // Manage DLC: the whole choice replaces the record's, with the record's branch and language. What the DLC turned on
+        // install is reserved; the update checks the room its files need again before it downloads them.
+        steam::InstallOptions options;
+        options.excluded_dlc = request.excluded_dlc;
+        options.dlc_choice = true;
+        if (const auto refused = installs_->Update(request.game_id, options, request.install_bytes); !refused.empty())
+          model_.NotifyUpdateRefused(request.game_id, refused);
+        break;
+      }
       case InstallRequestKind::Move:
         if (const auto refused = installs_->Move(request.game_id, request.volume_id); !refused.empty())
           model_.NotifyMoveRefused(request.game_id, refused);
@@ -2393,7 +2438,7 @@ void Controller::TickInstalls() {
     // An update that ended (finished or canceled) leaves the game prepared as it was: Play publishes its
     // settings again and puts Playden's Steam files back over the new ones; one that changed the files first
     // has its launch made again from them. Steam's details for it (the launch options that uses, whether more
-    // is to download) are asked for again.
+    // is to download) are asked for again; a DLC change's can add or take away options that need a DLC (DUSK HD).
     if (updating_.count(id)) {
       refresh_details_.insert(id);
       refresh_asked_.erase(id);
@@ -2469,6 +2514,7 @@ void Controller::TickInstalls() {
                         update && running && job.step == steam::InstallStep::kCheckingFiles,
                         update && running && (job.step == steam::InstallStep::kApplying || job.locked)};
     live.estimated_bytes = job.estimated_bytes;
+    live.dlc_change = job.dlc_change;
     if (move) {
       using Step = LiveInstallJob::MoveStep;
       live.move = true;
@@ -2483,11 +2529,23 @@ void Controller::TickInstalls() {
     jobs.push_back(std::move(live));
   }
   std::vector<LiveInstalledGame> installed;
-  for (const auto& game : snapshot.installed)
+  for (const auto& game : snapshot.installed) {
     installed.push_back({game.id, game.install_bytes, game.volume_id, game.available, game.finished_at});
+    // What Manage DLC starts from: the DLC whose depots the install holds, and the ones the player turned off.
+    if (game.record) {
+      auto& live = installed.back();
+      live.dlc_known = true;
+      live.excluded_dlc = game.record->excluded_dlc;
+      for (const auto& depot : game.record->depots)
+        if (depot.owner != 0 && depot.owner != game.record->app_id &&
+            std::find(live.installed_dlc.begin(), live.installed_dlc.end(), depot.owner) == live.installed_dlc.end())
+          live.installed_dlc.push_back(depot.owner);
+    }
+  }
   std::vector<LiveCompletedDownload> completed;
   for (const auto& finished : snapshot.completed)
-    completed.push_back({finished.id, finished.install_bytes, finished.volume_id, finished.finished_at, finished.update_bytes});
+    completed.push_back({finished.id, finished.install_bytes, finished.volume_id, finished.finished_at, finished.update_bytes,
+                         finished.updated});
   model_.UpdateInstalls(jobs, installed, completed);
 }
 void Controller::TickStoreDetails() {
@@ -2500,7 +2558,7 @@ void Controller::TickStoreDetails() {
   }
   for (auto& details : store_details_->Pump())
     model_.UpdateStoreDetails(details.id, std::move(details.description), std::move(details.genres),
-                              std::move(details.controller_support));
+                              std::move(details.controller_support), details.vac);
 }
 void Controller::TickAppDetails() {
   if (!app_details_) {
@@ -2520,6 +2578,7 @@ void Controller::TickAppDetails() {
     launch_options_.clear();
     launch_options_reason_.clear();
     launches_any_branch_.clear();
+    steam_install_dirs_.clear();
     // An updated game's setup that waited for these details was never asked of the runtime: it is asked again.
     for (const auto& id : prepare_after_details_) refresh_asked_.erase(id);
     prepare_after_details_.clear();
@@ -2629,6 +2688,7 @@ void Controller::TickAppDetails() {
                               {details.update.newer, details.update.new_dlc, 0, 0, details.update.target, false}, !check_waits);
       if (details.launches_any_branch) launches_any_branch_.insert(details.id);
       else launches_any_branch_.erase(details.id);
+      if (!details.install_dir.empty()) steam_install_dirs_[details.id] = details.install_dir;
       launch_options_[details.id] = details.launches;
       launch_options_reason_.erase(details.id);
     } else if (!launch_options_.count(details.id)) {
@@ -2721,6 +2781,8 @@ void Controller::SubmitPrepare(GameId id, bool announce) {
   // Steam's launch options and app details are for Steam games only: another store's game starts the
   // program the player picks in Game settings.
   const bool steam = id.store == Store::kSteam;
+  if (const auto folder = steam_install_dirs_.find(id); steam && folder != steam_install_dirs_.end())
+    request.steam_install_dir = folder->second;
   if (!steam)
     request.launch_reason = "Choose the program that starts this game in Game settings.";
   else if (const auto reason = launch_options_reason_.find(id); reason != launch_options_reason_.end())
@@ -2888,6 +2950,22 @@ void Controller::TickLicenseChanges() {
   if (now < *license_refresh_at_ || phase_ != Phase::Idle || library_->Busy() || library_->NeedsRenewal()) return;
   license_refresh_at_.reset();
   library_->Refresh();
+}
+void Controller::TickFriends() {
+  if (!friends_) return;
+  const auto& account = model_.state().account(Store::kSteam);
+  if (friends_account_ != account.id) {
+    friends_account_ = account.id;
+    friends_->Invalidate();
+  }
+  friends_->SetWanted(established_auth_ == AuthState::SignedIn && !account.id.empty());
+  if (friends_->Revision() == friends_snapshot_.revision) return;
+  friends_snapshot_ = friends_->Snapshot();
+  std::vector<Friend> people;
+  people.reserve(friends_snapshot_.friends.size());
+  for (const auto& view : friends_snapshot_.friends)
+    people.push_back({view.steam_id, view.name, view.persona_state, view.app_id, view.game_name, view.lobby_id, view.avatar_hash});
+  model_.UpdateFriends(std::move(people), friends_snapshot_.connected, friends_snapshot_.needs_sign_in);
 }
 void Controller::TickSelfUpdate() {
   if (!self_update_) return;

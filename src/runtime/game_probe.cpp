@@ -1,5 +1,6 @@
 #include "runtime/game_probe.h"
 
+#include "runtime/prospero_profile.h"
 #include "runtime/steam_stub.h"
 
 #include <algorithm>
@@ -254,11 +255,12 @@ void AddImports(const PeFacts& facts, std::set<std::string>* apis) {
   }
 }
 
-// Engines known only by a name inside the program: SIL (FTL) reads SIL_WINDOWS_* settings.
-// An XNA game names the framework among its .NET assembly references; Wine Mono runs it on FNA, which draws
-// through SDL and OpenGL (Celeste).
+// Engines known only by a name inside the program: SIL (FTL) reads SIL_WINDOWS_* settings. XNA games name its Game
+// assembly or Graphics namespace/manager; the framework name alone also appears in launchers (Borderlands 2).
 constexpr std::pair<const char*, const char*> kEngineMarks[] = {{"sil_windows_use_", "sil"},
-                                                                {"microsoft.xna.framework", "xna"}};
+                                                                {"microsoft.xna.framework.game", "xna"},
+                                                                {"microsoft.xna.framework.graphics", "xna"},
+                                                                {"graphicsdevicemanager", "xna"}};
 
 // An installer the game ships beside Unreal's Engine folder (VC_redist.x64.exe) is not the game.
 constexpr const char* kInstallerWords[] = {"redist", "dxsetup", "uninst", "prereq"};
@@ -484,6 +486,42 @@ std::string UnrealGameProgram(const std::string& install_root, const std::string
   return FindShipping(root, folder, LowerStem(lower_file));
 }
 
+namespace {
+
+std::string UnityPlayerBeside(const fs::path& directory_path, const std::vector<std::pair<std::string, bool>>& here,
+                              const std::string& folder, const std::string& lower_file) {
+  if (!EndsWith(lower_file, ".exe") || Find(here, LowerStem(lower_file) + "_data", true) ||
+      !Find(here, "unityplayer.dll", false))
+    return {};
+  std::vector<std::string> players;
+  for (const auto& [name, directory] : here) {
+    const auto lower = Lower(name);
+    if (directory || !EndsWith(lower, ".exe") || !Find(here, LowerStem(lower) + "_data", true)) continue;
+    const auto facts = ReadPe((directory_path / name).string(), true);
+    const auto loads = [](const std::vector<std::string>& list) {
+      return std::find(list.begin(), list.end(), "unityplayer.dll") != list.end();
+    };
+    if (facts.valid && (loads(facts.imports) || loads(facts.delay_imports))) players.push_back(name);
+  }
+  if (players.size() != 1) return {};
+  return folder.empty() ? players.front() : folder + "/" + players.front();
+}
+
+}  // namespace
+
+std::string UnityGameProgram(const std::string& install_root, const std::string& executable) {
+  const auto slash = executable.rfind('/');
+  const std::string folder = slash == std::string::npos ? std::string() : executable.substr(0, slash);
+  const auto file = slash == std::string::npos ? executable : executable.substr(slash + 1);
+  const auto directory = fs::path(install_root) / folder;
+  return UnityPlayerBeside(directory, Entries(directory), folder, Lower(file));
+}
+
+std::string GameProgramInstead(const std::string& install_root, const std::string& executable) {
+  auto program = UnrealGameProgram(install_root, executable);
+  return program.empty() ? UnityGameProgram(install_root, executable) : program;
+}
+
 bool ProgramUsesPhysx(const std::string& install_root, const std::string& executable) {
   const auto facts = ReadPe((fs::path(install_root) / executable).string(), true);
   if (!facts.valid) return false;
@@ -525,6 +563,29 @@ bool ProgramLooksLikeGame(const fs::path& path, const PeFacts& facts) {
 
 }  // namespace
 
+// The folder names the title linked in the bottle's steamapps\common (prospero-win src/pw_steam_view.h): what Wine
+// named the game by. Empty without a readable table.
+static std::vector<std::string> SteamLibraryLinks(const std::string& prefix_dir) {
+  std::vector<std::string> names;
+  const auto table = fs::path(prefix_dir) / "drive_c/Program Files (x86)/Steam/steamapps/common/.pw-symlinks";
+  std::error_code error;
+  if (!fs::is_regular_file(fs::symlink_status(table, error))) return names;
+  std::FILE* file = std::fopen(table.c_str(), "rb");
+  if (!file) return names;
+  char buffer[4096];
+  const std::string text(buffer, std::fread(buffer, 1, sizeof(buffer), file));
+  std::fclose(file);
+  std::size_t at = 0;
+  while (at < text.size()) {
+    const auto end = std::min(text.find('\n', at), text.size());
+    const auto line = text.substr(at, end - at);
+    const auto tab = line.find('\t');
+    if (tab != std::string::npos && IsProsperoSteamInstallDir(line.substr(0, tab))) names.push_back(line.substr(0, tab));
+    at = end + 1;
+  }
+  return names;
+}
+
 std::string TakeRefusedGameProgram(const std::string& prefix_dir, const std::string& console_root,
                                    const std::string& host_root) {
   const auto note = fs::path(prefix_dir) / ".pw-exec-refused";
@@ -542,11 +603,20 @@ std::string TakeRefusedGameProgram(const std::string& prefix_dir, const std::str
     static constexpr std::string_view kHeader = "pw-exec-refused 1\nimage=";
     if (text.rfind(kHeader, 0) != 0 || text.back() != '\n') return {};
     auto image = text.substr(kHeader.size(), text.size() - kHeader.size() - 1);
-    if (image.find('\n') != std::string::npos || image.size() < 3 || Lower(image.substr(0, 3)) != "z:\\") return {};
-    std::replace(image.begin(), image.end(), '\\', '/');
-    image.erase(0, 2);  // Z:
+    if (image.find('\n') != std::string::npos) return {};
+    // A title with [steam] shows the game to Wine in steamapps\common: the program is named there.
     auto root = console_root;
     while (!root.empty() && root.back() == '/') root.pop_back();
+    for (const auto& name : SteamLibraryLinks(prefix_dir)) {
+      const auto view = Lower(std::string(kProsperoSteamCommon) + "\\" + name + "\\");
+      if (image.size() > view.size() && Lower(image.substr(0, view.size())) == view) {
+        image = "Z:" + root + "/" + image.substr(view.size());
+        break;
+      }
+    }
+    std::replace(image.begin(), image.end(), '\\', '/');
+    if (image.size() < 3 || Lower(image.substr(0, 3)) != "z:/") return {};
+    image.erase(0, 2);  // Z:
     if (root.empty() || image.size() <= root.size() + 1 || image[root.size()] != '/' ||
         Lower(image.substr(0, root.size())) != Lower(root))
       return {};
@@ -602,6 +672,7 @@ GameProbe ProbeGame(const std::string& install_root, const std::string& executab
     if (probe.legacy_unity)
       if (const auto data = Find(here, Lower(stem) + "_data", true)) probe.unity_major = UnityMajorVersion(root / folder / *data);
     if (unity) ScanNames((root / folder / *unity).string(), &probe.apis);
+    probe.unity_program = UnityPlayerBeside(root / folder, here, folder, lower_file);
   } else if (EndsWith(lower_file, "-shipping.exe") || UnrealLauncher(here, lower_file)) {
     probe.engine = "unreal";
     if (!EndsWith(lower_file, "-shipping.exe")) {
@@ -665,6 +736,7 @@ bool WatcomProgram(const std::string& path) {
 int DefaultsRevision(std::string_view engine) {
   engine = engine.substr(0, engine.find_first_of(", "));
   if (engine == "nwjs") return 2;  // 1: low-end device mode and a larger V8 heap. 2: low-end device mode gone
+  if (engine == "xna") return 1;   // 1: XNA's name alone no longer makes a .NET launcher the game
   return 0;
 }
 

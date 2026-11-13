@@ -99,6 +99,9 @@ public:
   virtual PackageActionResult SettleBottleModes(const RuntimeInstall &) {
     return {PackageActionState::kComplete, {}, {}};
   }
+  // Creates missing profile folders recorded from Steam Cloud metadata; the title must be stopped.
+  virtual void AddProfileFolders(const RuntimeInstall &, const std::vector<std::string> &,
+                                 std::vector<std::string> *, std::vector<std::string> *) {}
   // Whether a staged title was made from the admitted kit (cheap marker check).
   virtual bool TitleCurrent(const RuntimeInstall &) { return true; }
   // Whether this install's title, or its bottle, is there and was made from another kit (or
