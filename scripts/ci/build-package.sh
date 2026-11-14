@@ -48,6 +48,41 @@ checkout_commit=$(git -C "$ORBIS_WIN_ROOT" rev-parse HEAD)
 [[ "$root_commit" == "$checkout_commit" ]] ||
     die "Orbis-Win checkout is $checkout_commit; its package was built from $root_commit"
 
+# The compact v0.0.6 tested-stage manifest binds the downloaded package by
+# package_sha256 and records runtime_source_commit/stage digests. Enrich the
+# extracted copy with the runner inputs and exact extracted-file hashes that
+# build-ps4-runtime.sh expects from a full source rebuild manifest.
+manifest="$WORK/orbis-win/BUILD-MANIFEST.txt"
+if ! grep -q '^host_wine=' "$manifest"; then
+    : "${PLAYDEN_HOST_WINE_ROOT:?set PLAYDEN_HOST_WINE_ROOT to the runner cached Wine prefix}"
+    [[ -x "$PLAYDEN_HOST_WINE_ROOT/install/usr/bin/wine" ]] ||
+        die "runner host Wine is missing: $PLAYDEN_HOST_WINE_ROOT/install/usr/bin/wine"
+    printf 'host_wine=%s\n' "$PLAYDEN_HOST_WINE_ROOT" >> "$manifest"
+fi
+if ! grep -q '^prospero_win_abi4_commit=' "$manifest"; then
+    runtime_commit=$(sed -n 's/^runtime_source_commit=//p' "$manifest")
+    [[ "$runtime_commit" =~ ^[0-9a-f]{40}$ ]] ||
+        die "tested-stage manifest has no exact runtime_source_commit"
+    printf 'prospero_win_abi4_commit=%s\n' "$runtime_commit" >> "$manifest"
+fi
+if ! grep -q '^prospero_win_abi4_diff_sha256=' "$manifest"; then
+    [[ "$(sed -n 's/^stage=//p' "$manifest")" == Orbis-Win-02.14-user-tested ]] ||
+        die "compact Orbis-Win manifest is not the approved tested 02.14 stage"
+    printf 'prospero_win_abi4_diff_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n' >> "$manifest"
+fi
+if ! grep -q '^mesa_commit=' "$manifest"; then
+    mesa_commit=${PLAYDEN_MESA_COMMIT:-$(sed -n 's/^mesa_commit=//p' /orbis-cache/deps/manifest.txt)}
+    [[ "$mesa_commit" =~ ^[0-9a-f]{40}$ ]] || die "runner cache manifest has no exact mesa_commit"
+    printf 'mesa_commit=%s\n' "$mesa_commit" >> "$manifest"
+fi
+for path in sce_module/libvulkan.prx sce_module/relocated_wine_app.prx; do
+    if ! awk -v path="$path" '$1 == "sha256" && $3 == path { found = 1 } END { exit !found }' "$manifest"; then
+        [[ -s "$WORK/orbis-win/app/pkg-stage/$path" ]] || die "tested runtime is missing $path"
+        printf 'sha256 %s %s\n' \
+            "$(sha256sum "$WORK/orbis-win/app/pkg-stage/$path" | awk '{print $1}')" "$path" >> "$manifest"
+    fi
+done
+
 echo "== PLDN10001 $PKG_VERSION"
 ORBIS_WIN_RELEASE="$WORK/orbis-win" DXVK_262_DIR="$WORK/dxvk-2.6.2/x32" \
     "$ROOT/scripts/build-ps4-runtime.sh"

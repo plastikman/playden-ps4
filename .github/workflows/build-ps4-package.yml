@@ -117,6 +117,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}   # prepare-orbis-win.sh downloads the Orbis-Win release
           ORBIS_WIN_ROOT: ${{ github.workspace }}/orbis-win
           PS4_PKGTOOL_OPENSSL_LIB: /orbis-cache/deps/openssl11/lib
+          PLAYDEN_HOST_WINE_ROOT: /home/zpeirce/codex_scratch/abi4-upstream-port-20261104/source/.deps/wine-host
           OUT: ${{ runner.temp }}/playden-artifacts
           JOBS: "4"
         run: |
