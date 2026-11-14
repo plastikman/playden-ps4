@@ -16,9 +16,10 @@ sending one, you agree to that. The recipes Playden ships (`runtime/recipes/`) a
 
 ## Turn them on
 
-Community recipes, sharing, votes, test reports and account linking are available in every build. The line
-`community-recipes` is still accepted in `features.txt` for older builds, but is no longer needed. Steam Online remains
-off unless `online-steam` is listed there; see [Steam network play](online-play.md).
+Community recipes, sharing, votes and account linking are available in every build. Game test reports are off in
+stable builds; to opt in, add `game-test-reports` to `features.txt`. Nightly and local development builds have them on.
+The line `community-recipes` is still accepted in `features.txt` for older builds, but is no longer needed. Steam Online
+remains off unless `online-steam` is listed there; see [Steam network play](online-play.md).
 
 `features.txt` lives in Playden's data folder (`/data/playden/features.txt` on the console); FTP and the file manager
 can write it. Playden reads it at startup. A game that already uses a community recipe keeps it: Playden reads it from
@@ -29,7 +30,9 @@ the saved copy, and the game can still go back to a preset.
 Get the game running well from **Game settings**, then choose **Share recipe** (near the end of Game settings, just
 above Reset all to preset), or answer "It ran well" when Playden asks
 how the game ran. Playden sends the recipe to the Playden API, which opens the pull request on
-playden-ps5-recipes for review. No GitHub account is needed.
+playden-ps5-recipes for review. No GitHub account is needed. Game test reports also go through the Playden API; their
+GitHub destination is controlled by that service and cannot be changed in a Playden build. Stable builds leave reports
+off unless `game-test-reports` is listed in `features.txt`.
 
 Who a recipe (or a test report) credits is the **Shared as** row on the Share and feedback sheets, and its default
 in Settings › Community › **Share as**:

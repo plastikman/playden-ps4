@@ -145,8 +145,25 @@ jobs:
           pkg=("$OUT"/IV0000-PLDN10001_00-PLDN100010000000.pkg)
           [[ -f "${pkg[0]}" ]] || { echo "no IV0000-PLDN10001_00-PLDN100010000000.pkg in $OUT" >&2; exit 1; }
           cp "$OUT/BUILD-MANIFEST.txt" "$OUT/BUILD-MANIFEST-$APP_VER.txt"
-          notes="Playden for PS4 package $APP_VER on Orbis-Win ${ORBIS_WIN_TAG:-01.62 (runner cache)}. Install with GoldHEN's package installer; Settings > Playden update finds later releases."
-          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes "$notes" \
+          package_sha=$(sed -n 's/^package_sha256=//p' "$OUT/BUILD-MANIFEST.txt")
+          cat > "$OUT/RELEASE-NOTES.md" <<EOF
+          ## What's new in Playden for PS4 v0.3.0
+
+          - **Game test reporting is off by default in stable builds.** This Playden release will not send reports of broken games to the upstream Playden report service. To opt in, add \`game-test-reports\` to \`/data/playden/features.txt\`.
+          - **Experimental Steam Online play:** Steam sign-in handoff, friends, lobby invites and online game settings. Online play remains off unless \`online-steam\` is listed in \`features.txt\`. Local-network sessions have been tested; internet peer-to-peer play is still experimental and has not been validated on-console. See the [online play notes](https://github.com/plastikman/playden-ps4/blob/ps4-v0.3.0/docs/online-play.md).
+          - **Manage locally stored games:** scan the local store, add games, move them into storage, and uninstall them from Playden.
+          - **More accurate PS4 runtime-kit support:** the kit reports PS5 audio and OpenGL/Zink capabilities, and the Wine template selects the PS5 audio driver. Registry canonicalization keeps the template stable between builds and avoids unnecessary kit changes.
+          - **PS4-specific integration updates:** console-facing text identifies the PS4, and the PS4 build includes the shared Steam profile, friends and online-session components.
+
+          This package is **$APP_VER**, built with Orbis-Win **${ORBIS_WIN_TAG:-01.62 (runner cache)}** (console version 02.15).
+
+          ### Installer
+
+          \`IV0000-PLDN10001_00-PLDN100010000000.pkg\`
+
+          SHA-256: \`$package_sha\`
+          EOF
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes-file "$OUT/RELEASE-NOTES.md" \
             "${pkg[0]}" "$OUT/BUILD-MANIFEST-$APP_VER.txt"
 
       - uses: actions/upload-artifact@v4

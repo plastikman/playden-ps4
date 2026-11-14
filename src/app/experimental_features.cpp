@@ -9,10 +9,10 @@
 namespace playden::app {
 
 ExperimentalFeatures DefaultExperimentalFeatures(bool all_on) {
-  // Community recipes are enabled in every build; Steam Online remains opt-in through features.txt.
-  (void)all_on;
+  // Community recipes are enabled in every build. Reports and Steam Online are off in stable builds.
   ExperimentalFeatures features;
   features.community_recipes = true;
+  features.game_test_reports = all_on;
   return features;
 }
 
@@ -27,6 +27,7 @@ ExperimentalFeatures ParseExperimentalFeatures(std::string_view text, Experiment
     while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.remove_suffix(1);
     if (line.empty() || line.front() == '#') continue;
     if (line == "community-recipes") features.community_recipes = true;
+    else if (line == "game-test-reports") features.game_test_reports = true;
     else if (line == "online-steam") features.online_steam = true;
     else if (unknown) unknown->emplace_back(line);
   }

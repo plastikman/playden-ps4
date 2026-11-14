@@ -282,6 +282,8 @@ int main() {
             features_root + "/" + playden::app::kExperimentalFeaturesFileName, features, &unknown);
         if (features.community_recipes)
             playden::app::AppendLogLine(log_root, "launch.log", "experimental feature community-recipes on");
+        if (features.game_test_reports)
+            playden::app::AppendLogLine(log_root, "launch.log", "experimental feature game-test-reports on");
         if (features.online_steam) playden::app::AppendLogLine(log_root, "launch.log", "experimental feature online-steam on");
         for (const auto& name : unknown)
             playden::app::AppendLogLine(log_root, "launch.log", "experimental feature unknown: " + name.substr(0, 64));
@@ -306,6 +308,7 @@ int main() {
 #endif
 #if !PLAYDEN_UI_SIMULATION
         simulation.SetCommunityRecipesEnabled(features.community_recipes);
+        simulation.SetGameTestReportsEnabled(features.game_test_reports);
 #endif
         {
             std::vector<playden::runtime::SettingsPreset> presets;

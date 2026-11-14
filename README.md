@@ -530,12 +530,12 @@ See the [compatibility list](COMPATIBILITY.md) for what we know about each game.
 
 Every test helps, including games that work.
 
-**From Playden:** after you play a game, Playden asks how it ran (or choose **Share feedback…** in the game's
-actions). Choose whether it ran well or had problems, and Playden sends a test report for you: the game, its
-settings, your versions and, when it had problems, its logs with your Steam account name, IDs, PS5 user and home
-network addresses removed. The report is a public issue on this repository. With a community recipe in use, your
-answer is also its vote (unless **Recipe votes** is off). Settings › Community › **Ask how games ran** turns the
-question off; votes and **Share feedback…** still work.
+**From Playden:** stable builds leave game test reports off by default. Nightly and local development builds can ask how
+a game ran (or you can choose **Share feedback…** in the game's actions). A report includes the game, its settings,
+your versions and, when it had problems, its logs with your Steam account name, IDs, PS5 user and home network
+addresses removed. Reports go through the Playden API to a public GitHub issue; the destination is set by that service.
+On a stable build, add `game-test-reports` to `/data/playden/features.txt` to opt in. With a community recipe in use,
+your answer is also its vote (unless **Recipe votes** is off).
 
 **By hand**, for anything Playden can't send:
 

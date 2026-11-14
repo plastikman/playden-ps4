@@ -420,6 +420,7 @@ int main(int argc, char** argv) {
             playden::app::DefaultExperimentalFeatures(playden::update::CurrentVersion().nightly() || PLAYDEN_DEV_BUILD), &unknown);
         for (const auto& name : unknown) std::fprintf(stderr, "unknown experimental feature: %s\n", name.substr(0, 64).c_str());
         if (features.community_recipes) std::fprintf(stderr, "experimental feature community-recipes on\n");
+        if (features.game_test_reports) std::fprintf(stderr, "experimental feature game-test-reports on\n");
         if (features.online_steam) std::fprintf(stderr, "experimental feature online-steam on\n");
         playden::runtime::SetOnlineSteamEnabled(features.online_steam);
     } else if (options->scenario == "friends") {
@@ -549,7 +550,10 @@ int main(int argc, char** argv) {
     SDL_GL_SetSwapInterval(options->headless ? 0 : 1);
     hui::gfx::set_glsl_prefix("#version 410 core\n");
 
-    if (!options->simulation) simulation.SetCommunityRecipesEnabled(features.community_recipes);
+    if (!options->simulation) {
+        simulation.SetCommunityRecipesEnabled(features.community_recipes);
+        simulation.SetGameTestReportsEnabled(features.game_test_reports);
+    }
 
     if (!options->simulation) {
         std::string settings_reason;

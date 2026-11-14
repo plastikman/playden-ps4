@@ -3487,7 +3487,7 @@ void Simulation::show_alert_prompt() {
         const auto* game = find_game(state_, alert.settings_game);
         ModalEntry failed{"start-failed", (game ? game->title : std::string("The game")) + " couldn't start",
                           state_.navigation.focus_key,
-                          community_enabled_
+                          community_enabled_ && game_test_reports_enabled_
                               ? std::vector<std::string>{"start-failed-settings", "start-failed-report", "start-failed-logs", "alert-ok"}
                               : std::vector<std::string>{"start-failed-settings", "start-failed-logs", "alert-ok"},
                           0, false};
@@ -12887,7 +12887,7 @@ void Simulation::activate() {
             push_notice({"account-link", "Account unlinked", "", false, kLiveNoticeSeconds, false, "Simulated"});
         }
     }
-    else if (action_name == "share-feedback") {
+    else if (action_name == "share-feedback" && community_enabled_ && game_test_reports_enabled_) {
         const auto game = state_.navigation.selected_game_id;
         close_modal();
         open_feedback(game, false, false);
@@ -15017,6 +15017,13 @@ void Simulation::SetCommunityRecipesEnabled(bool enabled) {
     rebuild_view();
 }
 
+void Simulation::SetGameTestReportsEnabled(bool enabled) {
+    if (game_test_reports_enabled_ == enabled) return;
+    game_test_reports_enabled_ = enabled;
+    if (!enabled) feedback_prompts_.clear();
+    rebuild_view();
+}
+
 void Simulation::UpdateCommunityCatalog(CommunityCatalog catalog) {
     if (catalog == state_.community) return;
     state_.community = std::move(catalog);
@@ -15319,7 +15326,8 @@ std::vector<std::string> Simulation::details_context_actions() const {
     if (installed || game_prepared(state_.navigation.selected_game_id))
         actions.insert(actions.begin(), {"game-settings", "game-maintenance"});
     // How it ran, any time: the same sheet as after a game (plan 2026-11-06, decision 1).
-    if (community_enabled_ && (installed || game_prepared(selected) || (!live() && is_installed(state_, selected)))) {
+    if (community_enabled_ && game_test_reports_enabled_ &&
+        (installed || game_prepared(selected) || (!live() && is_installed(state_, selected)))) {
         const auto after = std::find(actions.begin(), actions.end(), "game-maintenance");
         actions.insert(after == actions.end() ? actions.begin() : after + 1, "share-feedback");
     }
@@ -16128,6 +16136,10 @@ void Simulation::send_vote() {
 }
 
 void Simulation::show_feedback_prompt() {
+    if (!community_enabled_ || !game_test_reports_enabled_) {
+        feedback_prompts_.clear();
+        return;
+    }
     if (!state_.ask_after_games) {
         feedback_prompts_.clear();
         return;
@@ -16177,7 +16189,7 @@ void Simulation::NotifyStartFailed(GameId id, std::string message) {
 
 void Simulation::NotifySessionEnded(GameId id, std::int64_t played_seconds) {
     // Community recipes off (features.txt): Playden doesn't ask how a game ran.
-    if (!id.valid() || played_seconds < 0 || !community_enabled_) return;
+    if (!id.valid() || played_seconds < 0 || !community_enabled_ || !game_test_reports_enabled_) return;
     feedback_prompts_.push_back({id, played_seconds});
     show_feedback_prompt();
     rebuild_view();
@@ -16260,6 +16272,7 @@ void Simulation::note_feedback(const FeedbackDraft& draft, bool answered) {
 }
 
 void Simulation::open_feedback(GameId id, bool short_session, bool after_play) {
+    if (!community_enabled_ || !game_test_reports_enabled_) return;
     FeedbackDraft draft;
     draft.game = id;
     draft.short_session = short_session;
@@ -16320,7 +16333,7 @@ void Simulation::open_feedback_privacy() {
 }
 
 void Simulation::send_feedback() {
-    if (!feedback_ || feedback_->ticket != 0) return;
+    if (!community_enabled_ || !game_test_reports_enabled_ || !feedback_ || feedback_->ticket != 0) return;
     auto& draft = *feedback_;
     if (draft.step == "problems" && draft.reason.empty()) {
         draft.error = "Choose what went wrong first.";

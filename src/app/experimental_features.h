@@ -17,9 +17,12 @@ inline constexpr const char* kExperimentalFeaturesFileName = "features.txt";
 inline constexpr std::size_t kExperimentalFeaturesMaxBytes = 16384;
 
 struct ExperimentalFeatures {
-  // Line community-recipes: community recipes, sharing, votes, test reports and the Playden account
+  // Line community-recipes: community recipes, sharing, votes and the Playden account
   // (docs/community-recipes.md). My presets is not part of it. Enabled in every build; the line is still accepted.
   bool community_recipes = false;
+  // Line game-test-reports: asks players how games ran and sends their answers to the Playden API.
+  // Off in stable builds so reports are opt-in; on in nightlies and local dev builds.
+  bool game_test_reports = false;
   // Line online-steam: Steam features = Online (Steam's client beside the game), Steam sign-in and Steam network
   // (runtime::SetOnlineSteamEnabled). Off in every build unless the file names it.
   bool online_steam = false;
