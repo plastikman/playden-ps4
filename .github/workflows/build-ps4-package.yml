@@ -136,7 +136,8 @@ jobs:
           ORBIS_WIN_TAG: ${{ inputs.orbis_win_tag }}
         run: |
           set -euo pipefail
-          tag="v$(head -n1 playden/ps4/VERSION)"
+          # The upstream fork already owns v0.x tags; Playden PS4 releases use ps4-v<version>.
+          tag="ps4-v$(head -n1 playden/ps4/VERSION)"
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "$tag already has a release; raise ps4/VERSION first" >&2; exit 1
           fi

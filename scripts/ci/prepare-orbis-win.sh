@@ -45,7 +45,11 @@ DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 "$PKGTOOL" pkg_extract --passcode 000000
     "$pkg" "$OUT/extract" > "$OUT/extract.log" 2>&1 || { tail -20 "$OUT/extract.log" >&2; die "PkgTool could not extract $pkg"; }
 [[ -f "$OUT/extract/uroot/eboot.bin" ]] || die "the extracted package has no uroot/eboot.bin"
 
-# The manifest's per-file hashes (sha256 <hash> <path>) must hold for the extracted files.
+# Older Orbis-Win builds list every payload file as `sha256 <hash> <path>`.
+# The v0.0.6 tested-stage release instead binds its package with package_sha256
+# and records the source stage/tree digests. The package digest was verified
+# above before extraction, so accept that manifest format while retaining the
+# per-file checks whenever the records are present.
 checked=0
 while read -r _ hash path; do
     [[ -f "$OUT/extract/uroot/$path" ]] || die "manifest file missing from the package: $path"
@@ -53,7 +57,13 @@ while read -r _ hash path; do
         die "manifest hash mismatch for $path"
     checked=$((checked + 1))
 done < <(awk '$1 == "sha256" && NF == 3' "$manifest")
-[[ $checked -gt 0 ]] || die "the manifest lists no file hashes"
+if [[ $checked -eq 0 ]]; then
+    stage_hash=$(sed -n 's/^stage_tree_sha256=//p' "$manifest")
+    source_hash=$(sed -n 's/^source_stage_sha256=//p' "$manifest")
+    [[ "$stage_hash" =~ ^[0-9a-f]{64}$ && "$source_hash" =~ ^[0-9a-f]{64}$ ]] ||
+        die "manifest has neither per-file hashes nor tested-stage digests"
+    echo "prepare-orbis-win: package SHA-256 verified; manifest records tested-stage digests"
+fi
 
 # The package's keystone is the packager's, made again for Playden's package; build-ps4-runtime.sh
 # copies the whole stage, so it must not come along.
