@@ -133,10 +133,13 @@ Exchange Perform(const ApiContext& context, steam::HttpMethod method, const std:
   Exchange exchange;
   const std::string url = context.endpoints.api_base_url + path;
   const std::string origin = UrlOrigin(url);
-  // The secret goes to api.playden.club only; a dev build also to its configured API. Never to the
-  // GitHub hosts EndpointUrlAllowed also lets downloads reach.
+  // The sharing secret goes to api.playden.club for normal community requests, or to the explicitly
+  // configured report endpoint for report requests. Never to the GitHub hosts EndpointUrlAllowed
+  // also lets downloads reach.
   const bool api_origin =
-      origin == UrlOrigin(kPlaydenApiBaseUrl) || (DevEndpointsCompiledIn() && EndpointUrlAllowed(context.endpoints, url));
+      origin == UrlOrigin(kPlaydenApiBaseUrl) ||
+      (!context.endpoints.report_api_base_url.empty() && origin == UrlOrigin(context.endpoints.report_api_base_url)) ||
+      (DevEndpointsCompiledIn() && EndpointUrlAllowed(context.endpoints, url));
   if (origin.empty() || origin != UrlOrigin(context.endpoints.api_base_url) || !api_origin) {
     exchange.error = LocalError("not_allowed", "the API address is not allowed");
     return exchange;

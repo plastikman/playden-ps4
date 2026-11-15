@@ -1408,6 +1408,7 @@ const LiveImportCandidate* Simulation::import_candidate(const std::string& key) 
 }
 
 void Simulation::open_import_sheet() {
+    if (!import_games_enabled_) return;
     auto actions = import_sheet_actions();
     // The first game not added yet, else the first game, else Look for games.
     int focus = 0, first = -1;
@@ -8511,7 +8512,9 @@ void Simulation::rebuild_view() {
         view_.legends = {"Cross Quit to Home"};
     } else if (state_.navigation.route == Route::Startup) {
         view_.title = "Welcome to Playden";
-        view_.subtitle = live() ? "Connect a store or import games to fill your library." : "Browse the local UI fixture or connect a simulated Steam account.";
+        view_.subtitle = live() ? (import_games_enabled_ ? "Connect a store or import games to fill your library."
+                                                        : "Connect Steam to fill your library.")
+                                : "Browse the local UI fixture or connect a simulated Steam account.";
         if (state_.startup_loading || state_.account().authentication == AuthState::Restoring) {
             row("startup-loading", RowKind::Status, live() ? "Restoring your accounts…" : "Loading saved fixture state…", "").enabled = false;
             if (!live()) row("startup-advance", RowKind::Action, "Advance fixture clock", "advance-clock");
@@ -8522,7 +8525,7 @@ void Simulation::rebuild_view() {
         } else {
             row("startup-connect", RowKind::Action, "Connect Steam", "connect");
             // Games from a drive or the drop folder need no store account.
-            row("startup-import", RowKind::Action, "Import games", "import-manage");
+            if (import_games_enabled_) row("startup-import", RowKind::Action, "Import games", "import-manage");
             row("startup-skip", RowKind::Action, "Skip for now", "skip");
         }
     } else if (state_.navigation.route == Route::SignIn && state_.sign_in.step != SignInStep::Qr &&
@@ -8616,7 +8619,7 @@ void Simulation::rebuild_view() {
         if (connect && !view_.rows.empty() && state_.account().authentication != AuthState::Offline) view_.subtitle = "Your library";
         if (view_.rows.empty()) {
             row("home-library", RowKind::Action, "Open Library", "library");
-            row("home-import", RowKind::Action, "Import games", "import-manage");
+            if (import_games_enabled_) row("home-import", RowKind::Action, "Import games", "import-manage");
         }
         if (connect) row("home-connect", RowKind::Action, "Connect a store", "connect");
         auto add_shelf = [this](const playden::homebrew::Shelf& source, int shelf_index) {
@@ -9365,7 +9368,7 @@ void Simulation::rebuild_view() {
                 : "Off: Online games start without the notification.";
         }
         section = "Library";
-        {
+        if (import_games_enabled_) {
             // Windows games in a drive's playden/import or the console drop folder: the Import sheet.
             auto& entry = add("settings-import", RowKind::Action, "Import games", "import-manage");
             entry.subtitle = "Add Windows games from a drive or the console drop folder";
@@ -13112,6 +13115,12 @@ void Simulation::activate() {
 }
 
 bool Simulation::action(const std::string& logical_action, bool repeat) {
+    if (!import_games_enabled_ &&
+        (logical_action == "import-manage" || logical_action == "import-look" ||
+         logical_action.rfind("import-candidate-", 0) == 0 || logical_action.rfind("import-program-", 0) == 0 ||
+         logical_action == "import-play-in-place" || logical_action == "import-copy" ||
+         logical_action == "import-copy-game"))
+        return false;
     // Any input settles Details focus where the user put it.
     details_primary_pending_ = false;
     state_.controller = {};
@@ -15021,6 +15030,12 @@ void Simulation::SetGameTestReportsEnabled(bool enabled) {
     if (game_test_reports_enabled_ == enabled) return;
     game_test_reports_enabled_ = enabled;
     if (!enabled) feedback_prompts_.clear();
+    rebuild_view();
+}
+
+void Simulation::SetImportGamesEnabled(bool enabled) {
+    if (import_games_enabled_ == enabled) return;
+    import_games_enabled_ = enabled;
     rebuild_view();
 }
 

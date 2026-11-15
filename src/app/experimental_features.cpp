@@ -2,17 +2,20 @@
 // Copyright (c) 2026 Playden contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "app/experimental_features.h"
+#include "community/endpoints.h"
 
 #include <cctype>
 #include <cstdio>
+#include <utility>
 
 namespace playden::app {
 
 ExperimentalFeatures DefaultExperimentalFeatures(bool all_on) {
-  // Community recipes are enabled in every build. Reports and Steam Online are off in stable builds.
+  // Reports require an explicit API endpoint in features.txt on every platform.
+  // Local game import is available in nightlies and development builds.
   ExperimentalFeatures features;
   features.community_recipes = true;
-  features.game_test_reports = all_on;
+  features.import_games = all_on;
   return features;
 }
 
@@ -27,8 +30,19 @@ ExperimentalFeatures ParseExperimentalFeatures(std::string_view text, Experiment
     while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.remove_suffix(1);
     if (line.empty() || line.front() == '#') continue;
     if (line == "community-recipes") features.community_recipes = true;
-    else if (line == "game-test-reports") features.game_test_reports = true;
     else if (line == "online-steam") features.online_steam = true;
+    else if (line == "import-games") features.import_games = true;
+    else if (line.rfind("game-test-reports=https://", 0) == 0 &&
+             line.find_first_of(" \t\r\n?#") == std::string_view::npos) {
+      std::string endpoint(line.substr(sizeof("game-test-reports=") - 1));
+      if (!community::UrlOrigin(endpoint).empty()) {
+        while (endpoint.size() > 1 && endpoint.back() == '/') endpoint.pop_back();
+        features.game_test_reports_api = std::move(endpoint);
+        features.game_test_reports = true;
+      } else if (unknown) {
+        unknown->emplace_back(line);
+      }
+    }
     else if (unknown) unknown->emplace_back(line);
   }
   return features;

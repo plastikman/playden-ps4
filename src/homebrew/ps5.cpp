@@ -285,6 +285,7 @@ int main() {
         if (features.game_test_reports)
             playden::app::AppendLogLine(log_root, "launch.log", "experimental feature game-test-reports on");
         if (features.online_steam) playden::app::AppendLogLine(log_root, "launch.log", "experimental feature online-steam on");
+        if (features.import_games) playden::app::AppendLogLine(log_root, "launch.log", "experimental feature import-games on");
         for (const auto& name : unknown)
             playden::app::AppendLogLine(log_root, "launch.log", "experimental feature unknown: " + name.substr(0, 64));
     }
@@ -309,6 +310,7 @@ int main() {
 #if !PLAYDEN_UI_SIMULATION
         simulation.SetCommunityRecipesEnabled(features.community_recipes);
         simulation.SetGameTestReportsEnabled(features.game_test_reports);
+        simulation.SetImportGamesEnabled(features.import_games);
 #endif
         {
             std::vector<playden::runtime::SettingsPreset> presets;
@@ -912,6 +914,7 @@ int main() {
                 std::string endpoints_line;
                 community_config.endpoints = playden::community::LoadEndpoints(
                     user_root + "/" + playden::community::kDevEndpointsFileName, &endpoints_line);
+                community_config.endpoints.report_api_base_url = features.game_test_reports_api;
                 if (!endpoints_line.empty())
                     playden::app::AppendLogLine(log_root, "community.log", playden::diagnostics::RedactSecrets(endpoints_line));
             }

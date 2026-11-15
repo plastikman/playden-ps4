@@ -16,6 +16,7 @@ struct Endpoints {
   // releases_latest_url. Empty in release builds. Never logged.
   std::string recipes_auth_header;
   std::string api_base_url;         // vote totals: <api_base_url>/v1/summary.json
+  std::string report_api_base_url;  // reports only; empty unless explicitly enabled by features.txt
   // Plain http for the configured origins (dev endpoints only, see EndpointPlainHttpAllowed).
   bool allow_plain_http = false;
 };

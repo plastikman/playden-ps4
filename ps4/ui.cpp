@@ -728,7 +728,7 @@ void draw(std::uint32_t *frame, int tab, int selected, int page, int controller_
                      selected == 3 ? "Hidden games appear here. Open Actions on a game to hide it." :
                                      "Steam is connected for this session.") :
                     playden_ps4_library_detail();
-                const char *empty_detail = detail[0] ? detail : "Connect Steam or import a local game to fill your library.";
+                const char *empty_detail = detail[0] ? detail : "Connect Steam to fill your library.";
                 list.text(font, 0, empty_detail, 1162, 520, 22, secondary, Align::center);
                 if (show_connect)
                 {

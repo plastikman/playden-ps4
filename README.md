@@ -65,7 +65,8 @@ Built and packaged, not yet confirmed on the console:
 
 - Games don't get their own Home screen tile: start them from Playden.
 - One download at a time, by design: a second download at once is too much for the PS4.
-- No USB or external drives, and no importing games from elsewhere.
+- No USB or external drives. Local folder import from `/data/playden-import` is experimental and hidden by default;
+  advanced users can enable it by adding `import-games` to `/data/PLDN10001/features.txt` and restarting Playden.
 - Not yet ported from the PS5: community recipes and player presets, per-game notes and ratings, Library filters, the
   download server test, and web access.
 - Settings that need a newer Orbis-Win: 120 Hz, per-game volume, rumble, Windows version and language, the CPU mode.
@@ -530,12 +531,11 @@ See the [compatibility list](COMPATIBILITY.md) for what we know about each game.
 
 Every test helps, including games that work.
 
-**From Playden:** stable builds leave game test reports off by default. Nightly and local development builds can ask how
-a game ran (or you can choose **Share feedback…** in the game's actions). A report includes the game, its settings,
-your versions and, when it had problems, its logs with your Steam account name, IDs, PS5 user and home network
-addresses removed. Reports go through the Playden API to a public GitHub issue; the destination is set by that service.
-On a stable build, add `game-test-reports` to `/data/playden/features.txt` to opt in. With a community recipe in use,
-your answer is also its vote (unless **Recipe votes** is off).
+**From Playden:** report prompts and uploads are disabled by default on PS4. To enable them, add a report API base
+URL to `/data/PLDN10001/features.txt`, for example `game-test-reports=https://reports.example.com`, then restart
+Playden. The endpoint must provide the Playden report API (`/v1/reports` and, for log attachments,
+`/v1/attachments`). No report is sent to the upstream Playden API unless you explicitly configure it as the endpoint.
+Reports include the game, settings and versions; problem reports can include redacted logs.
 
 **By hand**, for anything Playden can't send:
 

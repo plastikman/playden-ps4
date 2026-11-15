@@ -1470,8 +1470,9 @@ public:
     // its base (read from the cache), shown in Choose settings without the others. My presets is not part of it.
     void SetCommunityRecipesEnabled(bool enabled);
     [[nodiscard]] bool CommunityRecipesEnabled() const noexcept { return community_enabled_; }
-    // Game compatibility reports are separately opt-in; recipes, sharing and votes can stay enabled without them.
-    void SetGameTestReportsEnabled(bool enabled);
+    // Local folder importing is hidden in stable builds unless features.txt enables it.
+    void SetImportGamesEnabled(bool enabled);
+    [[nodiscard]] bool ImportGamesEnabled() const noexcept { return import_games_enabled_; }
     void SetCommunityRecipeLoader(std::function<std::optional<playden::runtime::CommunityRecipe>(const std::string& revision)> loader);
     // The admitted kit (the view CommunityRecipeFits checks requirements against); nothing: no kit.
     void SetKitView(std::optional<playden::runtime::VerifiedKitView> view);
@@ -1827,6 +1828,7 @@ private:
     bool my_presets_unavailable_ = false;
     bool community_enabled_ = true;
     bool game_test_reports_enabled_ = true;
+    bool import_games_enabled_ = true;
     std::function<std::optional<std::string>()> my_preset_uuid_;
     std::function<std::int64_t()> my_preset_now_;
     std::string my_preset_menu_id_;  // the preset whose Triangle menu (or its Delete dialog) is open

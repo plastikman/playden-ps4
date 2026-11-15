@@ -248,7 +248,7 @@ void SharingService::Handle(SharingRequest request) {
   result.kind = request.kind;
   result.ticket = request.ticket;
   result.game_id = request.game_id;
-  const auto context = Context();
+  auto context = Context();
   const auto attempts = static_cast<std::uint32_t>(std::max(0, config_.retries)) + 1;
   switch (request.kind) {
     case SharingRequestKind::Submit: {
@@ -329,6 +329,11 @@ void SharingService::Handle(SharingRequest request) {
       }
       break;
     case SharingRequestKind::Report: {
+      if (config_.endpoints.report_api_base_url.empty()) {
+        result.report.error = LocalError("reports_disabled", "Game reports are disabled; configure game-test-reports=https://… in features.txt.");
+        break;
+      }
+      context.endpoints.api_base_url = config_.endpoints.report_api_base_url;
       auto& report = request.report;
       if (report.idempotency_key.empty())
         if (const auto key = community::NewIdempotencyKey()) report.idempotency_key = *key;

@@ -415,6 +415,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         playden::app::DefaultExperimentalFeatures(playden::update::CurrentVersion().nightly() || PLAYDEN_DEV_BUILD),
         nullptr);
     simulation.SetCommunityRecipesEnabled(s.features.community_recipes);
+    simulation.SetGameTestReportsEnabled(!s.features.game_test_reports_api.empty());
     playden::runtime::SetOnlineSteamEnabled(s.features.online_steam);
 
     probe_directory_identity();
@@ -937,6 +938,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         std::string endpoints_line;
         config.endpoints = playden::community::LoadEndpoints(
             (data / playden::community::kDevEndpointsFileName).string(), &endpoints_line);
+        config.endpoints.report_api_base_url = s.features.game_test_reports_api;
         const auto community_log = [log_directory](const std::string &line) {
             playden::app::AppendLogLine(log_directory, "community.log", playden::diagnostics::RedactSecrets(line));
         };

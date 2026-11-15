@@ -422,6 +422,7 @@ int main(int argc, char** argv) {
         if (features.community_recipes) std::fprintf(stderr, "experimental feature community-recipes on\n");
         if (features.game_test_reports) std::fprintf(stderr, "experimental feature game-test-reports on\n");
         if (features.online_steam) std::fprintf(stderr, "experimental feature online-steam on\n");
+        if (features.import_games) std::fprintf(stderr, "experimental feature import-games on\n");
         playden::runtime::SetOnlineSteamEnabled(features.online_steam);
     } else if (options->scenario == "friends") {
         // The friends scenario shows what online-steam adds (the Friends tab, Join, Invite friends); others keep it off.
@@ -553,6 +554,7 @@ int main(int argc, char** argv) {
     if (!options->simulation) {
         simulation.SetCommunityRecipesEnabled(features.community_recipes);
         simulation.SetGameTestReportsEnabled(features.game_test_reports);
+        simulation.SetImportGamesEnabled(features.import_games);
     }
 
     if (!options->simulation) {
@@ -847,6 +849,7 @@ int main(int argc, char** argv) {
             std::string endpoints_line;
             config.endpoints = playden::community::LoadEndpoints((options->data_directory / playden::community::kDevEndpointsFileName).string(),
                                                                  &endpoints_line);
+            config.endpoints.report_api_base_url = features.game_test_reports_api;
             const auto community_log = [log_directory](const std::string& line) {
                 playden::app::AppendLogLine(log_directory, "community.log", playden::diagnostics::RedactSecrets(line));
             };
