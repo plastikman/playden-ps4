@@ -60,9 +60,20 @@ done < <(awk '$1 == "sha256" && NF == 3' "$manifest")
 if [[ $checked -eq 0 ]]; then
     stage_hash=$(sed -n 's/^stage_tree_sha256=//p' "$manifest")
     source_hash=$(sed -n 's/^source_stage_sha256=//p' "$manifest")
-    [[ "$stage_hash" =~ ^[0-9a-f]{64}$ && "$source_hash" =~ ^[0-9a-f]{64}$ ]] ||
-        die "manifest has neither per-file hashes nor tested-stage digests"
-    echo "prepare-orbis-win: package SHA-256 verified; manifest records tested-stage digests"
+    if [[ "$stage_hash" =~ ^[0-9a-f]{64}$ && "$source_hash" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "prepare-orbis-win: package SHA-256 verified; manifest records tested-stage digests"
+    else
+        release_version=$(sed -n 's/^release_version=//p' "$manifest")
+        base_hash=$(sed -n 's/^base_package_sha256=//p' "$manifest")
+        mmdevapi32=$(sed -n 's/^mmdevapi32_sha256=//p' "$manifest")
+        mmdevapi64=$(sed -n 's/^mmdevapi64_sha256=//p' "$manifest")
+        [[ "$release_version" == 0.0.7-candidate && \
+           "$base_hash" =~ ^[0-9a-f]{64}$ && \
+           "$mmdevapi32" =~ ^[0-9a-f]{64}$ && \
+           "$mmdevapi64" =~ ^[0-9a-f]{64}$ ]] ||
+            die "manifest has neither per-file hashes, tested-stage digests, nor recognized v0.0.7 MMDevAPI provenance"
+        echo "prepare-orbis-win: package SHA-256 verified; manifest records v0.0.7 base-package and MMDevAPI hashes"
+    fi
 fi
 
 # The package's keystone is the packager's, made again for Playden's package; build-ps4-runtime.sh
