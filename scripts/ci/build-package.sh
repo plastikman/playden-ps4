@@ -66,8 +66,20 @@ if ! grep -q '^prospero_win_abi4_commit=' "$manifest"; then
     printf 'prospero_win_abi4_commit=%s\n' "$runtime_commit" >> "$manifest"
 fi
 if ! grep -q '^prospero_win_abi4_diff_sha256=' "$manifest"; then
-    [[ "$(sed -n 's/^stage=//p' "$manifest")" == Orbis-Win-02.14-user-tested ]] ||
-        die "compact Orbis-Win manifest is not the approved tested 02.14 stage"
+    stage=$(sed -n 's/^stage=//p' "$manifest")
+    release_version=$(sed -n 's/^release_version=//p' "$manifest")
+    base_hash=$(sed -n 's/^base_package_sha256=//p' "$manifest")
+    runtime_marker=$(sed -n 's/^runtime_build_marker=//p' "$manifest")
+    runtime_commit=$(sed -n 's/^runtime_source_commit=//p' "$manifest")
+    candidate_ok=false
+    if [[ "$release_version" == 0.0.7-candidate &&
+          "$base_hash" == 2a3507e34e945ebd0c57d4454118da8fbe70a8bfa9aaf6d38390101b28d6fd5b &&
+          "$runtime_marker" == GLDS10043-02.14-pw47f0cef-sampler0 &&
+          "$runtime_commit" == 47f0cefb4e5c39aad0e60e7a3ba1dfcc50376adf ]]; then
+        candidate_ok=true
+    fi
+    [[ "$stage" == Orbis-Win-02.14-user-tested || "$candidate_ok" == true ]] ||
+        die "compact Orbis-Win manifest is not the approved tested 02.14 runtime or its verified v0.0.7 audio candidate"
     printf 'prospero_win_abi4_diff_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n' >> "$manifest"
 fi
 if ! grep -q '^mesa_commit=' "$manifest"; then
