@@ -1470,6 +1470,8 @@ public:
     // its base (read from the cache), shown in Choose settings without the others. My presets is not part of it.
     void SetCommunityRecipesEnabled(bool enabled);
     [[nodiscard]] bool CommunityRecipesEnabled() const noexcept { return community_enabled_; }
+    // Game compatibility reports are separately opt-in; recipes, sharing and votes can stay enabled without them.
+    void SetGameTestReportsEnabled(bool enabled);
     // Local folder importing is hidden in stable builds unless features.txt enables it.
     void SetImportGamesEnabled(bool enabled);
     [[nodiscard]] bool ImportGamesEnabled() const noexcept { return import_games_enabled_; }
