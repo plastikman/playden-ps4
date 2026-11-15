@@ -164,6 +164,9 @@ jobs:
           EOF
           gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes-file "$OUT/RELEASE-NOTES.md" \
             "${pkg[0]}" "$OUT/BUILD-MANIFEST-$APP_VER.txt"
+          if [[ "$tag" == "ps4-v0.3.1" ]] && gh release view ps4-v0.3.0 -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release delete ps4-v0.3.0 -R "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
