@@ -504,7 +504,10 @@ bool WithPixelShaderEnvironment(const std::string& entries, const std::string& w
   return true;
 }
 
-constexpr const char* kVerboseWinedebug = "err+all,warn+all,fixme-all,+loaddll,+process,+seh";
+// +sync shows every RtlWaitOnAddress with the address waited on, which is what a stalled
+// Unity job system looks like from the outside: the PS4's first 64-bit title parks every
+// thread there and nothing says which address, or who should wake it.
+constexpr const char* kVerboseWinedebug = "err+all,warn+all,fixme-all,+loaddll,+process,+seh,+sync,+vulkan";
 // Raw Input, DirectInput, the winmm joystick API and the HID drivers the game hosts: what a game asks for and
 // what it finds.
 constexpr const char* kInputWinedebug =
