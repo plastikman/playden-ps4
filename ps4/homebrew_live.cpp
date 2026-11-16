@@ -24,7 +24,9 @@
 #include "runtime/game_probe.h"
 #include "runtime/game_settings.h"
 #include "runtime/artifact_hash.h"
+#include "platform/ps5/title_allow_list.h"
 #include "runtime/private_directories.h"
+#include "web/service.h"
 #include "runtime/settings_storage.h"
 #include "runtime/steamworks.h"
 #include "runtime/title_root.h"
@@ -392,6 +394,8 @@ struct LiveServices::State {
     std::unique_ptr<playden::steam::HttpClient> sharing_http;
     std::unique_ptr<playden::homebrew::SharingService> sharing;
     std::unique_ptr<playden::homebrew::RuntimeHost> runtime_host;
+    // Web access: declared before the Controller so the service outlives the pointer it is given.
+    std::unique_ptr<playden::web::Service> web;
     std::unique_ptr<playden::homebrew::Controller> services;
     std::unique_ptr<playden::homebrew::HttpArtworkBackend> artwork_backend;
     std::unique_ptr<playden::homebrew::ProgramIconArtworkBackend> program_icons;
@@ -896,6 +900,34 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
                                                                  s.installs.get(), s.cloud.get(), s.runtime_host.get(), auth_log);
     s.services->SetLocalLibrary(local);
     s.services->SetDownloadServers(s.servers.get());
+    {
+        // Settings > Web access. Without this the Controller's web_ stays null, TickWebAccess
+        // returns at once, no snapshot ever reaches the model, and the row reads "Starting..."
+        // for good -- which is what PS4 did until now, while the toggle only wrote the preference.
+        // The paths are the PS4 layout, not ps5.cpp's literals: titles live directly under
+        // kManagedTitleRoot and the kits under /data/playden, the same mismatch recorded for the
+        // sharing service below.
+        playden::web::ServiceConfig web_config;
+        web_config.paths = playden::web::LogsPaths{log_directory, playden::runtime::kManagedTitleRoot,
+                                                   "/data/playden/kits",
+                                                   playden::runtime::kManagedTitleRoot};
+        web_config.server.log = [log_directory](const std::string &line) {
+            playden::app::AppendLogLine(log_directory, "web.log", line);
+        };
+        // No address_fallback: ps5.cpp uses ConsoleAddress(), whose source is not in the PS4
+        // target (ps4/CMakeLists.txt links only some platform/ps5 sources). web::LocalAddress()
+        // still runs; if it finds nothing the page is reached by the console IP and port.
+        // Path work never runs while root is raised (effective_uid.cpp).
+        web_config.files.try_hold = [] { return playden::ps5::TryHoldEffectiveUid(); };
+        web_config.files.free_space = [](const std::string &path) -> std::optional<std::uint64_t> {
+            const auto space = playden::steam::QueryVolumeSpace(path, playden::steam::kConsoleSystemReserve);
+            return space ? std::optional<std::uint64_t>(space->free_bytes) : std::nullopt;
+        };
+        for (const auto &private_path : playden::runtime::PrivateProfilePaths())
+            web_config.files.private_profile_paths.push_back(private_path.generic_string());
+        s.web = std::make_unique<playden::web::Service>(std::move(web_config));
+        s.services->SetWebAccess(s.web.get());
+    }
     if (steam_cm_options.friends) {
         s.friends_cm = std::make_unique<playden::steam::CmClient>(kCaBundle, *s.library_storage);
         s.friends_cm->SetOwner("friends");
