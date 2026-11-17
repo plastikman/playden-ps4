@@ -79,7 +79,7 @@ actual_wine_prx="$(sha256sum "$ORBIS_WIN_STAGE/sce_module/relocated_wine_app.prx
 # Read DXVK's version out of the DLL that is actually being shipped.
 dxvk_version() {
     local v
-    v=$(strings -a "$1/d3d11.dll" 2>/dev/null | grep -oE "^v[0-9]+\.[0-9]+(\.[0-9]+)?$" | head -1)
+    v=$(strings -a "$1/d3d11.dll" 2>/dev/null | grep -oE "^v[0-9]+\.[0-9]+(\.[0-9]+)?\+?[A-Za-z0-9.]*$" | head -1)
     printf '%s' "${v:-unknown}"
 }
 DXVK_DLLS="d3d8 d3d9 d3d10core d3d11 dxgi"
@@ -351,9 +351,10 @@ python3 "$ROOT/scripts/ps4-kit-view.py" "$STAGE" "$KIT_ID" \
 cp "$STEAMWORKS_DIR/steam_api.dll" "$STEAMWORKS_DIR/steam_api64.dll" \
     "$STEAMWORKS_DIR/steam.dll" "$STEAMWORKS_DIR/LICENSE" "$STEAMWORKS_DIR/README.md" \
     "$STAGE/runtime/steamworks/"
-printf 'title=PLDN10001\nversion=%s\norbis_win_root_commit=%s\nprospero_win_abi4_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_commit=%s\nmesa_libvulkan_sha256=%s\ndxvk=%s-x32+x64\nprefix_template_stamp=%s\nsteamworks_emulator=gbe_fork-ca45922c\n' \
+printf 'title=PLDN10001\nversion=%s\norbis_win_root_commit=%s\nprospero_win_abi4_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_commit=%s\nmesa_libvulkan_sha256=%s\ndxvk=%s-x32+x64\ndxvk_d3d11_sha256=%s\nprefix_template_stamp=%s\nsteamworks_emulator=gbe_fork-ca45922c\n' \
     "$PKG_VERSION" "$manifest_root_commit" "$PW_SOURCE_COMMIT" "$manifest_diff" "${WINE_VERSION#wine-}" \
-    "$MESA_COMMIT" "$MESA_SHA256" "$(dxvk_version "$DXVK_262_DIR")" "$TEMPLATE_STAMP" >"$STAGE/runtime-manifest.txt"
+    "$MESA_COMMIT" "$MESA_SHA256" "$(dxvk_version "$DXVK_262_DIR")" \
+    "$(sha256sum "$DXVK_262_X64_DIR/d3d11.dll" | cut -d" " -f1)" "$TEMPLATE_STAMP" >"$STAGE/runtime-manifest.txt"
 cmp -s "$ORBIS_WIN_STAGE/sce_module/libvulkan.prx" "$STAGE/sce_module/libvulkan.prx" || die "packaged Mesa PRX mismatch"
 cmp -s "$STAGE/sce_module/libvulkan.prx" "$STAGE/win/wine/lib/wine/x86_64-unix/libvulkan.prx" ||
     die "Wine's Vulkan loader and system Vulkan module differ"
