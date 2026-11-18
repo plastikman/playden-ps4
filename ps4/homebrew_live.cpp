@@ -326,7 +326,12 @@ void probe_directory_identity()
 {
     const uid_t uid = ::geteuid();
     log_line("identity probe: euid=" + std::to_string(uid) + " egid=" + std::to_string(::getegid()));
-    for (const char *path : {"/", "/data", "/data/PLDN10001", "/data/PLDN10001/games", "/data/PLDN10001/logs"}) {
+    // /mnt and /mnt/usb0: GoldHEN's FTP server reaches an attached drive, but the importer's
+    // lstat of /mnt/usb0 failed from inside the title (mode=- in install.log, 2026-11-18), so the
+    // drive may be outside this title's view entirely. ENOENT says the path is not in our
+    // namespace; EACCES says it is there and closed to us. The two want different answers.
+    for (const char *path : {"/", "/mnt", "/mnt/usb0", "/data", "/data/PLDN10001",
+                             "/data/PLDN10001/games", "/data/PLDN10001/logs"}) {
         struct stat named{}, opened{};
         const int lstat_rc = ::lstat(path, &named);
         const int fd = ::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
