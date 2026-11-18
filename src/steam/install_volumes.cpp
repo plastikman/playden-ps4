@@ -148,9 +148,16 @@ Fstatfs ResolvedFstatfs() {
 
 bool VolumeSpaceSupported() {
 #if PLAYDEN_PLATFORM_PS4
-  // Whether the console lets this title ask at all. When _fstatfs is missing or refuses, writes
-  // stay authoritative: the installer handles ENOSPC and retains its download journal.
-  return ResolvedFstatfs() != nullptr;
+  // Whether the console actually answers, asked once and remembered -- NOT merely whether _fstatfs
+  // resolved. A title can hold the symbol and still be refused by the kernel (EPERM), and callers
+  // read "supported, but no answer" as a fault: an import stopped with "Free space is unavailable"
+  // (2026-11-18) because this said yes while every query said nothing. When writes cannot be
+  // checked ahead, they stay authoritative: the installer handles ENOSPC and keeps its journal.
+  static const bool answers = [] {
+    if (!ResolvedFstatfs()) return false;
+    return QueryVolumeSpace("/data", 0).has_value();
+  }();
+  return answers;
 #elif PLAYDEN_PLATFORM_PS5
   return ResolvedFstatfs() != nullptr;
 #else

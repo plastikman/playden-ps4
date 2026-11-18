@@ -1507,9 +1507,23 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
   if (chosen("pointer_stick")) text += "mouse = " + value("pointer_stick") + "\n";
   if (settings.values.at("pointer_speed").available && chosen("pointer_speed"))
     text += "mouse_speed = " + value("pointer_speed") + "\n";
-  const bool keyboard_stick = settings.input_keyboard_stick && settings.values.at("movement_stick").available &&
-                              value("movement_stick") != "none" && chosen("movement_stick");
-  if (keyboard_stick) text += "keyboard_stick = " + value("movement_stick") + "\n";
+  // Only a stick the runtime names. prospero-win reads none, left_stick and right_stick
+  // (src/pw_game_profile.c) and ProsperoProfileValid admits the same three, but movement_stick has
+  // no entry in the settings catalogue -- it reaches `values` from a controller preset alone -- so
+  // nothing bounded what went in. Anything else was written out and then refused by our own
+  // validator as "keyboard_stick: unknown movement stick", which failed the whole publication
+  // (seen on the PS4 for every game, 2026-11-18). A value we cannot name is left out instead: the
+  // profile stays valid and the runtime keeps its default.
+  // find, not at: movement_stick has no catalogue entry, so a settings record that never met a
+  // controller preset simply has no such key, and at() would throw -- out of a translation unit
+  // that allows exceptions into one built with -fno-exceptions, which ends the process rather than
+  // the call. Absent means the runtime's default, the same as a value we cannot name.
+  const auto movement_value = settings.values.find("movement_stick");
+  const bool movement_available = movement_value != settings.values.end() && movement_value->second.available;
+  const auto movement = movement_available ? value("movement_stick") : std::string();
+  const bool keyboard_stick = settings.input_keyboard_stick && movement_available &&
+                              (movement == "left_stick" || movement == "right_stick") && chosen("movement_stick");
+  if (keyboard_stick) text += "keyboard_stick = " + movement + "\n";
   // Written only when they differ from the runtime's defaults (no dead zone, full rumble).
   const bool tuned_deadzone = settings.values.at("stick_deadzone").available && value("stick_deadzone") != "0";
   const bool tuned_rumble = settings.values.at("rumble").available && value("rumble") != "100";
