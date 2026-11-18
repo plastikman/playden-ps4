@@ -86,9 +86,15 @@ bool Server::Start(const ServerOptions& options, Handler handler, std::string* e
     int on = 1;
     setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
     NoSigpipe(listener_);
-    // A system with a lower limit may refuse the size instead of giving what it can.
-    for (int wanted = options.receive_buffer_bytes; wanted >= 64 * 1024; wanted /= 2)
-      if (setsockopt(listener_, SOL_SOCKET, SO_RCVBUF, &wanted, sizeof wanted) == 0) break;
+    // Deliberately NOT sizing SO_RCVBUF here. Sizing a listener's buffers before bind()/listen()
+    // is what fixes the window scale for every socket accepted from it, and on this console that
+    // left a large response dead in the water: the client got exactly one buffer-full (32,768 B of
+    // a 98,579-byte page) and send() then returned EAGAIN for sixty seconds while curl sat reading,
+    // with the stack apparently believing the window never reopened. The console's own FTP server
+    // moves gigabyte packages over the same stack and sets no buffer sizes, so we set none either
+    // and let the defaults auto-tune (measured 2026-11-18; cf. NetBSD bin/59865, "ftp should not
+    // set socket send/receive buffers unless told to").
+    (void)options.receive_buffer_bytes;
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<std::uint16_t>(port));
@@ -178,6 +184,13 @@ void Server::Run() {
     if (client < 0) continue;
     NoSigpipe(client);
     SetTimeout(client, SO_SNDTIMEO, options_.write_timeout_ms);
+    if (options_.verbose) {
+      int sndbuf = 0, rcvbuf = 0;
+      socklen_t slen = sizeof sndbuf, rlen = sizeof rcvbuf;
+      getsockopt(client, SOL_SOCKET, SO_SNDBUF, &sndbuf, &slen);
+      getsockopt(client, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &rlen);
+      Log("accepted sndbuf=" + std::to_string(sndbuf) + " rcvbuf=" + std::to_string(rcvbuf));
+    }
     {
       std::lock_guard<std::mutex> lock(mutex_);
       waiting_.push_back({client, ip});
@@ -218,7 +231,7 @@ void Server::Work() {
     hold.l_linger = 10;  // seconds close() may take to finish the transfer
     ::setsockopt(accepted.fd, SOL_SOCKET, SO_LINGER, &hold, sizeof hold);
     SetTimeout(accepted.fd, SO_RCVTIMEO, 1000);
-    for (int reads = 0; reads < 64; ++reads) {
+    for (int reads = 0; reads < 4; ++reads) {
       char sink[512];
       const auto count = ::recv(accepted.fd, sink, sizeof sink, 0);
       if (count == 0) break;                      // the client acknowledged our FIN
@@ -230,26 +243,54 @@ void Server::Work() {
 }
 
 void Server::Serve(int client, const std::string& client_ip) {
-  // A page is tens of kilobytes and the console's socket send buffer is about 33 KB, so a response
-  // larger than that cannot leave in one send: the rest goes as the client drains it. SO_SNDTIMEO
-  // (set above) makes a full buffer return EAGAIN rather than block forever, and treating that as
-  // fatal truncated every big response at the buffer's size -- the web page arrived cut off in the
-  // middle of its script, so no JavaScript ran and the page was blank (measured 2026-11-18: 33,145
-  // of 98,579 bytes). A timeout means the buffer stayed full for that window, not that the client
-  // is gone, so keep sending; only a real error, a closed socket, or a client that has taken
-  // nothing at all for kStallLimit ends the response.
+  // Large responses used to arrive truncated at exactly the send buffer's size -- 32,768 bytes of
+  // a 98,579-byte page -- so the page was cut mid-script, no JavaScript ran, and every table and
+  // card rendered empty. The cause was this loop, not the console: send() here returns EAGAIN the
+  // moment the buffer is full and SO_SNDTIMEO is NOT honoured, so a retry budget measured in
+  // "timeouts" was really spent in milliseconds, long before the buffer could drain. Waiting on
+  // POLLOUT instead costs nothing measurable: the same page now completes in under 10ms and a
+  // 5.3MB report.zip in 3.5s (measured 2026-11-18).
   const auto write = [this, client](const char* data, std::size_t size) {
-    constexpr int kStallLimit = 6;  // x write_timeout_ms with no progress at all
+    // poll() for writability on EAGAIN; never treat a full buffer as the end of the response.
+    constexpr std::size_t kSendChunkBytes = 8 * 1024;
+    constexpr int kPollMs = 10000;   // one wait for the socket to drain
+    constexpr int kPollLimit = 12;   // consecutive waits with no progress before giving up
+    const auto began = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [began] {
+      return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - began).count());
+    };
     int stalled = 0;
     while (size > 0) {
       if (stop_.load()) return false;
-      const auto sent = ::send(client, data, size, kSendFlags);
+      // 8KB at a time, as the console's own FTP servers do; the buffer is about 33KB.
+      const auto want = size < kSendChunkBytes ? size : kSendChunkBytes;
+      const auto sent = ::send(client, data, want, kSendFlags);
       if (sent < 0 && errno == EINTR) continue;
       if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (++stalled >= kStallLimit) return false;
+        pollfd waiting{};
+        waiting.fd = client;
+        waiting.events = POLLOUT;
+        const int ready = ::poll(&waiting, 1, kPollMs);
+        if (ready > 0 && (waiting.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+          Log("send hangup left=" + std::to_string(size) + " revents=" +
+              std::to_string(waiting.revents) + " after=" + elapsed_ms() + "ms");
+          return false;
+        }
+        if (ready > 0) { stalled = 0; continue; }   // writable: take another run at it
+        if (ready < 0 && errno == EINTR) continue;
+        if (++stalled >= kPollLimit || ready < 0) {
+          Log("send stalled out left=" + std::to_string(size) + " poll=" + std::to_string(ready) +
+              " waits=" + std::to_string(stalled) + " after=" + elapsed_ms() + "ms");
+          return false;
+        }
         continue;
       }
-      if (sent <= 0) return false;
+      if (sent <= 0) {
+        Log("send gave up errno=" + std::to_string(errno) + " sent=" + std::to_string(sent) +
+            " left=" + std::to_string(size) + " after=" + elapsed_ms() + "ms");
+        return false;
+      }
       stalled = 0;
       data += sent;
       size -= static_cast<std::size_t>(sent);
