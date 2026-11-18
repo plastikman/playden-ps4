@@ -32,7 +32,16 @@ ZINK_PROVIDERS = ("win/mesa-zink/i386-windows/opengl32.dll", "win/mesa-zink/x86_
 VIEW = "runtime-template/playden-kit-view.json"
 # What Orbis-Win does that Playden's settings ask a kit about (ps4/platform_ps4/game_controls.cpp Ps4Kit),
 # and the any-title slots that stand for each game's profile.
-CAPABILITIES = sorted(["input-keyboard-stick", "input-touchpad", "settings-dxvk-config", "title-any-id"])
+# ⚠ Do NOT add game-root-unowned here. It reads like "this kit can start a game from a folder it
+# does not own", which is what an FTP-imported game needs (GoldHEN writes as root, the importer
+# places the tree with rename, so the game arrives uid 0 while Playden runs as uid 1). It is not
+# per-game: the capability makes Playden publish EVERY game folder unowned
+# (settings_publication.h), so declaring it re-publishes the whole library at startup. Tried in
+# 03.38 on 2026-11-18: every regeneration was refused with "keyboard_stick: unknown movement
+# stick" and Playden crashed on its title screen. An imported game needs to be owned by Playden
+# instead -- the importer should copy a tree it does not own rather than rename it.
+CAPABILITIES = sorted(["input-keyboard-stick", "input-touchpad", "settings-dxvk-config",
+                       "title-any-id"])
 
 
 def capabilities(stage) -> list:

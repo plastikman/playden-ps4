@@ -698,10 +698,19 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
                                           const std::string &volume_id, std::uint32_t runtime_number) {
         return runner->Enqueue(*service, entry, source, volume_id, runtime_number);
     };
+    // ⚠ Copy, not Move. A move is std::rename, which keeps the owner, and GoldHEN's FTP server
+    // writes /data/playden-import as root while Playden runs as another user. The game then sits in
+    // Playden's own library owned by someone else, and every start is refused with "The game's
+    // folder belongs to another user" (runtime_host.cpp: the check is on st_uid alone, so the 0777
+    // modes throughout /data do not help). Playden cannot chown it back: there is no root on this
+    // console. Copying writes each file as Playden, so the game ends up owned, and the drop folder
+    // is removed afterwards exactly as a copy from a drive would be. Measured with MDK, 2026-11-18:
+    // SHINY/ arrived uid 0 while the .playden-* records beside it were uid 1.
     import_config.move_into_playden = [service = s.installs.get(), runner = s.copy_runner.get()](
                                           const playden::stores::local::ImportEntry &entry, const std::string &source,
                                           std::uint32_t runtime_number) {
-        return runner->Move(*service, entry, source, runtime_number);
+        return runner->Enqueue(*service, entry, source,
+                               playden::installs::InstallService::kPrimaryVolumeId, runtime_number);
     };
     import_config.remove_copy_folder = [runner = s.copy_runner.get()](const std::string &root) {
         return runner->Remove(root).empty();
