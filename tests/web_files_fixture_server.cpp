@@ -43,6 +43,11 @@ int main(int argc, char** argv) {
   const auto wolverine_folder = base / "usb/playden/import/Wolverine";
   Put(wolverine_folder / "Binaries/Wolverine.exe", "exe");
   Put(wolverine_folder / "Support/DirectX/DXSETUP.exe", "dx");
+  const auto jazz = bottle("gog-1351891846");
+  Put(jazz / "drive_c/users/prospero/Documents/Jazz2/config.ini", "[video]\nfullscreen=1\n");
+  const auto jazz_folder = base / "playden-games/gog-1351891846";
+  Put(jazz_folder / "Jazz2.exe", "exe");
+  Put(jazz_folder / "save/slot1.lst", "slot");
   const auto darkwood = bottle("steam-274520");
   Put(darkwood / "drive_c/users/prospero/AppData/LocalLow/Acid Wizard Studio/Darkwood/save.dat", "kept");
 
@@ -84,6 +89,16 @@ int main(int argc, char** argv) {
     game.cloud = true;
     catalog.games.push_back(game);
     game = {};
+    game.id = "gog-1351891846";
+    game.name = "Jazz Jackrabbit 2: The Secret Files";
+    game.kind = FileGameKind(playden::Store::kGog);
+    game.bottle = jazz.string();
+    game.game_folder = jazz_folder.string();
+    game.game_folder_shown = "/data/playden-games/gog-1351891846";
+    game.drive = "console";
+    game.last_played = 1793600000;
+    catalog.games.push_back(game);
+    game = {};
     game.id = "steam-274520";
     game.name = "Darkwood";
     game.kind = "steam";
@@ -100,6 +115,19 @@ int main(int argc, char** argv) {
   fs::create_directories(base / "logs");
   config.server.first_port = config.server.last_port = wanted;
   config.server.loopback_only = true;
+  // PLAYDEN_FIXTURE_SLOW_MOVE=<ms>: each file a move copies waits that long, so the page's progress can be seen.
+  if (const char* slow = std::getenv("PLAYDEN_FIXTURE_SLOW_MOVE")) {
+    const int ms = std::atoi(slow);
+    config.files.store.fault = [ms](const std::string& step) {
+      if (step == "copy-sync") std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      return true;
+    };
+  }
+  // Import recipe: any file is used by the game named, or by GTA IV from the games list; a file with "bad" is refused.
+  config.files.import_recipe = [](const std::string& game, std::string file) -> RecipeImportAnswer {
+    if (file.find("bad") != std::string::npos) return {422, "This file isn't a Playden recipe."};
+    return {200, "The game now uses this recipe.", game.empty() ? std::string("steam-12210") : game};
+  };
   Service service(std::move(config));
   service.SetFileCatalog(catalog);
   service.SetEnabled(true);

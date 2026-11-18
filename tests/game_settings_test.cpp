@@ -54,6 +54,8 @@ void WritePe(const std::filesystem::path& path, bool pe64) {
 int main(int argc, char** argv) {
   const std::filesystem::path source = argc > 1 ? argv[1] : ".";
   std::string reason;
+  // The Steam network and Online cases run with the experimental feature on; the last block turns it off.
+  SetOnlineSteamEnabled(true);
 
   GameRecipe hl2;
   CHECK(ParseGameRecipe(ReadText(source / "runtime/recipes/steam-220-hl2-v1.json"), &hl2, &reason));
@@ -79,15 +81,16 @@ int main(int argc, char** argv) {
       if (definition.group != SettingGroup::kButtonMapping) ids.push_back(definition.id);
     const std::vector<std::string> expected = {
         "launch_option", "program", "start_through_launcher", "launcher_controller_preset", "extra_arguments",
+        "steam_features", "steam_sign_in", "game_invites",
         "resolution", "refresh", "frame_limit", "framegen", "vsync", "performance_overlay", "overlay_detail", "scaling",
         "window_view",
-        "controller", "controller_preset",
+        "controller", "controller_preset", "touchpad_hold",
         "pointer_stick", "pointer_speed", "stick_deadzone", "rumble", "invert_stick", "trigger_deadzone", "wheel_stick",
         "volume",
         "start_check",
         "graphics", "d3d12", "pixel_shader_waves", "frame_latency", "reported_gpu", "reported_vram",
-        "steam_features", "steam_input", "windows_version", "text_scale", "locale", "cpu_topology", "address_space", "cpu",
-        "network_adapters", "logging",
+        "steam_library_path", "steam_network", "steam_input", "windows_version", "text_scale",
+        "locale", "cpu_topology", "address_space", "cpu", "network_adapters", "logging",
         "environment", "program_folder", "program_arguments", "arguments", "architecture", "dll_overrides",
         "library_overrides", "registry_dll_overrides"};
     CHECK(ids == expected);
@@ -96,7 +99,24 @@ int main(int argc, char** argv) {
     CHECK(FindSetting("refresh")->group == SettingGroup::kDisplay &&
           FindSetting("button.cross")->group == SettingGroup::kButtonMapping &&
           FindSetting("rumble")->group == SettingGroup::kControllerTuning);
+    // Online play has its own section after Game; Compatibility › Steam keeps the other Steam rows, above Windows;
+    // Logging is in Advanced.
+    for (const char* id : {"steam_features", "steam_sign_in", "game_invites"})
+      CHECK(FindSetting(id)->group == SettingGroup::kOnline);
+    for (const char* id : {"steam_library_path", "steam_network", "steam_input"})
+      CHECK(FindSetting(id)->group == SettingGroup::kSteam);
+    CHECK(FindSetting("windows_version")->group == SettingGroup::kWindows &&
+          FindSetting("logging")->group == SettingGroup::kAdvanced);
   }
+
+  // "Also called" names only what a player finds in Wine, DXVK or Steam tips: never a profile key ([section] key),
+  // a Playden file or a prospero-win variable.
+  for (const auto& definition : SettingsCatalogue()) {
+    const auto& also = definition.also_called;
+    CHECK(also.find('[') == std::string::npos && also.find("playden") == std::string::npos &&
+          also.find("PW_") == std::string::npos);
+  }
+  CHECK(FindSetting("logging")->also_called == "WINEDEBUG" && FindSetting("resolution")->also_called.empty());
 
   // Every catalogue choice default is one of its own choices.
   for (const auto& definition : SettingsCatalogue()) {
@@ -269,6 +289,269 @@ int main(int argc, char** argv) {
     const std::string bad_label = std::string("[application]\n") + "\n[launcher]\nlabel = a\"b\n";
     CHECK(!CheckProsperoProfile(bad_label, &why, launcher_features));
   }
+  // Touchpad hold: the menu preset a touchpad hold swaps to, without a launcher ([launcher] chain = off). Only with the
+  // kit and a title on its runtime; Start through a launcher has its own switch and wins.
+  {
+    const auto touchpad_kit = KitCapabilitiesFromManifest({kKitTouchpadSwitch, kKitLauncherMode}, false);
+    CHECK(touchpad_kit.touchpad_switch && !KitCapabilitiesFromManifest({kKitLauncherMode}, false).touchpad_switch);
+    const auto older_title = KitForTitleRuntime(touchpad_kit, false);
+    CHECK(!older_title.touchpad_switch && older_title.touchpad_switch_needs_update);
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {}, touchpad_kit, &settings, &error));
+    CHECK(settings.values.at("touchpad_hold").value == "off" && settings.values.at("touchpad_hold").available);
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("[launcher]") == std::string::npos);
+    // On: the game keeps its own [input]; the menu preset is written out, with the D-pad as arrows and Triangle as Esc.
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"touchpad_hold", "mouse"}}, touchpad_kit, &settings, &error));
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("\n[launcher]\nchain = off\nlabel = Mouse\ngame_label = Game controls\nmode = keyboard\n"
+                            "mouse = left_stick\nmouse_speed = 900\ncross = mouse_left\ncircle = mouse_right\n"
+                            "square = mouse_middle\ntriangle = escape\nl2 = mouse_right\nr2 = mouse_left\nup = up\n"
+                            "down = down\nleft = left\nright = right\noptions = enter\n") != std::string::npos);
+    CHECK(profile.text.find("\n[input]\nmode = xinput\nmouse = none\n") != std::string::npos);
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"touchpad_hold", "mouse"}, {"controller_preset", "gamepad"}}, touchpad_kit,
+                                 &settings, &error));
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("\n[launcher]\nchain = off\nlabel = Mouse\ngame_label = Gamepad\n") != std::string::npos);
+    // Start through a launcher: one section, the launcher's, and the row says why it is off.
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"touchpad_hold", "mouse"}, {"start_through_launcher", "on"}}, touchpad_kit,
+                                 &settings, &error));
+    CHECK(!settings.values.at("touchpad_hold").available &&
+          settings.values.at("touchpad_hold").reason ==
+              "Start through a launcher already switches presets with the touchpad.");
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("chain = off") == std::string::npos &&
+          profile.text.find("[launcher]") == profile.text.rfind("[launcher]") && profile.text.find("[launcher]") != std::string::npos);
+    // Without the kit, or with a title on an older runtime, the row is off and nothing is written.
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"touchpad_hold", "mouse"}}, KitCapabilities{}, &settings, &error));
+    CHECK(!settings.values.at("touchpad_hold").available &&
+          settings.values.at("touchpad_hold").reason == "Needs a newer runtime kit that switches presets with the touchpad.");
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("[launcher]") == std::string::npos);
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"touchpad_hold", "mouse"}}, older_title, &settings, &error));
+    CHECK(!settings.values.at("touchpad_hold").available);
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("[launcher]") == std::string::npos);
+    // chain = off is only accepted when the renderer says so, and only as off.
+    std::string why;
+    ProsperoProfileFeatures launcher_only;
+    launcher_only.launcher_section = true;
+    const std::string chain_off = "[application]\n\n[launcher]\nchain = off\n";
+    CHECK(!CheckProsperoProfile(chain_off, &why, launcher_only));
+    ProsperoProfileFeatures chain_features = launcher_only;
+    chain_features.launcher_chain_off = true;
+    CHECK(!CheckProsperoProfile("[application]\n\n[launcher]\nchain = on\n", &why, chain_features));
+  }
+  // A kit whose only newer capability needs the title on its runtime still makes the host read the title's markers:
+  // otherwise a profile line the older title refuses goes out (helper-process alone once skipped the check).
+  {
+    for (const char* name : {kKitDisplay120Hz, kKitProfileVersion2, kKitInputRumble, kKitDisplayFramegen, kKitDisplayFpsCounter,
+                             kKitLauncherMode, kKitTouchpadSwitch, kKitInputPlaystation, kKitTitleNotify, kKitHelperProcess,
+                             kKitGameRootUsbSearch, kKitLaunchArguments4096, kKitLargeAddressAware, kKitNsiproxySwitch,
+                             kKitEnvironmentFileBudgets, kKitSteamLibraryPath}) {
+      if (!KitDependsOnTitleRuntime(KitCapabilitiesFromManifest({name}, false)))
+        std::fprintf(stderr, "%s alone doesn't check the title's runtime\n", name);
+      CHECK(KitDependsOnTitleRuntime(KitCapabilitiesFromManifest({name}, false)));
+    }
+    CHECK(!KitDependsOnTitleRuntime(KitCapabilities{}));
+    CHECK(!KitDependsOnTitleRuntime(KitCapabilitiesFromManifest({kKitDxvkConfig, kKitWineMono, kKitOpenGLZink}, true)));
+  }
+  // Steam features = Online: with a runtime that runs a helper, the profile starts the Steam host beside the game and
+  // holds the game until it is ready; without one, nothing is written. The section is refused unless the renderer says so.
+  {
+    const auto helper_kit = KitCapabilitiesFromManifest({kKitHelperProcess}, false);
+    CHECK(helper_kit.helper_process && !KitCapabilitiesFromManifest({kKitInputRumble}, false).helper_process);
+    CHECK(std::find(SettingsKitCapabilityNames().begin(), SettingsKitCapabilityNames().end(), kKitHelperProcess) !=
+          SettingsKitCapabilityNames().end());
+    const auto stale = KitForTitleRuntime(helper_kit, false);
+    CHECK(!stale.helper_process && stale.helper_process_needs_update && KitForTitleRuntime(helper_kit, true).helper_process);
+    const std::map<std::string, std::string> online = {{"unlock.steam_features", "on"}, {"steam_features", "online"}};
+    CHECK(BuildEffectiveSettings(hl2, nullptr, online, helper_kit, &settings, &error) && settings.helper_process);
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("\n[helper]\nprogram = Z:\\data\\playden\\steam-client\\client\\steam.exe\n"
+                            "ready = playden/steam-host.ready\nwait = 60\n") != std::string::npos);
+    // Without the Steam host, Online falls back to the game's default and says why; a title still on an older runtime
+    // keeps Online for its update.
+    CHECK(BuildEffectiveSettings(hl2, nullptr, online, KitCapabilities{}, &settings, &error) && !settings.helper_process);
+    CHECK(settings.values.at("steam_features").value != "online" &&
+          settings.values.at("steam_features").reason == "Needs a runtime kit that runs Steam beside the game.");
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("[helper]") == std::string::npos);
+    CHECK(BuildEffectiveSettings(hl2, nullptr, online, stale, &settings, &error));
+    CHECK(settings.values.at("steam_features").value != "online" && settings.values.at("steam_features").waits_for_update &&
+          settings.values.at("steam_features").after_update == "online");
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"unlock.steam_features", "on"}, {"steam_features", "emulate"}}, helper_kit,
+                                 &settings, &error));
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("[helper]") == std::string::npos);
+    std::string why;
+    const std::string base = profile.text;
+    ProsperoProfileFeatures helper_features;
+    helper_features.helper_section = true;
+    const std::string program = "program = C:\\Tools\\a b.exe\n";
+    CHECK(!CheckProsperoProfile(base + "\n[helper]\n" + program, &why, {}));
+    CHECK(CheckProsperoProfile(base + "\n[helper]\n" + program, &why, helper_features));
+    CHECK(CheckProsperoProfile(base + "\n[helper]\n" + program + "ready = a/b.ready\nwait = 120\n", &why, helper_features));
+    for (const char* bad : {"", "program = tools\\a.exe\n", "program = C:/a.exe\n", "program = C:\\a\"b.exe\n",
+                            "program = C:\\a.exe\nready = ../b\n", "program = C:\\a.exe\nready = /b\n",
+                            "program = C:\\a.exe\nready = a//b\n", "program = C:\\a.exe\nready = a\\b\n",
+                            "program = C:\\a.exe\nwait = 0\n", "program = C:\\a.exe\nwait = 121\n",
+                            "program = C:\\a.exe\nother = 1\n", "program = C:\\a.exe\nprogram = C:\\b.exe\n"})
+      CHECK(!CheckProsperoProfile(base + "\n[helper]\n" + bad, &why, helper_features));
+  }
+  // A Steam game shown in steamapps\common: the target names its folder only for a title whose runtime reads [steam]
+  // (the host decides, SteamLibraryFolder); the profile keeps the real paths and adds the section. The section is
+  // refused unless the renderer says so, and left out when a path there would be too long for the runtime.
+  {
+    const auto steam_kit = KitCapabilitiesFromManifest({kKitSteamLibraryPath}, false);
+    CHECK(steam_kit.steam_library_path && !KitCapabilitiesFromManifest({kKitHelperProcess}, false).steam_library_path);
+    CHECK(!KitForTitleRuntime(steam_kit, false).steam_library_path && KitForTitleRuntime(steam_kit, true).steam_library_path);
+    auto steam_target = target;
+    steam_target.steam_install_dir = "Half-Life 2";
+    // Only with Steam library folder = Steam's folder: a game installed before this Playden keeps Playden's folder, so
+    // does one whose player chose it, and a runtime kit without the capability shows none.
+    for (const auto& overrides : std::vector<std::map<std::string, std::string>>{
+             {}, {{"steam_library_path", "playden"}}, {{"default.steam_library_path", "steam"}, {"steam_library_path", "playden"}}}) {
+      CHECK(BuildEffectiveSettings(hl2, nullptr, overrides, steam_kit, &settings, &error));
+      CHECK(settings.values.at("steam_library_path").value == "playden");
+      CHECK(RenderProsperoProfile(hl2, settings, steam_target, &profile, &reason));
+      CHECK(profile.text.find("[steam]") == std::string::npos);
+    }
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"default.steam_library_path", "steam"}}, KitCapabilities{}, &settings, &error));
+    CHECK(RenderProsperoProfile(hl2, settings, steam_target, &profile, &reason));
+    CHECK(profile.text.find("[steam]") == std::string::npos);
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"steam_library_path", "steam"}}, steam_kit, &settings, &error));
+    CHECK(RenderProsperoProfile(hl2, settings, steam_target, &profile, &reason));
+    CHECK(profile.text.find("\n[steam]\ninstall_dir = Half-Life 2\n") != std::string::npos);
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"default.steam_library_path", "steam"}}, steam_kit, &settings, &error));
+    CHECK(RenderProsperoProfile(hl2, settings, steam_target, &profile, &reason));
+    CHECK(profile.text.find("\n[steam]\ninstall_dir = Half-Life 2\n") != std::string::npos);
+    CHECK(profile.text.find("executable = Z:\\data\\homebrew\\FAKE77031\\games\\220\\") != std::string::npos);
+    CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+    CHECK(profile.text.find("[steam]") == std::string::npos);
+    // 46 bytes of C:\Program Files (x86)\Steam\steamapps\common\, the folder and the program: a folder name that fits
+    // alone but not with the program keeps the game at its real path.
+    steam_target.steam_install_dir = std::string(128, 'a');
+    CHECK(RenderProsperoProfile(hl2, settings, steam_target, &profile, &reason));
+    CHECK(profile.text.find("[steam]") != std::string::npos);
+    {
+      auto deep = settings;
+      auto entry = std::make_shared<LaunchEntry>(*settings.launch);
+      // 45 + 1 + 128 + 1 + 84 = 259 bytes fit, one more doesn't.
+      entry->executable = std::string(80, 'b') + ".exe";
+      deep.launch_storage = entry;
+      deep.launch = entry.get();
+      CHECK(RenderProsperoProfile(hl2, deep, steam_target, &profile, &reason));
+      CHECK(profile.text.find("[steam]") != std::string::npos);
+      entry->executable = std::string(81, 'b') + ".exe";
+      CHECK(RenderProsperoProfile(hl2, deep, steam_target, &profile, &reason));
+      CHECK(profile.text.find("[steam]") == std::string::npos);
+    }
+    steam_target.steam_install_dir = "a/b";
+    CHECK(RenderProsperoProfile(hl2, settings, steam_target, &profile, &reason));
+    CHECK(profile.text.find("[steam]") == std::string::npos);
+    std::string why;
+    const std::string base = profile.text;
+    ProsperoProfileFeatures steam_features;
+    steam_features.steam_section = true;
+    CHECK(!CheckProsperoProfile(base + "\n[steam]\ninstall_dir = Half-Life 2\n", &why, {}));
+    CHECK(CheckProsperoProfile(base + "\n[steam]\ninstall_dir = Half-Life 2\n", &why, steam_features));
+    CHECK(CheckProsperoProfile(base + "\n[steam]\ninstall_dir = 257510\n", &why, steam_features));
+    for (const char* bad : {"", "install_dir =\n", "install_dir = ..\n", "install_dir = a\\b\n", "install_dir = a/b\n",
+                            "install_dir = C:\n", "install_dir = a\"b\n", "install_dir = trailing.\n", "other = 1\n",
+                            "install_dir = a\ninstall_dir = b\n"})
+      CHECK(!CheckProsperoProfile(base + "\n[steam]\n" + bad, &why, steam_features));
+    CHECK(IsProsperoSteamInstallDir("The Talos Principle") && IsProsperoSteamInstallDir(std::string(128, 'a')) &&
+          !IsProsperoSteamInstallDir(std::string(129, 'a')) && !IsProsperoSteamInstallDir("a\tb"));
+  }
+  // Steam library folder: Playden's folder by default, so a game installed before this Playden keeps its path. A Steam
+  // game this Playden installs holds "default.steam_library_path" = steam, its own default: Playden's value
+  // (kPlayden), not a change of the player's, never shared or put in a preset; a recipe and the player win over it.
+  {
+    const auto* row = FindSetting("steam_library_path");
+    CHECK(row && row->label == "Steam library folder" && row->group == SettingGroup::kSteam &&
+          row->apply == ApplyMode::kGameClosed && row->playden_default == "playden" && row->choices.size() == 2 &&
+          row->choices[0].value == "steam" && row->choices[0].label == "Steam's folder" &&
+          row->choices[1].value == "playden" && row->choices[1].label == "Playden's folder");
+    CHECK(SettingShown(*row, KitCapabilities{}));
+    const auto steam_kit = KitCapabilitiesFromManifest({kKitSteamLibraryPath}, true);
+    EffectiveSettings values;
+    const auto effective = [&](const std::map<std::string, std::string>& overrides, const KitCapabilities& kit,
+                               const GameRecipe& recipe) -> const EffectiveValue& {
+      CHECK(BuildEffectiveSettings(recipe, nullptr, overrides, kit, &values, &error));
+      return values.values.at("steam_library_path");
+    };
+    auto value = effective({}, steam_kit, hl2);
+    CHECK(value.value == "playden" && value.source == ValueSource::kPlayden && value.available);
+    value = effective({{"default.steam_library_path", "steam"}}, steam_kit, hl2);
+    CHECK(value.value == "steam" && value.source == ValueSource::kPlayden && value.available);
+    value = effective({{"default.steam_library_path", "steam"}, {"steam_library_path", "playden"}}, steam_kit, hl2);
+    CHECK(value.value == "playden" && value.source == ValueSource::kUser);
+    value = effective({{"steam_library_path", "steam"}}, steam_kit, hl2);
+    CHECK(value.value == "steam" && value.source == ValueSource::kUser);
+    // A default whose value isn't one of the row's is ignored.
+    value = effective({{"default.steam_library_path", "elsewhere"}}, steam_kit, hl2);
+    CHECK(value.value == "playden" && value.source == ValueSource::kPlayden);
+    // A recipe may set the row (The Talos Principle would); the player still wins.
+    auto talos = hl2;
+    talos.defaults["steam_library_path"] = "steam";
+    {
+      GameRecipe reread;
+      CHECK(ParseGameRecipe(SerializeGameRecipe(talos), &reread, &reason) &&
+            reread.defaults.at("steam_library_path") == "steam");
+    }
+    value = effective({}, steam_kit, talos);
+    CHECK(value.value == "steam" && value.source == ValueSource::kRecipe);
+    value = effective({{"steam_library_path", "playden"}}, steam_kit, talos);
+    CHECK(value.value == "playden" && value.source == ValueSource::kUser);
+    // A runtime kit that can't show the game there, or a title still on an older runtime, disables the row, which then
+    // is Playden's folder whatever was chosen. The second applies once the game's runtime is updated, and says so.
+    for (const auto& kit : {KitCapabilities{}, KitForTitleRuntime(steam_kit, false)}) {
+      value = effective({{"default.steam_library_path", "steam"}, {"steam_library_path", "steam"}}, kit, hl2);
+      CHECK(!value.available && value.value == "playden");
+    }
+    CHECK(effective({}, KitCapabilities{}, hl2).reason == "Needs a newer runtime kit that shows the game in Steam's folder.");
+    CHECK(KitForTitleRuntime(steam_kit, false).steam_library_path_needs_update &&
+          !KitForTitleRuntime(steam_kit, true).steam_library_path_needs_update &&
+          !KitForTitleRuntime(KitCapabilities{}, false).steam_library_path_needs_update);
+    CHECK(effective({}, KitForTitleRuntime(steam_kit, false), hl2).reason == kAppliesAfterKitUpdate);
+
+    // The reserved key.
+    CHECK(IsGameDefaultKey("default.steam_library_path") && !IsGameDefaultKey("default.") &&
+          !IsGameDefaultKey("default.resolution") && !IsGameDefaultKey("steam_library_path") &&
+          !IsUnlockKey("default.steam_library_path"));
+    const std::map<std::string, std::string> mixed = {{"default.steam_library_path", "steam"}, {"resolution", "1280x720"}};
+    CHECK(GameDefaultOverrides(mixed) == (std::map<std::string, std::string>{{"default.steam_library_path", "steam"}}));
+    CHECK(HasPlayerOverrides(mixed) && !HasPlayerOverrides(GameDefaultOverrides(mixed)) && !HasPlayerOverrides({}));
+    // Saved and read back with the record; one this build doesn't take, or with a value the row doesn't have, is dropped.
+    GameSettingsRecord record;
+    record.overrides = {{"default.steam_library_path", "steam"}, {"default.resolution", "1280x720"}};
+    GameSettingsRecord reread;
+    CHECK(ParseGameSettingsRecord(SerializeGameSettingsRecord(record), &reread, &reason));
+    CHECK(reread.overrides == (std::map<std::string, std::string>{{"default.steam_library_path", "steam"}}));
+    record.overrides = {{"default.steam_library_path", "elsewhere"}};
+    CHECK(ParseGameSettingsRecord(SerializeGameSettingsRecord(record), &reread, &reason) && reread.overrides.empty());
+
+    // Where a game is installed is its own: never in a preset, whoever chose it.
+    CHECK(!ValidatePresetSetting("steam_library_path", "steam", &reason));
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"steam_library_path", "steam"}}, steam_kit, &values, &error));
+    CHECK(!PresetSettingsFromGame(hl2, values, PresetCapture::kSave).count("steam_library_path"));
+
+    // Shares: the game's own default stays out (an older Playden refuses a recipe naming a row it doesn't know); a
+    // value the player or a recipe set goes in.
+    const auto ref = playden::GameRef::Steam(220);
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"default.steam_library_path", "steam"}}, steam_kit, &values, &error));
+    CHECK(!BuildCommunityRecipe(hl2, values, ref, "Half-Life 2").recipe.defaults.count("steam_library_path"));
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {}, steam_kit, &values, &error));
+    CHECK(!BuildCommunityRecipe(hl2, values, ref, "Half-Life 2").recipe.defaults.count("steam_library_path"));
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"steam_library_path", "steam"}}, steam_kit, &values, &error));
+    CHECK(BuildCommunityRecipe(hl2, values, ref, "Half-Life 2").recipe.defaults.at("steam_library_path") == "steam");
+    // A chosen Playden's folder goes in too: on another new install the game's own default would be Steam's folder.
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"default.steam_library_path", "steam"}, {"steam_library_path", "playden"}},
+                                 steam_kit, &values, &error));
+    CHECK(BuildCommunityRecipe(hl2, values, ref, "Half-Life 2").recipe.defaults.at("steam_library_path") == "playden");
+    CHECK(BuildEffectiveSettings(talos, nullptr, {}, steam_kit, &values, &error));
+    CHECK(BuildCommunityRecipe(talos, values, ref, "Half-Life 2").recipe.defaults.at("steam_library_path") == "steam");
+  }
   // Playden's tables of preset rows and buttons match the shipped input files.
   for (const auto& [name, buttons] : ControllerPresetButtons()) {
     const auto file = ReadText(source / ("runtime/input/" + name + ".input"));
@@ -320,6 +603,71 @@ int main(int argc, char** argv) {
   CHECK(RenderDxvkConfig(settings).find("dxvk.hud = fps,frametimes\n") != std::string::npos);
   CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
   CHECK(profile.text.find("show_fps = false\n") != std::string::npos);
+  // A kit without [environment] gets no DXVK_CONFIG_FILE (its title would refuse the profile).
+  CHECK(profile.text.find("DXVK_CONFIG_FILE") == std::string::npos);
+  {
+    // DXVK finds Playden's dxvk.conf by its full path, so a game that changes folder before DXVK loads (Dota 2) still
+    // reads it.
+    auto environment_kit = dxvk_kit;
+    environment_kit.environment = true;
+    EffectiveSettings with_config;
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"performance_overlay", "on"}}, environment_kit, &with_config, &error));
+    CHECK(RenderProsperoProfile(hl2, with_config, target, &profile, &reason));
+    CHECK(profile.text.find("\nDXVK_CONFIG_FILE = Z:\\data\\homebrew\\FAKE77031\\games\\220\\dxvk.conf\n") !=
+          std::string::npos);
+    // The launch working folder holds dxvk.conf (ApplyGameSettings), so the path names it.
+    auto nested = hl2;
+    nested.launch_entries.front().executable = "bin/hl2.exe";
+    nested.launch_entries.front().working_directory = "bin";
+    CHECK(BuildEffectiveSettings(nested, nullptr, {{"frame_limit", "30"}}, environment_kit, &with_config, &error));
+    CHECK(RenderProsperoProfile(nested, with_config, target, &profile, &reason));
+    CHECK(profile.text.find("DXVK_CONFIG_FILE = Z:\\data\\homebrew\\FAKE77031\\games\\220\\bin\\dxvk.conf\n") !=
+          std::string::npos);
+    // No dxvk.conf, no variable.
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {}, environment_kit, &with_config, &error));
+    CHECK(RenderDxvkConfig(with_config).empty());
+    CHECK(RenderProsperoProfile(hl2, with_config, target, &profile, &reason));
+    CHECK(profile.text.find("DXVK_CONFIG_FILE") == std::string::npos);
+    // The player's own DXVK_CONFIG_FILE wins, named once.
+    CHECK(BuildEffectiveSettings(hl2, nullptr,
+                                 {{"performance_overlay", "on"}, {"environment", "DXVK_CONFIG_FILE=C:\\mine.conf"}},
+                                 environment_kit, &with_config, &error));
+    CHECK(RenderProsperoProfile(hl2, with_config, target, &profile, &reason));
+    CHECK(profile.text.find("DXVK_CONFIG_FILE = C:\\mine.conf\n") != std::string::npos);
+    CHECK(profile.text.find("DXVK_CONFIG_FILE") == profile.text.rfind("DXVK_CONFIG_FILE"));
+    // Eight variables of the player's fill [environment]: it is the same as without a dxvk.conf, so none of theirs
+    // gives way to DXVK_CONFIG_FILE.
+    std::string eight;
+    for (char name = 'A'; name < 'A' + 8; ++name) eight += std::string(eight.empty() ? "" : ";") + "DXVK_" + name + "=1";
+    const auto environment_of = [&](const std::map<std::string, std::string>& overrides) {
+      CHECK(BuildEffectiveSettings(hl2, nullptr, overrides, environment_kit, &with_config, &error));
+      CHECK(RenderProsperoProfile(hl2, with_config, target, &profile, &reason));
+      const auto section = profile.text.find("\n[environment]\n");
+      return section == std::string::npos ? std::string() : profile.text.substr(section, profile.text.find("\n[", section + 1) - section);
+    };
+    const auto without_config = environment_of({{"environment", eight}});
+    CHECK(without_config.find("DXVK_A = 1\n") != std::string::npos);
+    CHECK(environment_of({{"performance_overlay", "on"}, {"environment", eight}}) == without_config);
+    // A path the runtime could not hold once it adds a USB drive's number is left out; the profile still renders.
+    // "Z:\data\" + folder + "\dxvk.conf" is 18 bytes plus the folder name: 126 bytes fit, 127 don't.
+    CHECK(BuildEffectiveSettings(hl2, nullptr, {{"performance_overlay", "on"}}, environment_kit, &with_config, &error));
+    const ProfileTarget fits{"playden-steam-220", "/data/" + std::string(108, 'x')};
+    CHECK(RenderProsperoProfile(hl2, with_config, fits, &profile, &reason));
+    CHECK(profile.text.find("DXVK_CONFIG_FILE = Z:\\data\\" + std::string(108, 'x') + "\\dxvk.conf\n") != std::string::npos);
+    const ProfileTarget deep{"playden-steam-220", "/data/" + std::string(109, 'x')};
+    CHECK(RenderProsperoProfile(hl2, with_config, deep, &profile, &reason));
+    CHECK(profile.text.find("DXVK_CONFIG_FILE") == std::string::npos);
+  }
+  // The runtime log names the overlay and the player's own rows; typed text stays out of it.
+  CHECK(SettingsLogSummary(settings) ==
+        "overlay=on detail=frametimes chosen=overlay_detail=frametimes,performance_overlay=on");
+  CHECK(BuildEffectiveSettings(hl2, nullptr, {{"extra_arguments", "+password hunter2"}, {"vsync", "off"}},
+                               KitCapabilities{}, &settings, &error));
+  CHECK(SettingsLogSummary(settings) == "overlay=off chosen=extra_arguments=set,vsync=game(unavailable)");
+  CHECK(BuildEffectiveSettings(hl2, nullptr, {}, dxvk_kit, &settings, &error));
+  CHECK(SettingsLogSummary(settings) == "overlay=off chosen=-");
+  CHECK(BuildEffectiveSettings(hl2, mouse, {}, dxvk_kit, &settings, &error));
+  CHECK(SettingsLogSummary(settings).find("controller=") != std::string::npos);
   CHECK(BuildEffectiveSettings(hl2, nullptr, {{"overlay_detail", "full"}}, dxvk_kit, &settings, &error));
   CHECK(!settings.values.at("overlay_detail").available);   // overlay off
   CHECK(RenderDxvkConfig(settings).find("dxvk.hud") == std::string::npos);
@@ -1494,6 +1842,25 @@ int main(int argc, char** argv) {
     // Again: already there, so the hive is left as it is.
     applied = ApplyInstallScripts(game.string(), "Z:\\data\\games\\22380", "", bottle.string(), 1791600000);
     CHECK(applied.ok && ReadText(bottle / "system.reg") == written);
+    // A later script setting the same value, in another case: its value wins instead of the registry refusing a
+    // duplicate. The same holds for HKCU and a key's unnamed value, under either name of the hive.
+    std::ofstream(game / "installscript_2.vdf")
+        << "\"InstallScript\" { \"Registry\" { \"HKEY_LOCAL_MACHINE\\\\Software\\\\bethesda softworks\\\\FalloutNV\" "
+           "{ \"string\" { \"installed path\" \"%INSTALLDIR%\\\\Data\" } } \"HKCU\\\\Software\\\\Studio\" "
+           "{ \"string\" { \"(Default)\" \"two\" } } } }";
+    std::ofstream(game / "installscript_3.vdf")
+        << "\"InstallScript\" { \"Registry\" { \"HKEY_CURRENT_USER\\\\software\\\\studio\" "
+           "{ \"string\" { \"(default)\" \"three\" } } } }";
+    std::ofstream(bottle / "user.reg") << "WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=win64\n";
+    ::chmod((bottle / "user.reg").c_str(), 0600);
+    applied = ApplyInstallScripts(game.string(), "Z:\\data\\games\\22380", "", bottle.string(), 1791700000);
+    CHECK(applied.ok && applied.found.size() == 3 && applied.values == 3);
+    const auto user_reg = ReadText(bottle / "user.reg");
+    CHECK(user_reg.find("@=\"three\"") != std::string::npos && user_reg.find("\"two\"") == std::string::npos);
+    const auto replaced = ReadText(bottle / "system.reg");
+    CHECK(replaced.find("\"Installed Path\"=\"Z:\\\\data\\\\games\\\\22380\\\\\"") == std::string::npos);
+    CHECK(replaced.find("\"installed path\"=\"Z:\\\\data\\\\games\\\\22380\\\\Data\"") != std::string::npos ||
+          replaced.find("\"Installed Path\"=\"Z:\\\\data\\\\games\\\\22380\\\\Data\"") != std::string::npos);
     std::filesystem::remove_all(script_root);
   }
 
@@ -1701,6 +2068,24 @@ int main(int argc, char** argv) {
     CHECK(BuildEffectiveSettings(ffxiii, nullptr, {{"steam_features", "game"}, {"unlock.steam_features", "on"}},
                                  KitCapabilities{}, &settings, &error));
     CHECK(settings.values.at("steam_features").value == "game" && settings.values.at("steam_features").unlocked);
+    // Steam network acts only on the emulator: with the game's own files it is unavailable and keeps its default.
+    CHECK(BuildEffectiveSettings(ffxiii, nullptr,
+                                 {{"steam_features", "game"}, {"unlock.steam_features", "on"}, {"steam_network", "offline"}},
+                                 KitCapabilities{}, &settings, &error));
+    CHECK(!settings.values.at("steam_network").available && settings.values.at("steam_network").value == "online");
+    CHECK(BuildEffectiveSettings(ffxiii, nullptr, {}, KitCapabilities{}, &settings, &error));
+    CHECK(settings.values.at("steam_network").available && settings.values.at("steam_network").value == "online");
+    CHECK(BuildEffectiveSettings(ffxiii, nullptr, {{"steam_network", "offline"}}, KitCapabilities{}, &settings, &error));
+    CHECK(settings.values.at("steam_network").value == "offline");
+    // Offline emulation, game's library is the same emulator answering one level lower: Steam network and Steam Input
+    // act on it too.
+    CHECK(BuildEffectiveSettings(ffxiii, nullptr,
+                                 {{"steam_features", "steamclient"}, {"unlock.steam_features", "on"},
+                                  {"steam_network", "offline"}, {"steam_input", "off"}},
+                                 KitCapabilities{}, &settings, &error));
+    CHECK(settings.values.at("steam_features").value == "steamclient");
+    CHECK(settings.values.at("steam_network").available && settings.values.at("steam_network").value == "offline");
+    CHECK(settings.values.at("steam_input").available && settings.values.at("steam_input").value == "off");
     CHECK(BuildEffectiveSettings(ffxiii, nullptr, {}, KitCapabilities{}, &settings, &error));
     // Its own full-screen, size and quality arguments; the size follows the Resolution row.
     CHECK(settings.arguments == "-FullScreenMode=Force -Width=1920 -Height=1080 -Shadow=4096 -MSAA=4");
@@ -1781,18 +2166,21 @@ int main(int argc, char** argv) {
     shared.replace(shared.size() - 1, 1, R"(,"executable":"g.exe","community":{"format_version":1,"status":"works"}})");
     CHECK(!ParseCommunityRecipe(shared, &community, &reason) && reason.find("steam_api_copies") != std::string::npos);
   }
-  // Project Zomboid runs out of open files watching its folders, so Playden ships a watcher that watches nothing.
+  // Project Zomboid watches each of its folders, which the runtime kit now does without a file each. 42.22 signs the
+  // game's classes, so the watcher that watched nothing, which Playden placed before, stops the game: it goes.
   {
     GameRecipe zomboid;
     CHECK(ParseGameRecipe(ReadText(source / "runtime/recipes/steam-108600-projectzomboid-v1.json"), &zomboid, &reason));
-    CHECK(zomboid.game_files == std::vector<std::string>{"zombie/DebugFileWatcher.class"});
-    const auto shipped = ReadText(source / "runtime/recipes/files/steam-108600-projectzomboid-v1/zombie/DebugFileWatcher.class");
-    CHECK(shipped.size() > 4 && shipped.compare(0, 4, "\xCA\xFE\xBA\xBE") == 0);
-    // Java 17, so that it loads on every Java the game could bring.
-    CHECK(static_cast<unsigned char>(shipped[6]) == 0 && static_cast<unsigned char>(shipped[7]) == 61);
-    // The field survives a round trip, and only names a path inside the game's folders.
+    CHECK(zomboid.game_files.empty());
+    const std::vector<std::pair<std::string, std::string>> stub{
+        {"zombie/DebugFileWatcher.class", "598b38e10d4cdbda29743824ad7d936a6d3ea1381268c859bbfd7f3b835c5d44"}};
+    CHECK(zomboid.retired_game_files == stub);
+    // The field survives a round trip.
     GameRecipe again;
-    CHECK(ParseGameRecipe(SerializeGameRecipe(zomboid), &again, &reason) && again.game_files == zomboid.game_files);
+    CHECK(ParseGameRecipe(SerializeGameRecipe(zomboid), &again, &reason) && again.retired_game_files == stub);
+  }
+  // A shipped recipe can place files in the game folder, and retire those an earlier version placed.
+  {
     const auto with_files = [](const std::string& paths, const std::string& id = "steam-108600-test-v1") {
       return R"({"recipe_id":")" + id + R"(","recipe_version":1,"app_id":108600,"launch_entries":[{"id":"game","label":"G","executable":"g.exe"}],)"
              R"("architecture":"pe64","runtime":"wine-wow64","prefix":"game","graphics":"opengl","game_files":)" + paths + "}";
@@ -1808,6 +2196,32 @@ int main(int argc, char** argv) {
     auto shared = with_files(R"(["a.class"])");
     shared.replace(shared.size() - 1, 1, R"(,"executable":"g.exe","community":{"format_version":1,"status":"works"}})");
     CHECK(!ParseCommunityRecipe(shared, &community, &reason) && reason.find("game_files") != std::string::npos);
+
+    const std::string hash(64, 'a');
+    const auto with_retired = [&](const std::string& retired, const std::string& id = "steam-108600-test-v1",
+                                  const std::string& placed = "[]") {
+      return R"({"recipe_id":")" + id + R"(","recipe_version":1,"app_id":108600,"launch_entries":[{"id":"game","label":"G","executable":"g.exe"}],)"
+             R"("architecture":"pe64","runtime":"wine-wow64","prefix":"game","graphics":"opengl","game_files":)" + placed +
+             R"(,"retired_game_files":)" + retired + "}";
+    };
+    CHECK(ParseGameRecipe(with_retired(R"({"a.class":")" + hash + R"(","b/c.class":")" + hash + R"("})"), &parsed, &reason));
+    CHECK(parsed.retired_game_files.size() == 2);
+    for (const std::string bad : std::vector<std::string>{
+             R"(["a.class"])", R"({"../a.class":")" + hash + R"("})", R"({"/a.class":")" + hash + R"("})",
+          R"({"a.class":")" + std::string(63, 'a') + R"("})", R"({"a.class":")" + std::string(64, 'A') + R"("})",
+          R"({"a.class":1})", R"({"a.class":")" + hash + R"(","A.CLASS":")" + hash + R"("})",
+          R"({"a":")" + hash + R"(","b":")" + hash + R"(","c":")" + hash + R"(","d":")" + hash + R"(","e":")" + hash + R"("})"})
+      CHECK(!ParseGameRecipe(with_retired(bad), &parsed, &reason));
+    // A path is placed or retired, not both.
+    CHECK(!ParseGameRecipe(with_retired(R"({"a.class":")" + hash + R"("})", "steam-108600-test-v1", R"(["A.class"])"),
+                           &parsed, &reason));
+    // Only Playden's own recipes remove a file from the game folder.
+    CHECK(!ParseGameRecipe(with_retired(R"({"a.class":")" + hash + R"("})", "community-steam-108600-test"), &parsed, &reason));
+    auto shared_retired = with_retired(R"({"a.class":")" + hash + R"("})");
+    shared_retired.replace(shared_retired.size() - 1, 1,
+                           R"(,"executable":"g.exe","community":{"format_version":1,"status":"works"}})");
+    CHECK(!ParseCommunityRecipe(shared_retired, &community, &reason) &&
+          reason.find("retired_game_files") != std::string::npos);
   }
   // Batman: Arkham City is Asylum's sibling: BatmanAC.exe starts BmLauncher.exe and exits too while UserEngine.ini has
   // no Language.
@@ -2487,6 +2901,13 @@ int main(int argc, char** argv) {
     GameRecipe generated;
     CHECK(GenerateGameRecipe(4242, "Example", launches, game_root.string(), &generated, &reason));
     CHECK(generated.id == GeneratedRecipeId(4242) && IsGeneratedRecipeId(generated.id) && !IsGeneratedRecipeId(hl2.id));
+    // A GOG game's generated recipe is one too: its id names the game.
+    const auto gog = playden::GameId::Gog(1207658924);
+    GameRecipe gog_generated;
+    CHECK(GenerateGameRecipe(gog, 0xF0000001u, "Example", launches, game_root.string(), &gog_generated, &reason));
+    CHECK(gog_generated.id == "gog-1207658924-auto" && gog_generated.id == playden::GeneratedRecipeId(gog) &&
+          IsGeneratedRecipeId(gog_generated.id) && RecipeGame(gog_generated) == gog &&
+          gog_generated.app_id == 0xF0000001u);
     CHECK(generated.app_id == 4242 && generated.version == 2 && generated.architecture == "pe64");
     // No graphics library named: DXVK (game_probe.cpp, DefaultsFor).
     CHECK(generated.graphics == "dxvk" && generated.dll_overrides.empty() && generated.locked.empty());
@@ -2540,6 +2961,89 @@ int main(int argc, char** argv) {
     CHECK(reason.find("Missing.exe") != std::string::npos);
     CHECK(!GenerateGameRecipe(4245, "Script", {{"", "", "run.sh", "", ""}}, game_root.string(), &generated, &reason));
     CHECK(reason.find("no Windows program") != std::string::npos);
+    std::filesystem::remove_all(game_root);
+  }
+
+  // A GOG game's recipe from its install record's play tasks (fixtures/gog/goggame-1900000002.info's shape: the
+  // primary task names jazz2.exe, the disk spells it Jazz2.exe; the tool is in a folder, with no working folder).
+  {
+    const auto game_root = std::filesystem::temp_directory_path() / ("playden-gog-recipe-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(game_root);
+    WritePe(game_root / "Jazz2.exe", false);
+    WritePe(game_root / "Tools" / "JCS.exe", false);
+    const auto jazz = playden::GameId::Gog(1900000002);
+    const std::vector<LaunchEntry> launches = {
+        {"", "Synthetic Platformer", "jazz2.exe", "", ""},
+        {"", "Level Editor", "tools/jcs.exe", "", ""},
+    };
+    GameRecipe recipe;
+    CHECK(GenerateGameRecipe(jazz, 0xF0000002u, "Synthetic Platformer", launches, game_root.string(), &recipe, &reason));
+    CHECK(recipe.id == "gog-1900000002-auto" && RecipeGame(recipe) == jazz && recipe.architecture == "pe32");
+    CHECK(recipe.launch_entries.size() == 2);
+    CHECK(recipe.launch_entries[0].executable == "Jazz2.exe" && recipe.launch_entries[0].label == "Synthetic Platformer");
+    CHECK(recipe.launch_entries[0].working_directory.empty() && !recipe.launch_entries[0].in_install_root);
+    // GOG starts a task with no working folder in the install root, also one in a folder (gogdl launch.py).
+    CHECK(recipe.launch_entries[1].executable == "Tools/JCS.exe" && recipe.launch_entries[1].label == "Level Editor");
+    CHECK(recipe.launch_entries[1].working_directory.empty() && recipe.launch_entries[1].in_install_root);
+    // Nothing startable names GOG, not Steam: the programs come from the game's own files.
+    CHECK(!GenerateGameRecipe(jazz, 0xF0000002u, "Synthetic Platformer", {{"", "", "readme.txt", "", ""}},
+                              game_root.string(), &recipe, &reason));
+    CHECK(reason == "GOG lists no Windows program this console can start for this game.");
+    CHECK(!GenerateGameRecipe(jazz, 0xF0000002u, "Synthetic Platformer", {}, game_root.string(), &recipe, &reason));
+    CHECK(reason == "GOG lists no Windows program this console can start for this game.");
+    // Steam's sentence is Steam's.
+    CHECK(!GenerateGameRecipe(4247, "Steam", {}, game_root.string(), &recipe, &reason));
+    CHECK(reason == "Steam lists no Windows program this console can start for this game.");
+    std::filesystem::remove_all(game_root);
+  }
+
+  // Steam names a working folder as Windows sees it: Unreal Tournament (13240) and UT2004 (13230) start
+  // "system\UnrealTournament.exe" in "system", which is System/ on disk (#844). The recipe, the profile and the
+  // folder dxvk.conf goes in use the disk's spelling, as the console's disk tells the two apart.
+  {
+    const auto game_root = std::filesystem::temp_directory_path() / ("playden-workdir-case-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(game_root);
+    WritePe(game_root / "System" / "UnrealTournament.exe", false);
+    std::filesystem::create_directories(game_root / "Maps");
+    GameRecipe generated;
+    CHECK(GenerateGameRecipe(13240, "Unreal Tournament", {{"", "", "system\\UnrealTournament.exe", "system", ""}},
+                             game_root.string(), &generated, &reason));
+    CHECK(generated.launch_entries.size() == 1);
+    CHECK(generated.launch_entries[0].executable == "System/UnrealTournament.exe");
+    CHECK(generated.launch_entries[0].working_directory == "System");
+    CHECK(LaunchWorkingFolder(generated.launch_entries[0]) == std::string("System"));
+    EffectiveSettings case_settings;
+    SettingsError case_error;
+    CHECK(BuildEffectiveSettings(generated, nullptr, {}, KitCapabilities{}, &case_settings, &case_error));
+    CHECK(case_settings.launch && case_settings.launch->working_directory == "System");
+    ProsperoProfile case_profile;
+    CHECK(RenderProsperoProfile(generated, case_settings, {"playden-steam-13240", "/data/playden-games/13240"},
+                                &case_profile, &reason));
+    CHECK(case_profile.text.find("\nworking_directory = Z:\\data\\playden-games\\13240\\System\n") != std::string::npos);
+    // A folder Steam names that isn't there stays as Steam names it.
+    CHECK(GenerateGameRecipe(13240, "Unreal Tournament", {{"", "", "system\\UnrealTournament.exe", "missing", ""}},
+                             game_root.string(), &generated, &reason));
+    CHECK(generated.launch_entries[0].working_directory == "missing");
+    // A recipe from elsewhere (a community recipe exported from an older setup) is matched to the disk when bound.
+    GameRecipe shared = generated;
+    shared.launch_entries[0].working_directory = "system";
+    shared.launch_entries.push_back({"maps", "Maps", "System/UnrealTournament.exe", "MAPS", ""});
+    shared.launch_entries.push_back({"root", "Root", "System/UnrealTournament.exe", "", ""});
+    shared.launch_entries.push_back({"gone", "Gone", "System/UnrealTournament.exe", "Gone", ""});
+    CHECK(MatchWorkingFoldersToDisk(game_root.string(), &shared));
+    CHECK(shared.launch_entries[0].working_directory == "System" && shared.launch_entries[1].working_directory == "Maps");
+    CHECK(shared.launch_entries[2].working_directory.empty() && shared.launch_entries[3].working_directory == "Gone");
+    CHECK(!MatchWorkingFoldersToDisk(game_root.string(), &shared));
+    // A file is not a folder.
+    shared.launch_entries[0].working_directory = "system/unrealtournament.exe";
+    CHECK(!MatchWorkingFoldersToDisk(game_root.string(), &shared));
+    // Every folder in a nested path takes the disk's spelling; a link on the way is not followed.
+    std::filesystem::create_directories(game_root / "Maps" / "Custom");
+    shared.launch_entries[0].working_directory = "maps\\CUSTOM";
+    CHECK(MatchWorkingFoldersToDisk(game_root.string(), &shared) && shared.launch_entries[0].working_directory == "Maps/Custom");
+    std::filesystem::create_directory_symlink(game_root / "System", game_root / "Linked");
+    shared.launch_entries[0].working_directory = "linked";
+    CHECK(!MatchWorkingFoldersToDisk(game_root.string(), &shared) && shared.launch_entries[0].working_directory == "linked");
     std::filesystem::remove_all(game_root);
   }
 
@@ -2711,6 +3215,32 @@ int main(int argc, char** argv) {
                                  {"arguments", "-game hl2 {resolution}"}, {"dll_overrides", "d3d9=n;xinput1_3=n"}},
                                  KitCapabilities{}, &settings, &error));
     auto community = BuildCommunityRecipe(hl2, settings, kHalfLife2, "Half-Life 2");
+    {  // Online is shared, the sign-in is not; Offline emulation and its network value are shared too.
+      EffectiveSettings steam;
+      const auto host_kit = KitCapabilitiesFromManifest({kKitHelperProcess}, false);
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"unlock.steam_features", "on"}, {"steam_features", "online"},
+                                   {"steam_sign_in", "kept"}}, host_kit, &steam, &error));
+      CHECK(steam.values.at("steam_features").value == "online" && steam.values.at("steam_sign_in").value == "kept");
+      const auto online = BuildCommunityRecipe(hl2, steam, kHalfLife2, "Half-Life 2").recipe;
+      CHECK(online.defaults.at("steam_features") == "online" && !online.defaults.count("steam_sign_in"));
+      // Nor what the game does with the player's invites.
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"unlock.steam_features", "on"}, {"steam_features", "online"},
+                                   {"game_invites", "off"}}, host_kit, &steam, &error));
+      CHECK(steam.values.at("game_invites").value == "off" && steam.values.at("game_invites").source == ValueSource::kUser);
+      CHECK(!BuildCommunityRecipe(hl2, steam, kHalfLife2, "Half-Life 2").recipe.defaults.count("game_invites"));
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"unlock.steam_features", "on"}, {"steam_features", "emulate"},
+                                   {"steam_network", "offline"}}, KitCapabilities{}, &steam, &error));
+      const auto offline = BuildCommunityRecipe(hl2, steam, kHalfLife2, "Half-Life 2").recipe;
+      CHECK(offline.defaults.at("steam_features") == "emulate" && offline.defaults.at("steam_network") == "offline");
+    }
+    {  // The performance overlay is the player's own: a recipe fixes the game.
+      EffectiveSettings overlay;
+      CHECK(BuildEffectiveSettings(hl2, nullptr, {{"performance_overlay", "on"}, {"overlay_detail", "full"}},
+                                   KitCapabilitiesFromManifest({kKitDxvkConfig}, false), &overlay, &error));
+      CHECK(overlay.values.at("performance_overlay").value == "on" && overlay.values.at("overlay_detail").available);
+      const auto shared = BuildCommunityRecipe(hl2, overlay, kHalfLife2, "Half-Life 2").recipe;
+      CHECK(!shared.defaults.count("performance_overlay") && !shared.defaults.count("overlay_detail"));
+    }
     {  // What the files showed travels without the graphics value, which has its own field (#67).
       auto detected = hl2;
       detected.detected = "d3d9 graphics=dxvk";
@@ -2790,6 +3320,12 @@ int main(int argc, char** argv) {
       CHECK(!BuildCommunityRecipe(from_generated, chosen, kHalfLife2, "Half-Life 2").recipe.defaults.count("steam_input"));
       CHECK(BuildEffectiveSettings(from_generated, nullptr, {{"steam_input", "off"}}, KitCapabilities{}, &chosen, &error));
       CHECK(BuildCommunityRecipe(from_generated, chosen, kHalfLife2, "Half-Life 2").recipe.defaults.at("steam_input") == "off");
+      // Touchpad hold came later still: off stays out of a share, a player's choice goes with it.
+      const auto touchpad_kit = KitCapabilitiesFromManifest({kKitTouchpadSwitch}, false);
+      CHECK(BuildEffectiveSettings(from_generated, nullptr, {}, touchpad_kit, &chosen, &error));
+      CHECK(!BuildCommunityRecipe(from_generated, chosen, kHalfLife2, "Half-Life 2").recipe.defaults.count("touchpad_hold"));
+      CHECK(BuildEffectiveSettings(from_generated, nullptr, {{"touchpad_hold", "mouse"}}, touchpad_kit, &chosen, &error));
+      CHECK(BuildCommunityRecipe(from_generated, chosen, kHalfLife2, "Half-Life 2").recipe.defaults.at("touchpad_hold") == "mouse");
     }
     // Registry values and requirements stay with the game when it is exported.
     auto with_extras = from_generated;
@@ -3135,6 +3671,113 @@ int main(int argc, char** argv) {
       for (const auto& value : removed) CHECK(value.data.empty());
       CHECK(RecipeRegistryInterim(nullptr, after_b).values == after_b.values);
     }
+  }
+
+  // Game invites (title-notify): listed beside the Steam rows, Ask by default, and only with Steam features = Online.
+  // Ask and Only show need a title that shows notifications: without one both are Off (never Join at once), and
+  // the row says so; on a title still on an older runtime the choice waits for its update.
+  {
+    GameRecipe ffxiii;
+    CHECK(ParseGameRecipe(ReadText(source / "runtime/recipes/steam-292120-ffxiii-v1.json"), &ffxiii, &reason));
+    const auto* invites = FindSetting("game_invites");
+    CHECK(invites && invites->label == "Game invites" && invites->playden_default == "ask");
+    CHECK(invites->group == FindSetting("steam_sign_in")->group);
+    CHECK(invites->choices.size() == 4 && invites->choices[0].value == "ask" && invites->choices[1].value == "join" &&
+          invites->choices[2].value == "show" && invites->choices[3].value == "off");
+    CHECK(invites->choices[0].label == "Ask with L3 + R3" && invites->choices[1].label == "Join at once" &&
+          invites->choices[2].label == "Only show" && invites->choices[3].label == "Off");
+    CHECK(SettingShown(*invites, KitCapabilities{}));
+    const auto notify = KitCapabilitiesFromManifest({kKitTitleNotify}, false);
+    CHECK(notify.title_notify && !KitCapabilitiesFromManifest({kKitInputRumble}, false).title_notify);
+    CHECK(std::find(SettingsKitCapabilityNames().begin(), SettingsKitCapabilityNames().end(), kKitTitleNotify) !=
+          SettingsKitCapabilityNames().end());
+    const auto stale = KitForTitleRuntime(notify, false);
+    CHECK(!stale.title_notify && stale.title_notify_needs_update);
+    CHECK(KitForTitleRuntime(notify, true).title_notify);
+    EffectiveSettings settings;
+    SettingsError error;
+    const auto effective = [&](std::map<std::string, std::string> overrides, const KitCapabilities& kit) {
+      overrides["unlock.steam_features"] = "on";  // the recipe locks Steam features
+      CHECK(BuildEffectiveSettings(ffxiii, nullptr, overrides, kit, &settings, &error));
+      return settings.values.at("game_invites");
+    };
+    // Not Online: the row does not apply.
+    auto row = effective({{"steam_features", "emulate"}, {"game_invites", "off"}}, notify);
+    CHECK(!row.available && row.reason == "Only with Steam features = Online.");
+    // With notifications every choice applies as chosen; Ask is the default.
+    row = effective({{"steam_features", "online"}}, notify);
+    CHECK(row.available && row.value == "ask" && row.reason.empty());
+    for (const char* value : {"ask", "join", "show", "off"}) {
+      row = effective({{"steam_features", "online"}, {"game_invites", value}}, notify);
+      CHECK(row.value == value && row.reason.empty() && !row.waits_for_update);
+      CHECK(SettingChoiceUnavailable(settings, "game_invites", value).empty());
+    }
+    // Without them only Join at once and Off: Ask (also the default) and Only show are Off.
+    row = effective({{"steam_features", "online"}}, KitCapabilities{});
+    CHECK(row.available && row.value == "off" && row.reason == "Needs a runtime kit that shows game invites.");
+    row = effective({{"steam_features", "online"}, {"game_invites", "ask"}}, KitCapabilities{});
+    CHECK(row.value == "off" && row.reason == "Needs a runtime kit that shows game invites.");
+    row = effective({{"steam_features", "online"}, {"game_invites", "show"}}, KitCapabilities{});
+    CHECK(row.value == "off" && row.reason == "Needs a runtime kit that shows game invites.");
+    CHECK(!SettingChoiceUnavailable(settings, "game_invites", "ask").empty() &&
+          !SettingChoiceUnavailable(settings, "game_invites", "show").empty());
+    CHECK(SettingChoiceUnavailable(settings, "game_invites", "join").empty() &&
+          SettingChoiceUnavailable(settings, "game_invites", "off").empty());
+    row = effective({{"steam_features", "online"}, {"game_invites", "off"}}, KitCapabilities{});
+    CHECK(row.value == "off" && row.reason.empty());
+    // A title on an older runtime: the same fallback until its update, the choice kept for it.
+    row = effective({{"steam_features", "online"}, {"game_invites", "show"}}, stale);
+    CHECK(row.value == "off" && row.waits_for_update && row.after_update == "show" && ChosenValue(row) == "show");
+    CHECK(row.reason == kAppliesAfterKitUpdate && SettingChoiceWaitsForUpdate(settings, "game_invites", "show"));
+    row = effective({{"steam_features", "online"}, {"game_invites", "join"}}, stale);
+    CHECK(row.value == "join" && !row.waits_for_update);
+  }
+
+  // Without online-steam: no Online choice, Steam sign-in and Steam network are not listed, a saved Online is ignored
+  // and the emulator stays off the network.
+  {
+    SetOnlineSteamEnabled(false);
+    GameRecipe ffxiii;
+    CHECK(ParseGameRecipe(ReadText(source / "runtime/recipes/steam-292120-ffxiii-v1.json"), &ffxiii, &reason));
+    CHECK(!SettingChoiceOffered("steam_features", "online") && SettingChoiceOffered("steam_features", "emulate"));
+    CHECK(!SettingShown(*FindSetting("steam_sign_in"), KitCapabilities{}));
+    CHECK(!SettingShown(*FindSetting("steam_network"), KitCapabilities{}));
+    CHECK(!SettingShown(*FindSetting("game_invites"), KitCapabilities{}));
+    CHECK(SettingShown(*FindSetting("steam_features"), KitCapabilities{}));
+    CHECK(!ValidateSettingValue(ffxiii, "steam_features", "online", &reason));
+    EffectiveSettings settings;
+    SettingsError error;
+    CHECK(BuildEffectiveSettings(ffxiii, nullptr,
+                                 {{"steam_features", "online"}, {"unlock.steam_features", "on"}, {"steam_sign_in", "kept"},
+                                  {"steam_network", "online"}},
+                                 KitCapabilities{}, &settings, &error));
+    CHECK(settings.values.at("steam_features").value == "emulate");
+    CHECK(settings.values.at("steam_sign_in").value == "play");
+    CHECK(settings.values.at("steam_network").value == "offline" && !settings.values.at("steam_network").available);
+    // The saved Online goes, with its sign-in; Steam network stays for when the feature is back.
+    GameSettingsRecord record;
+    // A recipe's Online is kept when it is read, and ignored while online-steam is off: the game still starts.
+    {
+      auto online_recipe = ffxiii;
+      online_recipe.defaults["steam_features"] = "online";
+      GameRecipe reread;
+      CHECK(ParseGameRecipe(SerializeGameRecipe(online_recipe), &reread, &reason));
+      CHECK(reread.defaults.at("steam_features") == "online");
+      EffectiveSettings ignored;
+      CHECK(BuildEffectiveSettings(reread, nullptr, {}, KitCapabilities{}, &ignored, &error));
+      CHECK(ignored.values.at("steam_features").value != "online");
+    }
+    record.overrides = {{"steam_features", "online"}, {"unlock.steam_features", "on"}, {"steam_sign_in", "kept"},
+                        {"game_invites", "off"}, {"steam_network", "offline"}};
+    CHECK(DropOnlineSteamSettings(&record) && record.revision == 1);
+    CHECK(record.overrides == (std::map<std::string, std::string>{{"steam_network", "offline"}}));
+    CHECK(!DropOnlineSteamSettings(&record) && record.revision == 1);
+    record.overrides = {{"steam_features", "emulate"}};
+    CHECK(!DropOnlineSteamSettings(&record));
+    record.overrides = {{"steam_features", "emulate"}, {"game_invites", "join"}};
+    CHECK(DropOnlineSteamSettings(&record) && record.overrides.size() == 1);
+    SetOnlineSteamEnabled(true);
+    CHECK(SettingChoiceOffered("steam_features", "online"));
   }
 
   std::puts("game settings tests passed");

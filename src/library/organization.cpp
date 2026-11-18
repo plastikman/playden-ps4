@@ -1,9 +1,11 @@
 #include "library/organization.h"
 
+#include "library/model.h"
 #include "library/store.h"
 
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <limits>
 #include <string_view>
 #include <utility>
@@ -15,6 +17,9 @@ constexpr std::array<std::uint8_t, 8> kMagic{{'P', 'L', 'D', 'O', 'R', 'G', 0, 0
 constexpr std::uint16_t kVersion1 = 1;
 constexpr std::uint16_t kVersion2 = 2;
 constexpr char kPathV2[] = "organization.v2";
+constexpr char kDamagedPathV2[] = "organization.v2.damaged";
+// Version 2's magic, version, selection length and checksum: the smallest file.
+constexpr std::size_t kFixedBytesV2 = kMagic.size() + 2 + 4 + 4;
 constexpr std::size_t kMaximumSnapshotBytes = 1024 * 1024;
 constexpr std::size_t kMaximumGameIds = 10000;
 constexpr std::size_t kMaximumCollections = 256;
@@ -25,6 +30,8 @@ constexpr std::size_t kMaximumQueryBytes = 256;
 constexpr std::size_t kMaximumScopeBytes = 128;
 constexpr std::size_t kMaximumSortBytes = 32;
 constexpr std::size_t kMaximumFilterBytes = 32;
+// Filters a version 2 file may list as read; filters a newer Playden wrote are skipped (see DecodeV2).
+constexpr std::uint32_t kMaximumFiltersRead = 64;
 constexpr std::size_t kMaximumKeyBytes = 64;
 
 std::string PathV1(std::uint64_t account_id) {
@@ -100,8 +107,19 @@ bool BuiltInScope(const std::string& value) {
   return value == "all" || value == "favorites" || value == "hidden";
 }
 
-// The Library rails of installed and imported games: scopes, never collection IDs.
-bool RailScope(const std::string& value) { return value == "installed" || value == "imported"; }
+// The Library rails of installed games and of each store's games (Steam, GOG, imported): scopes, never collection IDs.
+bool RailScope(const std::string& value) {
+  return value == "installed" || value == "steam" || value == "gog" || value == "imported";
+}
+
+// A store's own collection (#536): "steam-collection:<id>" or "gog-tag:<id>" (ValidLibraryCollectionId). The
+// collections come from the stores after loading, so any such ID is kept; the Library falls back to the store when
+// its store no longer has it. A collection ID never has ':', so the two can't collide.
+bool StoreCollectionScope(const std::string& value) {
+  for (const std::string_view prefix : {std::string_view("steam-collection:"), std::string_view("gog-tag:")})
+    if (value.compare(0, prefix.size(), prefix) == 0) return ValidLibraryCollectionId(value.substr(prefix.size()));
+  return false;
+}
 
 bool ReservedCollectionId(const std::string& value) {
   return BuiltInScope(value) || RailScope(value) || value == "new-collection";
@@ -112,9 +130,16 @@ bool ValidSort(const std::string& value) {
          value == "playtime";
 }
 
-// Version 1 knows only Playable; version 2 also keeps demos and family-shared games hidden (they show by default).
+// The Library's Store filter: one store's games only ("store-imported" for imported ones). Version 2 only.
+bool StoreFilter(const std::string& value) {
+  return value == "store-steam" || value == "store-gog" || value == "store-imported";
+}
+
+// Version 1 knows only Playable; version 2 also keeps demos and family-shared games hidden (they show by default), and
+// the Store filter.
 bool ValidFilter(const std::string& value, std::uint16_t version) {
-  return value == "compat-playable" || (version != kVersion1 && (value == "hide-demos" || value == "hide-family"));
+  return value == "compat-playable" ||
+         (version != kVersion1 && (value == "hide-demos" || value == "hide-family" || StoreFilter(value)));
 }
 
 // Version 1 stores Steam app IDs only; version 2 any valid game.
@@ -157,7 +182,8 @@ bool Validate(const OrganizationSnapshot& snapshot, std::uint16_t version) {
     }
     for (const GameId& id : collection.members) if (!AddGameId(game_ids, id, version)) return false;
   }
-  if (!BuiltInScope(snapshot.scope) && !RailScope(snapshot.scope) && !collection_ids.count(snapshot.scope))
+  if (!BuiltInScope(snapshot.scope) && !RailScope(snapshot.scope) && !StoreCollectionScope(snapshot.scope) &&
+      !collection_ids.count(snapshot.scope))
     return false;
 
   if (snapshot.ratings.size() > kMaximumGameIds || snapshot.notes.size() > kMaximumGameIds)
@@ -175,11 +201,12 @@ bool Validate(const OrganizationSnapshot& snapshot, std::uint16_t version) {
       return false;
     }
   }
-  if (snapshot.filters.size() > (version == kVersion1 ? 1u : 3u)) return false;
+  if (snapshot.filters.size() > (version == kVersion1 ? 1u : 4u)) return false;
   for (const auto& filter : snapshot.filters) {
     if (!ValidText(filter, kMaximumFilterBytes, false) || !ValidFilter(filter, version)) return false;
   }
-  return true;
+  // The Store filter picks one store, or none (Any).
+  return std::count_if(snapshot.filters.begin(), snapshot.filters.end(), StoreFilter) <= 1;
 }
 
 std::uint32_t Checksum(const Bytes& bytes, std::size_t size) {
@@ -390,6 +417,7 @@ Loaded DecodeV1(const Bytes& bytes, std::uint64_t account_id) {
 }
 
 // ---- Version 2: games as `ToKey` strings, no account. ----
+// Unknown stores are skipped; an unknown scope reads as "all".
 
 bool WriteKeys(Writer& writer, const std::set<GameId>& ids) {
   if (!writer.U32(static_cast<std::uint32_t>(ids.size()))) return false;
@@ -397,21 +425,34 @@ bool WriteKeys(Writer& writer, const std::set<GameId>& ids) {
   return true;
 }
 
-bool ReadKey(Reader& reader, GameId& id) {
-  std::string key;
-  if (!reader.String(key, kMaximumKeyBytes)) return false;
+// A key names a game, names a game of a store this build doesn't know (a newer Playden wrote it: the entry is
+// skipped), or is damage (a malformed key of a known store, "gog-0", "0440", "local-UPPER", or an empty one).
+enum class KeyRead { kGame, kUnknownStore, kDamaged };
+
+KeyRead ClassifyKey(const std::string& key, GameId& id) {
   const auto parsed = ParseKey(key);
-  if (!parsed || !parsed->valid()) return false;
-  id = *parsed;
-  return true;
+  if (parsed && parsed->valid()) {
+    id = *parsed;
+    return KeyRead::kGame;
+  }
+  return IsUnknownStoreKey(key) ? KeyRead::kUnknownStore : KeyRead::kDamaged;
 }
 
+KeyRead ReadKey(Reader& reader, GameId& id) {
+  std::string key;
+  if (!reader.String(key, kMaximumKeyBytes)) return KeyRead::kDamaged;
+  return ClassifyKey(key, id);
+}
+
+// Unknown-store keys are skipped and never count as duplicates; the count limit applies to the count as read.
 bool ReadKeys(Reader& reader, std::set<GameId>& ids) {
   std::uint32_t count = 0;
   if (!reader.U32(count) || count > kMaximumGameIds) return false;
   for (std::uint32_t index = 0; index < count; ++index) {
     GameId id;
-    if (!ReadKey(reader, id) || !ids.insert(std::move(id)).second) return false;
+    const KeyRead read = ReadKey(reader, id);
+    if (read == KeyRead::kDamaged) return false;
+    if (read == KeyRead::kGame && !ids.insert(std::move(id)).second) return false;
   }
   return true;
 }
@@ -441,7 +482,7 @@ std::size_t EncodedBytesV2(const OrganizationSnapshot& snapshot) {
 }
 
 Loaded DecodeV2(const Bytes& bytes) {
-  constexpr std::size_t kFixedBytes = kMagic.size() + 2 + 4 + 4;
+  constexpr std::size_t kFixedBytes = kFixedBytesV2;
   if (bytes.size() < kFixedBytes || !std::equal(kMagic.begin(), kMagic.end(), bytes.begin()))
     return InvalidLoad("header");
   if (!CheckFrame(bytes, kFixedBytes)) return InvalidLoad("checksum");
@@ -453,11 +494,9 @@ Loaded DecodeV2(const Bytes& bytes) {
   if (!reader.U16(version) || version != kVersion2 || !reader.String(selected, kMaximumKeyBytes))
     return InvalidLoad("version or selection");
   snapshot.schema_version = version;
-  if (!selected.empty()) {
-    const auto parsed = ParseKey(selected);
-    if (!parsed || !parsed->valid()) return InvalidLoad("selection");
-    snapshot.selected_game_id = *parsed;
-  }
+  // A selected game of an unknown store leaves nothing selected.
+  if (!selected.empty() && ClassifyKey(selected, snapshot.selected_game_id) == KeyRead::kDamaged)
+    return InvalidLoad("selection");
   if (!ReadKeys(reader, snapshot.favorites) || !ReadKeys(reader, snapshot.hidden))
     return InvalidLoad("favorites or hidden");
 
@@ -482,11 +521,14 @@ Loaded DecodeV2(const Bytes& bytes) {
   for (std::uint32_t index = 0; index < rating_count; ++index) {
     GameId id;
     std::uint8_t rating = 0;
-    if (!ReadKey(reader, id) || !reader.U8(rating) ||
-        rating > static_cast<std::uint8_t>(CompatibilityRating::kBroken) ||
-        !snapshot.ratings.emplace(std::move(id), static_cast<CompatibilityRating>(rating)).second) {
+    const KeyRead read = ReadKey(reader, id);
+    if (read == KeyRead::kDamaged || !reader.U8(rating) ||
+        rating > static_cast<std::uint8_t>(CompatibilityRating::kBroken)) {
       return InvalidLoad("rating");
     }
+    if (read == KeyRead::kUnknownStore) continue;
+    if (!snapshot.ratings.emplace(std::move(id), static_cast<CompatibilityRating>(rating)).second)
+      return InvalidLoad("rating");
   }
 
   std::uint32_t note_count = 0;
@@ -494,23 +536,45 @@ Loaded DecodeV2(const Bytes& bytes) {
   for (std::uint32_t index = 0; index < note_count; ++index) {
     GameId id;
     std::string note;
-    if (!ReadKey(reader, id) || !reader.String(note, kMaximumNoteBytes) ||
-        !snapshot.notes.emplace(std::move(id), std::move(note)).second) {
-      return InvalidLoad("note");
+    const KeyRead read = ReadKey(reader, id);
+    if (read == KeyRead::kDamaged || !reader.String(note, kMaximumNoteBytes)) return InvalidLoad("note");
+    // Validate checks the notes it keeps; a skipped one is checked here.
+    if (read == KeyRead::kUnknownStore) {
+      if (!ValidText(note, kMaximumNoteBytes, true)) return InvalidLoad("note");
+      continue;
     }
+    if (!snapshot.notes.emplace(std::move(id), std::move(note)).second) return InvalidLoad("note");
   }
 
   std::uint32_t filter_count = 0;
   if (!reader.String(snapshot.query, kMaximumQueryBytes) ||
       !reader.String(snapshot.scope, kMaximumScopeBytes) ||
       !reader.String(snapshot.sort, kMaximumSortBytes) ||
-      !reader.U32(filter_count) || filter_count > 3) {
+      !reader.U32(filter_count) || filter_count > kMaximumFiltersRead) {
     return InvalidLoad("view state");
   }
+  // A filter this build doesn't know (a newer one, or the Store filter naming a newer store) is skipped. Only the reader
+  // is lenient: Validate, and so the writer, still refuse it. An empty, oversized, invalid or repeated filter is damage.
+  std::set<std::string> read_filters;
   for (std::uint32_t index = 0; index < filter_count; ++index) {
     std::string filter;
-    if (!reader.String(filter, kMaximumFilterBytes) || !snapshot.filters.insert(std::move(filter)).second)
+    if (!reader.String(filter, kMaximumFilterBytes) || !ValidText(filter, kMaximumFilterBytes, false) ||
+        !read_filters.insert(filter).second)
       return InvalidLoad("filter");
+    if (ValidFilter(filter, kVersion2)) snapshot.filters.insert(std::move(filter));
+  }
+  // More than one store (a newer build letting several be picked) reads as Any.
+  if (std::count_if(snapshot.filters.begin(), snapshot.filters.end(), StoreFilter) > 1) {
+    for (auto filter = snapshot.filters.begin(); filter != snapshot.filters.end();)
+      filter = StoreFilter(*filter) ? snapshot.filters.erase(filter) : std::next(filter);
+  }
+  // A scope this build doesn't know (a newer rail, or a removed collection) reads as "all". Only the
+  // reader is lenient: Validate, and so the writer, still refuse it. An empty or invalid scope stays damage.
+  if (ValidText(snapshot.scope, kMaximumScopeBytes, false) && !BuiltInScope(snapshot.scope) &&
+      !RailScope(snapshot.scope) && !StoreCollectionScope(snapshot.scope) &&
+      std::none_of(snapshot.collections.begin(), snapshot.collections.end(),
+                   [&](const OrganizationCollection& collection) { return collection.id == snapshot.scope; })) {
+    snapshot.scope = "all";
   }
   if (reader.offset() != reader.limit() || !Validate(snapshot, kVersion2))
     return InvalidLoad("trailing or semantic data");
@@ -630,16 +694,36 @@ Result<void> OrganizationStore::Save(std::uint64_t scope, const OrganizationSnap
 
   Bytes encoded = writer.Take();
   AppendChecksum(encoded);
-  return storage_.WriteAtomicPrivate(kPathV2, encoded);
+  return storage_.WriteAtomicOpen(kPathV2, encoded);
 }
 
 Result<std::optional<OrganizationSnapshot>> OrganizationStore::Load(std::uint64_t scope) const {
   if (scope != kDeviceOrganization) return InvalidLoad("organization scope");
   const auto ready = storage_.EnsureRootDirectory();
   if (!ready.ok()) return Loaded::Failure(ready.error(), ready.message());
+  load_note_.clear();
   const auto loaded = storage_.Read(kPathV2, kMaximumSnapshotBytes);
-  if (loaded.ok()) return DecodeV2(loaded.value());
+  if (loaded.ok()) {
+    // Its frame (magic, size, checksum) is the same in every version: one that fails it is a torn save, not a
+    // newer format. Its bytes are kept for a look; the organization starts again as if there were no file.
+    if (CheckFrame(loaded.value(), kFixedBytesV2)) return DecodeV2(loaded.value());
+    // Kept first: its copy is also what stops the .v1 merge later. Without it the file stays, and the load fails.
+    const auto kept = storage_.WriteAtomicOpen(kDamagedPathV2, loaded.value());
+    if (!kept.ok())
+      return Loaded::Failure(StorageError::kInvalidData,
+                             "organization data is damaged and could not be set aside: " + kept.message());
+    const auto removed = storage_.Remove(kPathV2);
+    if (!removed.ok()) return Loaded::Failure(removed.error(), removed.message());
+    load_note_ = "organization.v2 was damaged (" + std::to_string(loaded.value().size()) + " bytes), kept as " +
+                 kDamagedPathV2 + "; started again";
+    // Not the .v1 merge: their organization is older than the one lost.
+    return Loaded::Success(std::nullopt);
+  }
   if (loaded.error() != StorageError::kNotFound) return Loaded::Failure(loaded.error(), loaded.message());
+  // A damaged file was set aside and nothing saved since: the .v1 files were merged long ago.
+  const auto damaged = storage_.Read(kDamagedPathV2, kMaximumSnapshotBytes);
+  if (damaged.ok()) return Loaded::Success(std::nullopt);
+  if (damaged.error() != StorageError::kNotFound) return Loaded::Failure(damaged.error(), damaged.message());
 
   // First load on this device: unite every account's version 1 file.
   const auto listed = storage_.ListFiles();
@@ -677,12 +761,16 @@ Result<std::optional<OrganizationSnapshot>> OrganizationStore::Load(std::uint64_
   return Loaded::Success(std::move(merged));
 }
 
+std::string OrganizationStore::TakeLoadNote() const { return std::exchange(load_note_, std::string()); }
+
 Result<void> OrganizationStore::Clear(std::uint64_t scope) const {
   if (scope != kDeviceOrganization) return Invalid("organization scope");
   const auto final_result = storage_.Remove(kPathV2);
   const auto temporary_result = storage_.Remove(std::string(kPathV2) + ".tmp");
+  const auto damaged_result = storage_.Remove(kDamagedPathV2);
   if (!final_result.ok()) return final_result;
   if (!temporary_result.ok()) return temporary_result;
+  if (!damaged_result.ok()) return damaged_result;
   return Result<void>::Success();
 }
 
@@ -718,7 +806,7 @@ Result<void> OrganizationStore::SaveV1(std::uint64_t account_id,
 
   Bytes encoded = writer.Take();
   AppendChecksum(encoded);
-  return storage_.WriteAtomicPrivate(PathV1(account_id), encoded);
+  return storage_.WriteAtomicOpen(PathV1(account_id), encoded);
 }
 
 Result<std::optional<OrganizationSnapshot>> OrganizationStore::LoadV1(std::uint64_t account_id) const {

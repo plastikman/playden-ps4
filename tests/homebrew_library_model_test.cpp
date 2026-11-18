@@ -187,7 +187,7 @@ void non_canonical_game_keys_select_nothing() {
     check(model.UpdateLibrary({{game(SteamId(19), "Nineteen"), game(SteamId(20), "Twenty")}, false, {}, false, true, 1}),
           "library loaded");
     check(model.action("r1") && model.action("select:20"), "a canonical key selects its game");
-    for (const char* key : {"0020", "+19", "19x", "019", " 19", "local-", "gog-19", "4294967315", ""}) {
+    for (const char* key : {"0020", "+19", "19x", "019", " 19", "local-", "gog-019", "epic-19", "4294967315", ""}) {
         const std::string text(key);
         check(!model.action("select:" + text) && !model.action("details:" + text) &&
                   !model.action("rate:" + text + ":works") && !model.action("note:" + text + ":hi"),
@@ -577,8 +577,8 @@ void live_install_dlc_row() {
     check(model.UpdateLibrary({{game(SteamId(42), "With DLC"), game(SteamId(43), "Without DLC")}, false, {}, false, false, {}}),
           "library loaded");
     model.UpdateVolumes({{"internal", "Console storage", true, 2'000'000'000, 1'000'000'000}}, "internal");
-    const std::vector<GameDlc> dlc{{501, "Art Book", 40, 50, false}, {502, "Campaign", 200'000'000, 300'000'000, false},
-                                   {503, "Texture Pack", 100'000'000, 1'200'000'000, true}, {504, "", 10, 20, false}};
+    const std::vector<GameDlc> dlc{{SteamId(501), "Art Book", 40, 50, false}, {SteamId(502), "Campaign", 200'000'000, 300'000'000, false},
+                                   {SteamId(503), "Texture Pack", 100'000'000, 1'200'000'000, true}, {SteamId(504), "", 10, 20, false}};
     // The game's figures count owned DLC, not the free pack, which the account doesn't own yet.
     model.UpdateAppDetails(SteamId(42), 300'000'000, 500'000'000, true, {"english", "german"}, dlc);
     check(model.action("details:42"), "details open");
@@ -631,7 +631,7 @@ void live_install_dlc_row() {
     row = find_row(model, "install-dlc");
     check(row && row->value.rfind("2 of 4", 0) == 0, "the sheet shows the choice");
     size_check = model.TakeSizeChecks();
-    check(size_check.size() == 1 && (size_check[0].excluded_dlc == std::vector<std::uint32_t>{502}),
+    check(size_check.size() == 1 && (size_check[0].excluded_dlc == SteamIds({502})),
           "the size check leaves out owned DLC only");
     // A measured size has left the owned DLC out already; free DLC that is on is added to it.
     model.UpdateMeasuredSize(size_check[0], true, false, {150'000'000, 100'000'000});
@@ -642,7 +642,7 @@ void live_install_dlc_row() {
     activate(model, "install-confirm");
     auto requests = model.TakeInstallRequests();
     check(requests.size() == 1 && requests[0].kind == InstallRequestKind::Install && requests[0].install_bytes == 150'000'000u &&
-              (requests[0].excluded_dlc == std::vector<std::uint32_t>{502, 503}),
+              (requests[0].excluded_dlc == SteamIds({502, 503})),
           "the install carries the choice and the size it reserves");
     // The drive reserves that size while it runs, not the game's figure with its DLC.
     playden::homebrew::LiveInstallJob running;
@@ -673,9 +673,9 @@ void live_install_dlc_row() {
     check(find_row(model, "install-dlc")->value == "None", "the sheet says none");
     activate(model, "cancel");
     // Another version: its sizes, and only the DLC it has. A sheet opened with none gets the row when they arrive.
-    std::vector<GameDlc> versioned{{601, "Pack", 40, 50'000'000, false, {{"beta", "english", 20, 10'000'000}}},
-                                   {602, "Only public", 40, 70'000'000, false, {{"beta", "english", 0, 0}}},
-                                   {603, "Only beta", 0, 0, false, {{"beta", "english", 30, 30'000'000}}}};
+    std::vector<GameDlc> versioned{{SteamId(601), "Pack", 40, 50'000'000, false, {{"beta", "english", 20, 10'000'000}}},
+                                   {SteamId(602), "Only public", 40, 70'000'000, false, {{"beta", "english", 0, 0}}},
+                                   {SteamId(603), "Only beta", 0, 0, false, {{"beta", "english", 30, 30'000'000}}}};
     const std::vector<playden::homebrew::GameVersion> versions{{"public", "", 1760000000, 9000, 100, 200'000'000, {}},
                                                                {"beta", "", 1760000000, 9001, 100, 100'000'000, {}}};
     model.UpdateAppDetails(SteamId(43), 100, 200'000'000, true, {}, versioned, versions);
@@ -693,7 +693,7 @@ void live_install_dlc_row() {
     activate(model, "install-dlc-done");
     activate(model, "cancel");
     // No DLC on the chosen version: no row, and it comes back with the version.
-    versioned = {{701, "Public DLC", 40, 70'000'000, false, {{"beta", "english", 0, 0}}}};
+    versioned = {{SteamId(701), "Public DLC", 40, 70'000'000, false, {{"beta", "english", 0, 0}}}};
     model.UpdateAppDetails(SteamId(43), 100, 200'000'000, true, {}, versioned, versions);
     check(model.action("details:43"), "details open");
     activate(model, "details-install");
@@ -720,14 +720,181 @@ void live_install_dlc_row() {
           "a game with one language opens the sheet without a Language row");
 }
 
+// A GOG game's DLC on the install sheet: rows by GOG key, and the install and its size check carry the GOG ID.
+void live_install_dlc_gog() {
+    using playden::homebrew::InstallRequestKind;
+    const auto id = playden::GameId::Gog(1900000001);
+    const auto pack = playden::GameId::Gog(1900000002), voices = playden::GameId::Gog(18446744073709551615ull);
+    auto model = make_live();
+    model.SetStoreInstalls(playden::Store::kGog, true);
+    playden::homebrew::AccountUpdate gog_account;
+    gog_account.authentication = AuthState::SignedIn;
+    gog_account.id = "00000000000000ab";
+    gog_account.display_name = "Synthetic GOG";
+    gog_account.store = playden::Store::kGog;
+    model.UpdateAccount(gog_account);
+    LibraryUpdate update{{game(id, "GOG with DLC")}, false, {}, false, false, {}};
+    update.source = playden::Store::kGog;
+    check(model.UpdateLibrary(update), "library loaded");
+    model.UpdateVolumes({{"internal", "Console storage", true, 2'000'000'000, 1'000'000'000}}, "internal");
+    model.UpdateAppDetails(id, 300'000'000, 500'000'000, true, {}, {{pack, "Pack", 40'000'000, 50'000'000, false},
+                                                                  {voices, "", 10'000'000, 20'000'000, false}});
+    check(model.action("details:gog-1900000001"), "details open");
+    activate(model, "details-install");
+    (void)model.TakeSizeChecks();
+    activate(model, "install-dlc");
+    check(model.view().surface == "install-dlc", "the row opens the list");
+    const auto* row = find_row(model, "install-dlc-gog-1900000002");
+    check(row && row->title == "Pack" && row->selected, "a GOG DLC's row goes by its key");
+    row = find_row(model, "install-dlc-gog-18446744073709551615");
+    check(row && row->title == "DLC 18446744073709551615", "one without a name goes by its product ID");
+    activate(model, "install-dlc-gog-1900000002");
+    check(!find_row(model, "install-dlc-gog-1900000002")->selected && find_row(model, "install-dlc-all")->value == "1 of 2",
+          "it turns off");
+    activate(model, "install-dlc-done");
+    const auto checks = model.TakeSizeChecks();
+    check(checks.size() == 1 && checks[0].id == id && (checks[0].excluded_dlc == std::vector<playden::GameId>{pack}),
+          "the size check carries the GOG ID");
+    // GOG answers size checks as failed: the sheet keeps the details' figures less the DLC turned off, as an estimate.
+    model.UpdateMeasuredSize(checks[0], false, true, {});
+    check(fact(model, "Needs") == "About 450 MB", "the size stays an estimate");
+    activate(model, "install-confirm");
+    const auto requests = model.TakeInstallRequests();
+    check(requests.size() == 1 && requests[0].kind == InstallRequestKind::Install && requests[0].game_id == id &&
+              (requests[0].excluded_dlc == std::vector<playden::GameId>{pack}),
+          "the install carries the GOG ID");
+}
+
 // Optional DLC the account owns starts off; other DLC and free DLC start on; the player's choice wins.
+// Manage DLC (Maintenance) of an installed Steam game: its DLC as the install holds them, check boxes that say what
+// changes, and Apply queues one DLC change with every DLC to leave out and what the DLC turned on install.
+void live_manage_dlc() {
+    using namespace playden::homebrew;
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    check(model.UpdateLibrary({{game(SteamId(42), "With DLC"), game(SteamId(43), "Old record")}, false, {}, false, false, {}}),
+          "library loaded");
+    model.UpdateVolumes({{"internal", "Console storage", true, 2'000'000'000, 1'000'000'000}}, "internal");
+    // Art Book is installed, Texture Pack was turned off at install, Campaign was bought later, the free pack never claimed.
+    LiveInstalledGame installed{SteamId(42), 500'000'000, "internal", true, 0};
+    installed.dlc_known = true;
+    installed.installed_dlc = SteamIds({501});
+    installed.excluded_dlc = SteamIds({503, 599});
+    // No install record read: nothing says what it holds.
+    LiveInstalledGame unknown{SteamId(43), 500'000'000, "internal", true, 0};
+    model.UpdateInstalls({}, {installed, unknown});
+    const std::vector<GameDlc> dlc{{SteamId(501), "Art Book", 40'000'000, 50'000'000, false}, {SteamId(502), "Campaign", 200'000'000, 300'000'000, false},
+                                   {SteamId(503), "Texture Pack", 100'000'000, 1'200'000'000, false}, {SteamId(504), "Pack", 10'000'000, 20'000'000, true},
+                                   {SteamId(505), "Unlock", 0, 0, false}};
+    model.UpdateAppDetails(SteamId(42), 300'000'000, 500'000'000, true, {"english"}, dlc);
+    model.UpdateAppDetails(SteamId(43), 300'000'000, 500'000'000, true, {"english"}, dlc);
+
+    check(model.action("details:43"), "details open");
+    activate(model, "details-more");
+    check(!has_row(model, "manage-dlc"), "without the install record there is no Manage DLC");
+    model.action("circle");
+    model.action("circle");
+
+    check(model.action("details:42"), "details open");
+    activate(model, "details-more");
+    const auto* row = find_row(model, "manage-dlc");
+    check(row && row->enabled && row->value == "1 of 4", "Game actions offers Manage DLC with what is installed");
+    activate(model, "manage-dlc");
+    check(model.view().surface == "manage-dlc" && model.view().title == "Manage DLC", "the row opens the sheet");
+    check(find_row(model, "heading-manage-dlc-installed") && find_row(model, "heading-manage-dlc-other"), "installed DLC comes first");
+    check(!has_row(model, "manage-dlc-505"), "DLC without files isn't listed");
+    row = find_row(model, "manage-dlc-501");
+    check(row && row->kind == RowKind::Toggle && row->selected && row->subtitle.empty(), "an installed DLC starts on");
+    row = find_row(model, "manage-dlc-502");
+    check(row && !row->selected, "a DLC bought later starts off");
+    check(find_row(model, "manage-dlc-504")->value == "Free · 20 MB", "a free DLC says so");
+    check(fact(model, "Free space") == "1.0 GB", "the sheet says the drive's free space");
+    check(!find_row(model, "manage-dlc-apply")->enabled && find_row(model, "manage-dlc-apply")->subtitle == "Nothing changed",
+          "nothing to apply yet");
+
+    activate(model, "manage-dlc-501");
+    activate(model, "manage-dlc-502");
+    check(model.view().surface == "manage-dlc", "a toggle keeps the sheet open");
+    check(find_row(model, "manage-dlc-501")->subtitle == "Its files are deleted", "turning one off says what happens");
+    check(find_row(model, "manage-dlc-502")->subtitle == "Downloads", "turning one on says what happens");
+    check(fact(model, "Download") == "About 200 MB" && fact(model, "Frees") == "About 50 MB", "the sheet says what changes");
+    check(find_row(model, "manage-dlc-apply")->enabled && find_row(model, "manage-dlc-apply")->subtitle == "Runs in Queue", "Apply is ready");
+    // Too big for the drive: Apply waits.
+    activate(model, "manage-dlc-503");
+    check(fact(model, "Download") == "About 300 MB · 1.0 GB free", "the download says it doesn't fit");
+    check(!find_row(model, "manage-dlc-apply")->enabled && find_row(model, "manage-dlc-apply")->subtitle == "Not enough space",
+          "a change that doesn't fit can't start");
+    activate(model, "manage-dlc-503");
+    activate(model, "manage-dlc-504");
+    check(find_row(model, "manage-dlc-504")->subtitle == "Downloads, and Steam adds it to your account", "a free DLC is claimed");
+    activate(model, "manage-dlc-504");
+    check(model.TakeInstallRequests().empty(), "toggling asks for nothing");
+
+    activate(model, "manage-dlc-apply");
+    auto requests = model.TakeInstallRequests();
+    check(requests.size() == 1 && requests[0].kind == InstallRequestKind::ChangeDlc && requests[0].game_id == SteamId(42) &&
+              (requests[0].excluded_dlc == SteamIds({501, 503, 504, 599})) &&
+              requests[0].install_bytes == std::optional<std::uint64_t>(300'000'000),
+          "Apply asks for the whole choice (the record's unlisted DLC stays off) and reserves what turns on");
+    check(model.state().navigation.modals.empty() && model.state().navigation.route == Route::Details, "back on the game's page");
+
+    // While its change runs, Queue says so and the row waits.
+    LiveInstallJob change;
+    change.game_id = SteamId(42);
+    change.state = JobState::Downloading;
+    change.update = true;
+    change.dlc_change = true;
+    model.UpdateInstalls({change}, {installed, unknown});
+    const auto* job = std::find_if(model.state().jobs.begin(), model.state().jobs.end(), [](const Job& value) { return value.game_id == SteamId(42); }).operator->();
+    check(job && job->stage_text == "Changing DLC", "Queue names the DLC change");
+    const auto* note = find_row(model, "details-updating");
+    check(note && note->title == "Changing DLC", "the game's page names the DLC change too");
+    activate(model, "details-more");
+    row = find_row(model, "manage-dlc");
+    check(row && !row->enabled && row->subtitle == "Wait for its job in Queue to finish.", "one change at a time");
+    model.action("circle");
+    model.action("circle");
+    installed.installed_dlc = SteamIds({502});
+    installed.excluded_dlc = SteamIds({501, 503, 504, 599});
+    model.UpdateInstalls({}, {installed, unknown});
+    check(std::any_of(model.state().notices.begin(), model.state().notices.end(),
+                      [](const auto& notice) { return notice.message == "DLC changed"; }),
+          "its end says the DLC changed");
+    // A change that only removed DLC downloaded nothing: Completed lists it as an update, not as the whole game.
+    const auto now = static_cast<std::int64_t>(std::time(nullptr));
+    model.UpdateInstalls({}, {installed, unknown}, {{SteamId(42), 500'000'000, "internal", now, 0, true}});
+    const auto finished = std::find_if(model.state().jobs.begin(), model.state().jobs.end(),
+                                       [](const Job& value) { return value.game_id == SteamId(42); });
+    check(finished != model.state().jobs.end() && finished->state == JobState::Downloaded && finished->update &&
+              finished->total_bytes == 0,
+          "a change that downloaded nothing is no download of the game");
+
+    // Steam offline, or its sign-in expired: Manage DLC stays, and the change waits in Queue for Steam.
+    for (const auto state : {AuthState::Offline, AuthState::Expired}) {
+        model.UpdateAccount({state, "123", "Synthetic"});
+        while (!model.state().navigation.modals.empty()) model.action("circle");
+        if (model.state().navigation.route == Route::Details) model.action("circle");
+        check(model.action("details:42"), "details open");
+        activate(model, "details-more");
+        row = find_row(model, "manage-dlc");
+        check(row && row->enabled, "Manage DLC stays without a Steam sign-in");
+        activate(model, "manage-dlc");
+        check(model.view().surface == "manage-dlc", "and opens");
+        activate(model, "manage-dlc-501");
+        activate(model, "manage-dlc-apply");
+        requests = model.TakeInstallRequests();
+        check(requests.size() == 1 && requests[0].kind == InstallRequestKind::ChangeDlc && requests[0].game_id == SteamId(42),
+              "Apply queues the change without a Steam sign-in");
+    }
+}
+
 void live_install_optional_dlc() {
     auto model = make_live();
     model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
     check(model.UpdateLibrary({{game(SteamId(42), "With DLC"), game(SteamId(44), "By language")}, false, {}, false, false, {}}), "library loaded");
     model.UpdateVolumes({{"internal", "Console storage", true, 20'000'000'000, 10'000'000'000}}, "internal");
-    std::vector<GameDlc> dlc{{501, "Expansion", 100'000'000, 100'000'000}, {502, "Tools", 200'000'000, 200'000'000},
-                             {503, "Free tools", 300'000'000, 300'000'000, true}};
+    std::vector<GameDlc> dlc{{SteamId(501), "Expansion", 100'000'000, 100'000'000}, {SteamId(502), "Tools", 200'000'000, 200'000'000},
+                             {SteamId(503), "Free tools", 300'000'000, 300'000'000, true}};
     dlc[1].optional = true;
     dlc[2].optional = true;
     model.UpdateAppDetails(SteamId(42), 400'000'000, 500'000'000, true, {}, dlc);
@@ -741,7 +908,7 @@ void live_install_optional_dlc() {
     check(model.action("down") && model.state().navigation.focus_key == "install-dlc", "only rows take the focus");
     check(model.action("up") && model.state().navigation.focus_key == "install-confirm", "both ways");
     auto checks = model.TakeSizeChecks();
-    check(checks.size() == 1 && (checks[0].excluded_dlc == std::vector<std::uint32_t>{502}), "the size check leaves it out");
+    check(checks.size() == 1 && (checks[0].excluded_dlc == SteamIds({502})), "the size check leaves it out");
     model.UpdateMeasuredSize(checks[0], false, false, {});
     check(fact(model, "Needs") == "About 600 MB", "the sheet's total leaves it out");
     activate(model, "install-dlc");
@@ -761,10 +928,10 @@ void live_install_optional_dlc() {
     activate(model, "install-dlc-done");
     activate(model, "install-confirm");
     auto requests = model.TakeInstallRequests();
-    check(requests.size() == 1 && (requests[0].excluded_dlc == std::vector<std::uint32_t>{501}), "the choice wins over the default");
+    check(requests.size() == 1 && (requests[0].excluded_dlc == SteamIds({501})), "the choice wins over the default");
     // Optional on one language only: the default follows the language chosen, same size or not.
     model.UpdateInstalls({}, {});
-    std::vector<GameDlc> by_language{{601, "Voices", 10'000'000, 10'000'000}, {602, "Tools", 10'000'000, 10'000'000}};
+    std::vector<GameDlc> by_language{{SteamId(601), "Voices", 10'000'000, 10'000'000}, {SteamId(602), "Tools", 10'000'000, 10'000'000}};
     by_language[0].other_sizes.push_back({"public", "german", 10'000'000, 10'000'000, true});
     by_language[1].optional = true;
     by_language[1].other_sizes.push_back({"public", "german", 10'000'000, 10'000'000, false});
@@ -778,7 +945,7 @@ void live_install_optional_dlc() {
     (void)model.TakeSizeChecks();
     activate(model, "install-confirm");
     auto german = model.TakeInstallRequests();
-    check(german.size() == 1 && (german[0].excluded_dlc == std::vector<std::uint32_t>{601}), "German turns off German's optional DLC");
+    check(german.size() == 1 && (german[0].excluded_dlc == SteamIds({601})), "German turns off German's optional DLC");
     // Installing without opening the list leaves optional DLC out.
     model.UpdateInstalls({}, {});
     check(model.action("details:42"), "details open");
@@ -786,7 +953,7 @@ void live_install_optional_dlc() {
     (void)model.TakeSizeChecks();
     activate(model, "install-confirm");
     requests = model.TakeInstallRequests();
-    check(requests.size() == 1 && (requests[0].excluded_dlc == std::vector<std::uint32_t>{502}), "the default goes with the install");
+    check(requests.size() == 1 && (requests[0].excluded_dlc == SteamIds({502})), "the default goes with the install");
 }
 
 // A game's page says what the install sheet will, before and after the exact check (DUSK flipped from 9.3 to 11.7 GB).
@@ -796,14 +963,14 @@ void live_page_matches_install_sheet() {
     check(model.UpdateLibrary({{game(SteamId(42), "Like DUSK"), game(SteamId(43), "Check fails")}, false, {}, false, false, {}}), "library loaded");
     model.UpdateVolumes({{"internal", "Console storage", true, 40'000'000'000, 30'000'000'000}}, "internal");
     // Owned: HD, which starts on, and optional Goodies, which starts off. Steam's figures count both.
-    std::vector<GameDlc> dlc{{601, "HD", 2'000'000'000, 2'400'000'000}, {602, "The Goodies", 3'000'000'000, 4'100'000'000}};
+    std::vector<GameDlc> dlc{{SteamId(601), "HD", 2'000'000'000, 2'400'000'000}, {SteamId(602), "The Goodies", 3'000'000'000, 4'100'000'000}};
     dlc[1].optional = true;
     model.UpdateAppDetails(SteamId(42), 9'000'000'000, 15'800'000'000, true, {}, dlc);
     check(model.action("details:42"), "details open");
     check(find_row(model, "details-install")->value == "11.7 GB", "the page counts what starts on");
     // The check runs with the page, for what the sheet opens with.
     auto checks = model.TakeSizeChecks();
-    check(checks.size() == 1 && checks[0].id == SteamId(42) && (checks[0].excluded_dlc == std::vector<std::uint32_t>{602}),
+    check(checks.size() == 1 && checks[0].id == SteamId(42) && (checks[0].excluded_dlc == SteamIds({602})),
           "opening the page checks the sheet's choice");
     model.UpdateMeasuredSize(checks[0], true, false, {11'500'000'000, 6'500'000'000});
     check(find_row(model, "details-install")->value == "11.5 GB", "the page takes the exact size");
@@ -821,11 +988,11 @@ void live_page_matches_install_sheet() {
     check(find_row(model, "details-install")->value == "11.5 GB", "the page goes back to the defaults");
     // Optional DLC with no files on this version isn't in the sheet's list, so it isn't in the page's check either.
     auto beta_only = dlc;
-    beta_only.push_back({603, "Beta extras", 0, 0});
+    beta_only.push_back({SteamId(603), "Beta extras", 0, 0});
     beta_only.back().optional = true;
     model.UpdateAppDetails(SteamId(42), 9'000'000'000, 15'800'000'000, true, {}, beta_only);
     checks = model.TakeSizeChecks();
-    check(checks.size() == 1 && (checks[0].excluded_dlc == std::vector<std::uint32_t>{602}), "DLC without files isn't in the page's check");
+    check(checks.size() == 1 && (checks[0].excluded_dlc == SteamIds({602})), "DLC without files isn't in the page's check");
     model.UpdateMeasuredSize(checks[0], true, false, {11'500'000'000, 6'500'000'000});
     activate(model, "details-install");
     check(model.TakeSizeChecks().empty() && fact(model, "Needs") == "11.5 GB", "the sheet still has the page's answer");
@@ -868,6 +1035,25 @@ void details_ask_follows_licenses_and_install_state() {
     check(NextDetailsAsk(DetailsAsked{1, true}, {1, false}, false) == DetailsAsk::kAgain, "uninstalled on its page: asked again");
     check(NextDetailsAsk(DetailsAsked{1, true}, {1, true}, true) == DetailsAsk::kAgain, "an installed game is asked at each visit");
     check(NextDetailsAsk(DetailsAsked{1, true}, {1, true}, false) == DetailsAsk::kNothing, "but not all the time");
+}
+
+// Leaving a game page for another screen keeps its game for Back. Nothing is asked for it until the page opens again
+// (MK11 was asked for over 5000 times in two days, Mouthwashing every second after its download).
+void details_page_asks_only_while_open() {
+    using playden::homebrew::DetailsAsk;
+    using playden::homebrew::DetailsPageAsks;
+    DetailsPageAsks asks;
+    const auto id = SteamId(976310);
+    check(asks.Tick(id, {0, true}) == DetailsAsk::kAgain, "an installed game's page asks when it opens");
+    check(asks.Tick(id, {0, true}) == DetailsAsk::kNothing, "and waits while it stays open");
+    for (int tick = 0; tick < 5; ++tick)
+        check(asks.Tick(std::nullopt, {0, true}) == DetailsAsk::kNothing, "another screen asks for nothing, tick after tick");
+    check(asks.Tick(id, {0, true}) == DetailsAsk::kAgain, "back on the page: a new visit asks again");
+    check(asks.Tick(id, {0, true}) == DetailsAsk::kNothing, "once");
+    asks.Leave();
+    check(asks.Tick(id, {0, true}) == DetailsAsk::kAgain, "a page that left the screen asks on its next opening");
+    check(asks.Tick(SteamId(42), {0, false}) == DetailsAsk::kAgain, "another game's page asks for its own");
+    check(asks.Tick(SteamId(42), {0, false}) == DetailsAsk::kNothing, "an open page with its answer waits");
 }
 
 // A game in several languages: the install sheet's Language row chooses one for this install only.
@@ -1357,7 +1543,7 @@ void refresh_actions_preserve_authentication_and_wall_clock_is_external() {
           "baseline for refresh action accepted");
     model.action("l1");
     activate(model, "settings-account");
-    activate(model, "account-sync");
+    activate(model, "refresh-library");
     const auto actions = model.TakeServiceActions();
     check(actions.size() == 1 && actions.front() == ServiceAction::RefreshLibrary
               && model.state().account().authentication == AuthState::SignedIn
@@ -1587,6 +1773,124 @@ void live_family_filter_defaults_on() {
     activate(model,"filter-hide-family");
     check(model.visible_games().size()==2 && model.ExportOrganization().filters==std::set<std::string>{"hide-demos"},
           "turning Family sharing on shows it again");
+}
+
+// The Store filter: listed under Store (Any, then each store with games) while the games come from more than one store,
+// one store at a time with a tick, combined with the rail's scope and the other filters, saved, and cleared by Reset.
+void live_store_filter() {
+    auto model=make_live();
+    model.SetGogStoreEnabled(true);
+    model.UpdateAccount({AuthState::SignedIn,"123","Synthetic",{},{},true});
+    auto demo=game(SteamId(44),"Steam Demo");demo.demo=true;
+    check(model.UpdateLibrary({{game(SteamId(42),"Steam one"),game(SteamId(43),"Steam two"),demo},false,{},false,false,{}}),
+          "Steam's games load");
+    check(model.action("r1") && model.action("triangle"),"live filter modal opens");
+    auto keys=model.state().navigation.modals.back().action_keys;
+    check(std::find(keys.begin(),keys.end(),"heading-store")==keys.end() && find_row(model,"store-filter-any")==nullptr,
+          "Steam's games only: no Store group");
+    model.action("circle");
+
+    playden::homebrew::AccountUpdate gog_account;
+    gog_account.authentication=AuthState::SignedIn;
+    gog_account.id="00000000000000ab";
+    gog_account.display_name="Synthetic GOG";
+    gog_account.store=playden::Store::kGog;
+    model.UpdateAccount(gog_account);
+    LibraryUpdate gog{{game(playden::GameId::Gog(1000000001),"GOG one"),game(playden::GameId::Gog(1000000002),"GOG two")},
+                      false,{},false,false,{}};
+    gog.source=playden::Store::kGog;
+    check(model.UpdateLibrary(gog),"GOG's games load");
+    check(model.action("triangle"),"filter modal opens with two stores");
+    keys=model.state().navigation.modals.back().action_keys;
+    const auto heading=std::find(keys.begin(),keys.end(),"heading-store");
+    check(heading!=keys.end() && std::vector<std::string>(heading,heading+4)==
+              std::vector<std::string>{"heading-store","store-filter-any","store-filter-steam","store-filter-gog"} &&
+              *(heading+4)=="divider",
+          "Store lists Any, Steam and GOG after the filters, before the actions");
+    const auto* any=find_row(model,"store-filter-any");
+    const auto* title=find_row(model,"heading-store");
+    check(title && title->title=="Store" && title->kind==RowKind::Separator && any && any->title=="Any" && any->checked &&
+              !find_row(model,"store-filter-gog")->checked && find_row(model,"store-filter-gog")->title=="GOG",
+          "a Store heading, and Any has the tick");
+    activate(model,"store-filter-gog");
+    auto visible=model.visible_games();
+    check(visible.size()==2 && std::all_of(visible.begin(),visible.end(),[](const auto* item){ return item->id.store==playden::Store::kGog; }),
+          "GOG lists only GOG's games");
+    check(model.ExportOrganization().filters==std::set<std::string>{"store-gog"} &&
+              playden::OrganizationSnapshotIsValid(model.ExportOrganization()),
+          "the Store filter is saved");
+    check(model.action("triangle") && find_row(model,"store-filter-gog")->checked && !find_row(model,"store-filter-any")->checked,
+          "the tick moves to GOG");
+    activate(model,"store-filter-steam");
+    check(model.visible_games().size()==3 && model.ExportOrganization().filters==std::set<std::string>{"store-steam"},
+          "picking Steam replaces GOG");
+    // With the other filters and the rail's scope.
+    check(model.action("triangle"),"filter modal opens again");
+    activate(model,"filter-hide-demos");
+    check(model.visible_games().size()==2 && model.ExportOrganization().filters==std::set<std::string>{"hide-demos","store-steam"},
+          "the Store filter combines with Demos");
+    for(int step=0;step<6 && !model.state().navigation.library_rail_focused;++step) model.action("left");
+    for(int step=0;step<10 && model.state().navigation.focus_key!="rail-gog";++step) model.action("down");
+    check(model.state().navigation.focus_key=="rail-gog","the rail reaches GOG");
+    check(model.action("cross") && model.visible_games().empty() && has_row(model,"library-empty"),
+          "the GOG scope with the Steam filter: nothing, and the empty view offers Reset filters");
+    check(model.action("triangle"),"filter modal opens on the empty view");
+    activate(model,"store-filter-any");
+    check(model.visible_games().size()==2 && model.ExportOrganization().filters==std::set<std::string>{"hide-demos"},
+          "Any lists every store's games again");
+    check(model.action("triangle"),"filter modal opens again");
+    activate(model,"store-filter-gog");
+    check(model.action("triangle"),"filter modal opens before Reset");
+    activate(model,"filters-reset");
+    check(model.ExportOrganization().filters.empty() && model.visible_games().size()==2,"Reset clears the Store filter too");
+
+    // A store picked keeps its row while it is the only one with games, so it can be set back to Any.
+    check(model.action("triangle"),"filter modal opens");
+    activate(model,"store-filter-steam");
+    Simulation restored=make_live();
+    restored.SetGogStoreEnabled(true);
+    restored.UpdateAccount({AuthState::SignedIn,"123","Synthetic",{},{},true});
+    check(restored.UpdateLibrary({{game(SteamId(42),"Steam one")},false,{},false,false,{}}),"a Steam-only library");
+    auto saved=model.ExportOrganization();
+    saved.scope="all";
+    check(restored.ApplyOrganization(1,restored.BeginOrganizationLoad(1),saved) &&
+              restored.state().library.filters==std::set<std::string>{"store-steam"},
+          "the Store filter is restored");
+    check(restored.action("r1") && restored.action("triangle"),"filter modal opens on one store");
+    keys=restored.state().navigation.modals.back().action_keys;
+    const auto only=std::find(keys.begin(),keys.end(),"heading-store");
+    check(only!=keys.end() && std::vector<std::string>(only,only+3)==
+              std::vector<std::string>{"heading-store","store-filter-any","store-filter-steam"} &&
+              find_row(restored,"store-filter-steam")->checked,
+          "with one store, the group stays while that store is picked");
+    activate(restored,"store-filter-any");
+    check(restored.action("triangle") && find_row(restored,"store-filter-any")==nullptr,"set back to Any, the group goes");
+    restored.action("circle");
+
+    // A store picked while the file loads replaces the file's store; Any picked meanwhile clears it.
+    for (const std::string picked : {"steam","any"}) {
+        Simulation loading=make_live();
+        loading.SetGogStoreEnabled(true);
+        loading.UpdateAccount({AuthState::SignedIn,"123","Synthetic",{},{},true});
+        check(loading.UpdateLibrary({{game(SteamId(42),"Steam one")},false,{},false,false,{}}),"Steam's games load");
+        loading.UpdateAccount(gog_account);
+        check(loading.UpdateLibrary(gog),"GOG's games load");
+        playden::OrganizationSnapshot file;
+        file.filters={"hide-demos","store-gog"};
+        check(loading.action("r1"),"the Library opens");
+        // Any is a change only from a store picked before the load began.
+        if (picked=="any") {
+            check(loading.action("triangle"),"filter modal opens");
+            activate(loading,"store-filter-steam");
+        }
+        const auto token=loading.BeginOrganizationLoad(1);
+        check(loading.action("triangle"),"filter modal opens while the file loads");
+        activate(loading,"store-filter-"+picked);
+        check(loading.ApplyOrganization(1,token,file),"the file applies");
+        const auto expected=picked=="any" ? std::set<std::string>{"hide-demos"} : std::set<std::string>{"hide-demos","store-steam"};
+        check(loading.state().library.filters==expected && playden::OrganizationSnapshotIsValid(loading.ExportOrganization()),
+              "the store picked meanwhile wins, and the result saves");
+    }
 }
 
 // Sort and filters offers Refresh library: it asks the controller for Steam's current list and the
@@ -1859,34 +2163,36 @@ void live_storage_section_and_installed_games() {
     model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
     model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb}}, "internal");
 
-    // Nothing installed: the Storage rows say so, and leftovers stay hidden.
+    // Nothing installed: the Games rows say so, and leftovers stay hidden with their heading's group showing.
     model.action("l1");
     check(model.state().navigation.route == Route::Settings, "Settings opens");
-    const auto section_of = [&model](const std::string& key) {
-        const auto* row = find_row(model, key);
-        return row ? row->section : std::string("missing");
+    const auto keys_in = [&model](const std::string& section) {
+        std::vector<std::string> keys;
+        for (const auto& row : model.view().rows) if (row.section == section) keys.push_back(row.key);
+        return keys;
     };
-    for (const auto* key : {"settings-storage", "settings-installed", "settings-kept", "settings-runtime"})
-        check(section_of(key) == "Storage", "the storage rows are in the Storage section");
-    std::vector<std::string> library;
-    for (const auto& row : model.view().rows) if (row.section == "Library") library.push_back(row.key);
-    check(library == std::vector<std::string>{"settings-import", "settings-title-store", "settings-cloud-saves"},
-          "Library starts with Import games, then its toggles");
-    std::vector<std::string> community;
-    for (const auto& row : model.view().rows) if (row.section == "Community") community.push_back(row.key);
-    check(community == std::vector<std::string>{"settings-ask-after-games", "settings-recipe-votes", "settings-share-as", "settings-account-link",
-                                                "settings-sharing-reset"},
-          "Community holds the feedback toggle, the Playden account and Reset sharing ID");
+    check(keys_in("Games") == std::vector<std::string>{"settings-heading-installed-games", "settings-installed",
+                                                      "settings-game-updates", "settings-import",
+                                                      "settings-heading-saves-and-data", "settings-cloud-saves",
+                                                      "settings-kept"},
+          "Games: installed games with their updates and Import, then saves and data; no PS5 titles heading without a row");
+    check(keys_in("Accounts") == std::vector<std::string>{"settings-heading-stores", "settings-account", "settings-signout",
+                                                         "settings-title-store", "settings-heading-community", "settings-account-link",
+                                                         "settings-share-as", "settings-ask-after-games",
+                                                         "settings-recipe-votes", "settings-sharing-reset"},
+          "Accounts: the stores, then Community with the Playden account first");
     check(find_row(model, "settings-storage")->action == "storage-picker", "Games storage opens the drive picker");
-    std::vector<std::string> order;
-    for (const auto& row : model.view().rows) if (row.section == "Storage") order.push_back(row.key);
-    check(order == std::vector<std::string>{"settings-storage", "settings-installed", "settings-kept", "settings-runtime"},
-          "Storage lists its rows in order, without the hidden cleanup row");
-    std::vector<std::string> downloads;
-    for (const auto& row : model.view().rows) if (row.section == "Downloads") downloads.push_back(row.key);
-    check(downloads == std::vector<std::string>{"settings-content-language", "settings-downloads-slow",
-                                                "settings-download-server"},
-          "Downloads holds the download language, the slow-network toggle and the download server");
+    check(keys_in("Downloads") == std::vector<std::string>{"settings-storage", "settings-content-language",
+                                                          "settings-download-server", "settings-downloads-slow"},
+          "Downloads: where new games go, their language, the server and the slow-network toggle, with no heading");
+    check(keys_in("System") == std::vector<std::string>{"settings-heading-playden-updates", "settings-update",
+                                                       "settings-beta-updates", "settings-heading-runtime-kit",
+                                                       "settings-runtime", "settings-heading-display", "settings-motion",
+                                                       "settings-heading-help", "settings-logs", "settings-about",
+                                                       "settings-heading-reset", "settings-reset",
+                                                       "settings-remove-playden"},
+          "System: Playden updates, the runtime kit, display, help, then the two reset rows");
+    check(find_row(model, "settings-runtime")->title == "Runtime kit status", "the runtime kit's status says runtime kit");
     {
         const auto* language = find_row(model, "settings-content-language");
         check(language->title == "Download language" && language->value == "English" &&
@@ -1904,9 +2210,8 @@ void live_storage_section_and_installed_games() {
     std::vector<std::string> sections;
     for (const auto& row : model.view().rows)
         if (sections.empty() || sections.back() != row.section) sections.push_back(row.section);
-    check(sections == std::vector<std::string>{"Account", "Library", "Community", "Storage", "Downloads", "Display", "Updates",
-                                                  "Web access", "About", "Quit Playden"},
-          "the rail order is Account, Library, Community, Storage, Downloads, Display, Updates, Web access, About, Quit");
+    check(sections == std::vector<std::string>{"Accounts", "Games", "Downloads", "Web access", "System", "Quit Playden"},
+          "the rail order is Accounts, Games, Downloads, Web access, System, Quit Playden");
     // Web access: on by default; the address and its QR once the server reports them; the reason when it can't open.
     check(find_row(model, "settings-web-access")->selected && model.ExportPreferences().web_access, "web access is on by default");
     check(!find_row(model, "settings-web-address"), "no address before the server reports one");
@@ -1930,10 +2235,29 @@ void live_storage_section_and_installed_games() {
               find_row(model, "settings-web-problem")->subtitle.rfind(
                   "Web access could not start: port 7039: Address already in use (errno 48).", 0) == 0,
           "a port that could not be opened says why");
+    // Paired browsers (#873): the count, and Forget all once there is one.
+    {
+        const auto* none = find_row(model, "settings-web-browsers");
+        check(none && none->title == "Paired browsers" && none->value == "0" && !none->enabled && none->kind == RowKind::Status,
+              "no paired browser: the count, with nothing to forget");
+        playden::homebrew::LiveWebAccess paired{"on", "http://192.168.1.50:7031/", 7031, {}};
+        paired.paired_browsers = 2;
+        model.ApplyLiveWebAccess(paired);
+        const auto* two = find_row(model, "settings-web-browsers");
+        check(two && two->value == "2" && two->enabled && two->kind == RowKind::Action && two->section == "Web access",
+              "paired browsers are counted and can be forgotten");
+    }
     activate(model, "settings-web-access");
     check(!find_row(model, "settings-web-access")->selected && !model.ExportPreferences().web_access &&
               !find_row(model, "settings-web-problem") && !find_row(model, "settings-web-address"),
           "the toggle turns web access off");
+    check(find_row(model, "settings-web-browsers") && find_row(model, "settings-web-browsers")->value == "2",
+          "turning web access off doesn't forget paired browsers");
+    check(!model.TakeForgetWebBrowsers(), "nothing forgotten yet");
+    activate(model, "settings-web-browsers");
+    check(!model.TakeForgetWebBrowsers(), "Forget all asks first");
+    activate(model, "web-forget-browsers-confirm");
+    check(model.TakeForgetWebBrowsers() && !model.TakeForgetWebBrowsers(), "Forget all reaches the web service once");
     activate(model, "settings-web-access");
     check(model.ExportPreferences().web_access, "and on again");
     check(!model.state().quit_requested, "not quitting yet");
@@ -1944,11 +2268,11 @@ void live_storage_section_and_installed_games() {
     check(find_row(model, "settings-kept")->value == "None" && !has_row(model, "settings-runtime-cleanup"),
           "kept data says None and the cleanup row is hidden");
     model.SetRuntimeLeftovers(1);
-    order.clear();
-    for (const auto& row : model.view().rows) if (row.section == "Storage") order.push_back(row.key);
-    check(order == std::vector<std::string>{"settings-storage", "settings-installed", "settings-kept",
-                                            "settings-runtime-cleanup", "settings-runtime"},
-          "unused settings data sits before Runtime status when there is some");
+    {
+        const auto games = keys_in("Games");
+        check(games.size() >= 2 && games[games.size() - 2] == "settings-heading-ps5-titles" && games.back() == "settings-runtime-cleanup",
+              "unused settings data shows Games › PS5 titles when there is some");
+    }
     model.SetRuntimeLeftovers(0);
     // The Settings drive picker changes the default, not one install's drive.
     activate(model, "settings-storage");
@@ -1959,16 +2283,16 @@ void live_storage_section_and_installed_games() {
     check(model.action("focus:settings-storage"), "Games storage is focused");
     model.action("up");
     check(model.state().navigation.focus_key == "settings-storage" &&
-              model.view().rows[static_cast<std::size_t>(model.view().focused_row)].section == "Storage",
-          "Up on Storage's first row does not leave the section");
+              model.view().rows[static_cast<std::size_t>(model.view().focused_row)].section == "Downloads",
+          "Up on Downloads' first row does not leave the section");
     if (model.state().navigation.tabs_focused) model.action("down");
-    check(model.action("focus:settings-download-server"), "Download server is focused");
+    check(model.action("focus:settings-downloads-slow"), "Downloads for slow networks is focused");
     model.action("down");
-    check(model.state().navigation.focus_key == "settings-download-server", "Down on Downloads' last row stays on it");
+    check(model.state().navigation.focus_key == "settings-downloads-slow", "Down on Downloads' last row stays on it");
     model.action("left");
     model.action("down");
     model.action("right");
-    check(model.state().navigation.focus_key == "settings-motion", "the rail moves to the next section");
+    check(model.state().navigation.focus_key == "settings-web-access", "the rail moves to the next section");
 
     const auto played = [&](playden::GameId id, std::string title, std::optional<std::int64_t> days) {
         auto summary = game(id, std::move(title));
@@ -2240,8 +2564,9 @@ void live_settings_focus_stays_near_a_removed_row() {
     const auto& rows = model.view().rows;
     const auto focused = rows[static_cast<std::size_t>(model.view().focused_row)];
     check(!has_row(model, "settings-runtime-cleanup"), "the cleaned row is gone");
-    check(focused.section == "Storage" && !focused.rail_only && !model.state().navigation.settings_rail_focused,
-          "focus moves to the nearest row in the same section, not the rail");
+    check(focused.section == "Games" && !focused.rail_only && !model.state().navigation.settings_rail_focused &&
+              focused.kind != playden::homebrew::RowKind::Heading,
+          "focus moves to the nearest row in the same section, not the rail or a heading");
     check(focused.enabled, "a row that can be chosen is preferred");
 }
 
@@ -2346,6 +2671,19 @@ void live_ready_to_play_quits_to_home() {
     check(play && play->enabled && play->action == "quit-to-home" && play->title == "Finish setup" && play->value == "Quits to Home", "Finish setup explains quitting to Home");
     check(find_row(model, "details-setup")->value == "Waiting for the PS5", "setup says the title waits for the PS5");
     check(model.state().navigation.focus_key == "details-play", "focus rests on Play");
+    // Game settings waits for the PS5: its title is published, and changes made now would miss the first start from Home.
+    activate(model, "details-more");
+    const auto* settings_row = find_row(model, "game-settings");
+    check(settings_row && !settings_row->enabled && settings_row->subtitle == "Opens once the PS5 has added the game" &&
+              settings_row->value == "After Finish setup",
+          "Game settings says it waits for the PS5, where Game actions shows it");
+    model.action("focus:game-settings");
+    model.action("cross");
+    check(std::none_of(model.state().navigation.modals.begin(), model.state().navigation.modals.end(),
+                       [](const auto& modal) { return modal.id == "game-settings"; }),
+          "Game settings doesn't open while the game waits for the PS5");
+    while (!model.state().navigation.modals.empty()) model.action("circle");
+    check(model.action("focus:details-play"), "back on Play");
     // Its saves sync first (#50): Play waits in a dialog, then quits once they are in step.
     model.UpdateCloud({{SteamId(42), CloudStatus::UpToDate, "Saves are up to date"}});
     activate(model, "details-play");
@@ -2353,6 +2691,7 @@ void live_ready_to_play_quits_to_home() {
     check(requests.size() == 1 && requests[0].kind == CloudRequestKind::Sync && requests[0].game_id == SteamId(42), "Play syncs saves first");
     check(!model.state().quit_requested && model.state().navigation.modals.back().title == "Syncing Cloud saves…",
           "Play waits for the sync in a dialog");
+    check(!model.FinishSetupGame(), "no game is handed anything before the quit");
     model.UpdateCloud({{SteamId(42), CloudStatus::UpToDate, "Saves are up to date"}});
     check(!model.state().quit_requested, "a result that is not the sync's answer does not count");
     model.NotifyCloudAnswered(SteamId(43), CloudStatus::Synced);
@@ -2360,6 +2699,8 @@ void live_ready_to_play_quits_to_home() {
     model.UpdateCloud({{SteamId(42), CloudStatus::Synced, "1 save downloaded"}});
     model.NotifyCloudAnswered(SteamId(42), CloudStatus::Synced);
     check(model.state().quit_requested && model.state().navigation.modals.empty(), "Play quits to Home once saves are in step");
+    // The game starts from Home next: Playden hands it what Play would first, as it quits.
+    check(model.FinishSetupGame() == SteamId(42), "the quit is Finish setup's, for this game");
     // A choice or a failure lets the player play without syncing.
     auto choosing = make_live();
     sync_automatically(choosing);
@@ -2444,6 +2785,7 @@ void live_ready_to_play_quits_to_home() {
     check(requests.size() == 1 && requests[0].game_id == SteamId(43), "Play in the prompt syncs the announced game");
     prompted.NotifyCloudAnswered(SteamId(43), CloudStatus::Synced);
     check(prompted.state().quit_requested, "Play in the prompt quits to Home");
+    check(prompted.FinishSetupGame() == SteamId(43), "the prompt's Play is Finish setup for the announced game");
     // Quitting would cut off another game's preparation: the quit waits for it in a dialog.
     auto busy = make_live();
     busy.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
@@ -2463,6 +2805,7 @@ void live_ready_to_play_quits_to_home() {
     busy.UpdateRuntime(RuntimeState::Ready, {waiting, prepared});
     check(busy.state().quit_requested && !busy.state().quit_waiting && busy.state().navigation.modals.empty(),
           "Playden quits once the preparation is done");
+    check(busy.FinishSetupGame() == SteamId(42), "a quit that waited is still Finish setup's");
     // Games queued while none is being prepared (between two): the quit waits until the queue is held.
     auto queued = make_live();
     queued.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
@@ -2490,6 +2833,9 @@ void live_ready_to_play_quits_to_home() {
     activate(cancelled, "cancel");
     cancelled.UpdateRuntime(RuntimeState::Ready, {waiting, prepared});
     check(!cancelled.state().quit_requested && !cancelled.state().quit_waiting, "Cancel keeps Playden open");
+    // A quit from outside afterwards (web access) is not Finish setup: no game is handed anything.
+    cancelled.RequestQuit();
+    check(cancelled.state().quit_requested && !cancelled.FinishSetupGame(), "a later quit from outside names no game");
     // A game held behind another game's preparation says what it waits for.
     auto held = make_live();
     held.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
@@ -2616,6 +2962,9 @@ void live_play_does_the_next_useful_thing() {
                   "missing kit does not queue an impossible preparation");
             check(model.state().navigation.focus_key == "about-kit", "missing kit opens Runtime kit in About");
             while (!model.state().navigation.modals.empty()) check(model.action("circle"), "close kit information");
+            const auto& focused = model.view().rows[static_cast<std::size_t>(model.view().focused_row)];
+            check(focused.key == "settings-about" && focused.section == "System",
+                  "closing it leaves About focused in Settings › System");
         } else {
             check(play->action == expected.action, "redesigned action preserves existing behavior");
             if (play->action == "runtime-play" || play->action == "runtime-prepare") {
@@ -3305,6 +3654,40 @@ void live_queue_counts_copies() {
           "Downloads counts the copy as copying");
 }
 
+// A game waiting for the PS5 is set up. A pass the runtime queued for it behind other work (an uninstall here) only asks
+// the console again: its page keeps Finish setup and Queue keeps it under Waiting for the PS5, not "Up next" (Mouthwashing
+// with uninstalls queued, 2026-11-15).
+void live_waiting_for_ps5_stays_ready_with_a_queued_check() {
+    using namespace playden::homebrew;
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    check(model.UpdateLibrary({{game(SteamId(10), "Mouthwashing"), game(SteamId(11), "Bullet Witch")}, false, {}, false, false, {}}),
+          "library loaded");
+    model.UpdateInstalls({}, {{SteamId(10), 1, "internal", true}, {SteamId(11), 1, "internal", true}}, {});
+    LiveRuntimeGame waiting; waiting.game_id = SteamId(10); waiting.status = "Waiting for the PS5";
+    waiting.awaiting_registration = true; waiting.can_prepare = true; waiting.has_title = true;
+    waiting.queued = true;  // the runtime has a pass for it queued
+    LiveRuntimeGame removing; removing.game_id = SteamId(11); removing.status = "Ready"; removing.has_title = true;
+    model.UpdateRuntime(RuntimeState::Ready, {waiting, removing});
+    PreparationQueue queue;
+    queue.waiting = {SteamId(10)};
+    queue.uninstalls = {{SteamId(11), "Removing PS5 title…"}};
+    model.UpdatePreparationQueue(queue);
+    check(model.state().preparation_queue.waiting.empty(), "the check doesn't wait in line");
+    model.action("r1");
+    model.action("r1");
+    check(model.state().navigation.route == Route::Downloads, "the Queue tab opens");
+    check(queue_row(model, "prep-10") == nullptr && queue_row(model, "prep-attn-10") &&
+              queue_row(model, "prep-attn-10")->value == "Waiting for the PS5",
+          "Queue lists the game as waiting for the PS5, not up next");
+    check(model.action("details:10"), "the game page opens");
+    const auto* play = find_row(model, "details-play");
+    check(play && play->title == "Finish setup" && play->enabled && play->value == "Quits to Home",
+          "Finish setup still quits to Home");
+    const auto* setup = find_row(model, "details-setup");
+    check(setup && setup->value == "Waiting for the PS5", "Setup says it waits for the PS5, not Queued");
+}
+
 // Queue: both workflows, one section expanded at a time. A collapsed section keeps its card and counts.
 // Waiting preparations are numbered in the runtime's order, completed ones follow them in the same list,
 // and Prepare next moves a waiting game first without touching the one being prepared.
@@ -3624,6 +4007,313 @@ void live_refused_preparation_offers_uninstall() {
     check(!has_row(model, "uninstall") && !has_row(model, "import-remove"), "nothing to remove without its files");
 }
 
+// Game actions, regrouped: the page's sheet holds the game's own rows (Manage DLC… and Move to… among them), then Start,
+// Library and Your rating under headings, and Uninstall… and Cancel below a divider. A tile's sheet (Home and Library,
+// the same) is the page's with rows left out, never reordered. Cancel download is the Queue's Cancel, from both.
+void live_game_menus_regrouped() {
+    using namespace playden::homebrew;
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    model.UpdateVolumes({{"internal", "Console storage", true, 800'000'000'000, 500'000'000'000},
+                         {"usb", "USB Drive", true, 1000'000'000'000, 100'000'000'000}}, "internal");
+    const auto local = playden::GameId::Local("6d1f3a52-0c55-4f3e-9b2a-5d1c7e0a9f11");
+    check(model.UpdateLibrary({{game(SteamId(36), "Doom 3"), game(SteamId(37), "Failed"), game(SteamId(38), "Queued"),
+                                game(SteamId(39), "Moving"), game(SteamId(40), "Updating"), game(SteamId(41), "Update failed")},
+                               false, {}, false, false, {}}),
+          "menus: library loaded");
+    LibraryUpdate imported{{game(local, "Rally")}, false, {}, false, false, {}};
+    imported.source = playden::Store::kLocal;
+    check(model.UpdateLibrary(imported), "menus: imported library");
+    LiveInstalledGame doom{SteamId(36), 600'000'000, "internal", true, 0};
+    doom.dlc_known = true;
+    doom.installed_dlc = SteamIds({501});
+    LiveInstallJob failed{SteamId(37), JobState::Failed, 50, 200, "Download failed"};
+    LiveInstallJob queued{SteamId(38), JobState::Queued, 0, 200, {}};
+    LiveInstallJob moving{SteamId(39), JobState::Downloading, 50, 200, {}, "usb"};
+    moving.move = true;
+    moving.from_volume_id = "internal";
+    LiveInstallJob updating{SteamId(40), JobState::Downloading, 50, 200, {}};
+    updating.update = true;
+    LiveInstallJob locked{SteamId(41), JobState::Failed, 50, 200, "Disk error"};
+    locked.update = true;
+    locked.locked = true;
+    model.UpdateInstalls({failed, queued, moving, updating, locked},
+                         {doom, {SteamId(39), 100, "internal"}, {SteamId(40), 100, "internal"}, {SteamId(41), 100, "internal"}});
+    model.UpdateAppDetails(SteamId(36), 300'000'000, 500'000'000, true, {"english"},
+                           {{SteamId(501), "Art Book", 40'000'000, 50'000'000, false},
+                            {SteamId(502), "Campaign", 200'000'000, 300'000'000, false}});
+    model.UpdateExternalGames({{local, "usb0", true, ""}});
+    LiveRuntimeGame ready;
+    ready.game_id = SteamId(36);
+    ready.status = "Ready";
+    ready.ready = ready.prepared = ready.has_title = ready.can_play = true;
+    ready.activity = TitleActivity::Stopped;
+    model.UpdateRuntime(RuntimeState::Ready, {ready});
+
+    const auto keys = [&model] {
+        std::vector<std::string> result;
+        for (const auto& row : model.view().rows) result.push_back(row.key);
+        return result;
+    };
+    const auto close = [&model] {
+        while (!model.state().navigation.modals.empty()) model.action("circle");
+    };
+    const auto page = [&](playden::GameId id) {
+        close();
+        if (model.state().navigation.route == Route::Details) model.action("circle");
+        check(model.action("details:" + ToKey(id)), "menus: the game's page opens");
+        activate(model, "details-more");
+        return keys();
+    };
+    const auto tile = [&](Route route, playden::GameId id) {
+        close();
+        if (model.state().navigation.route == Route::Details) model.action("circle");
+        if (model.state().navigation.route != route) model.action(route == Route::Library ? "r1" : "l1");
+        check(model.state().navigation.route == route, "menus: on the tile's screen");
+        check(model.action("select:" + ToKey(id)) && model.action("options") && model.state().navigation.modals.size() == 1 &&
+                  model.state().navigation.modals.back().id == "context",
+              "menus: the tile's Game actions open");
+        return keys();
+    };
+    // Every row of `part` is in `whole`, in the same order.
+    const auto in_order = [](const std::vector<std::string>& part, const std::vector<std::string>& whole) {
+        auto at = whole.begin();
+        for (const auto& key : part) {
+            at = std::find(at, whole.end(), key);
+            if (at == whole.end()) return false;
+            ++at;
+        }
+        return true;
+    };
+
+    // The page: the game's rows, then Start, Library and Your rating, then Uninstall… and Cancel apart.
+    const auto doom_page = page(SteamId(36));
+    check(doom_page == std::vector<std::string>{"game-settings", "manage-dlc", "manage-saves", "game-move", "game-maintenance",
+                                                "heading-start", "run-once", "play-detailed-logs", "heading-library",
+                                                "favorite", "collection", "note", "hide", "heading-rating", "compatibility",
+                                                "share-feedback", "divider", "uninstall", "cancel"},
+          "menus: the page's Game actions, in the mockup's order");
+    check(model.state().navigation.focus_key == "game-settings", "menus: focus lands on Game settings");
+    check(find_row(model, "heading-start")->kind == RowKind::Separator && find_row(model, "heading-start")->title == "Start" &&
+              find_row(model, "heading-library")->title == "Library" && find_row(model, "heading-rating")->title == "Your rating" &&
+              find_row(model, "divider")->kind == RowKind::Separator && find_row(model, "divider")->title.empty(),
+          "menus: headings name the groups; the divider is untitled");
+    check(find_row(model, "game-maintenance")->title == "Maintenance…", "menus: Maintenance… opens another sheet");
+    check(find_row(model, "manage-dlc")->enabled && find_row(model, "manage-dlc")->value == "1 of 2",
+          "menus: Manage DLC… moved here, with what is installed");
+    check(!find_row(model, "game-move")->enabled && find_row(model, "game-move")->value == "Checking…",
+          "menus: Move to… waits to hear whether the game runs");
+    check(find_row(model, "run-once")->enabled, "menus: Run launcher or setup… doesn't wait for that answer");
+    model.UpdateRuntime(RuntimeState::Ready, {ready});
+    check(find_row(model, "game-move")->enabled && find_row(model, "game-move")->value == "Console storage",
+          "menus: Move to… moved here, with the game's drive, once the console answers");
+    check(find_row(model, "uninstall")->dangerous && !find_row(model, "cancel")->dangerous, "menus: Uninstall… is set apart in red");
+
+    // Maintenance: Fix problems, then Settings and saves; no Manage DLC… or Move to…
+    activate(model, "game-maintenance");
+    check(keys() == std::vector<std::string>{"heading-fix", "maintenance-repair", "maintenance-update", "maintenance-recreate",
+                                             "maintenance-shader", "heading-settings-saves", "maintenance-reset",
+                                             "maintenance-backup", "divider", "cancel"},
+          "menus: Maintenance in two groups");
+    check(model.state().navigation.focus_key == "maintenance-repair", "menus: Maintenance opens on Repair, past its heading");
+    check(find_row(model, "heading-fix")->title == "Fix problems" &&
+              find_row(model, "heading-settings-saves")->title == "Settings and saves",
+          "menus: Maintenance's headings");
+
+    // Tiles: the page's rows left out, never reordered; Home and Library the same, Compatibility on both.
+    tile(Route::Library, SteamId(36));
+    activate(model, "compatibility");
+    activate(model, "rating-works");
+    const std::vector<std::string> doom_tile{"heading-library", "favorite", "collection", "note", "hide", "heading-rating",
+                                             "compatibility", "share-feedback", "divider", "uninstall", "cancel"};
+    const auto library_tile = tile(Route::Library, SteamId(36));
+    check(library_tile == doom_tile, "menus: the Library tile's rows");
+    check(model.state().navigation.focus_key == "favorite", "menus: a tile's sheet opens on Favorite, past its heading");
+    check(find_row(model, "compatibility")->value == "Works", "menus: Compatibility shows the player's rating");
+    check(tile(Route::Home, SteamId(36)) == doom_tile, "menus: the Home tile's rows are the Library's");
+    check(in_order(doom_tile, doom_page), "menus: a tile's rows are the page's, in its order");
+
+    // Cancel download: a failed download, from its tile and its page; the tile's rows stay in the page's order.
+    const auto failed_page = page(SteamId(37));
+    check(failed_page == std::vector<std::string>{"cancel-download", "heading-library", "favorite", "collection", "note", "hide",
+                                                  "heading-rating", "compatibility", "divider", "uninstall", "cancel"},
+          "menus: a failed download's page: Cancel download…, no Share feedback… or Start");
+    check(model.state().navigation.focus_key == "cancel-download", "menus: focus lands on Cancel download…");
+    check(find_row(model, "cancel-download")->title == "Cancel download", "menus: the row says Cancel download, as the mockup");
+    check(!find_row(model, "uninstall")->enabled, "menus: the page's Uninstall… says the game isn't installed");
+    const auto failed_tile = tile(Route::Library, SteamId(37));
+    check(failed_tile == std::vector<std::string>{"cancel-download", "heading-library", "favorite", "collection", "note", "hide",
+                                                  "heading-rating", "compatibility", "divider", "cancel"},
+          "menus: a failed download's tile has Cancel download…");
+    check(in_order(failed_tile, failed_page), "menus: the failed tile's rows are the page's, in its order");
+    activate(model, "cancel-download");
+    check(model.state().navigation.modals.size() == 2 && model.state().navigation.modals.back().title == "Cancel download?" &&
+              model.TakeInstallRequests().empty(),
+          "menus: it asks the Queue's question first");
+    activate(model, "confirm-destructive");
+    auto requests = model.TakeInstallRequests();
+    check(requests.size() == 1 && requests[0].kind == InstallRequestKind::Cancel && requests[0].game_id == SteamId(37) &&
+              model.state().navigation.modals.empty() && model.state().navigation.route == Route::Library &&
+              model.state().navigation.focus_key == "game-37",
+          "menus: confirmed, the download is canceled and focus returns to its tile");
+    // A queued one, from its page; one that ends while the sheet is open leaves the row disabled.
+    page(SteamId(38));
+    model.UpdateInstalls({queued, moving, updating, locked},
+                         {doom, {SteamId(39), 100, "internal"}, {SteamId(40), 100, "internal"}, {SteamId(41), 100, "internal"}});
+    check(find_row(model, "cancel-download") && find_row(model, "cancel-download")->enabled,
+          "menus: the queued download can still be canceled");
+    model.UpdateInstalls({moving, updating, locked},
+                         {doom, {SteamId(39), 100, "internal"}, {SteamId(40), 100, "internal"}, {SteamId(41), 100, "internal"}});
+    check(find_row(model, "cancel-download") && !find_row(model, "cancel-download")->enabled &&
+              find_row(model, "cancel-download")->value == "Nothing to cancel",
+          "menus: a download gone while the sheet is open leaves nothing to cancel");
+    activate(model, "cancel-download");
+    check(model.state().navigation.modals.size() == 1 && model.TakeInstallRequests().empty(), "menus: the disabled row asks nothing");
+    model.UpdateInstalls({queued, moving, updating, locked},
+                         {doom, {SteamId(39), 100, "internal"}, {SteamId(40), 100, "internal"}, {SteamId(41), 100, "internal"}});
+    page(SteamId(38));
+    activate(model, "cancel-download");
+    activate(model, "confirm-destructive");
+    requests = model.TakeInstallRequests();
+    check(requests.size() == 1 && requests[0].kind == InstallRequestKind::Cancel && requests[0].game_id == SteamId(38) &&
+              model.state().navigation.modals.empty() && model.state().navigation.route == Route::Details &&
+              model.state().navigation.focus_key == "details-more",
+          "menus: a queued download is canceled from its page, back on More");
+    check(has_row(model, "details-more"), "menus: More is still on the page");
+    // An update downloading can be canceled too; a move or an update putting its files in place can't.
+    check(std::ranges::count(page(SteamId(40)), std::string("cancel-download")) == 1, "menus: an update is canceled here too");
+    check(std::ranges::count(page(SteamId(39)), std::string("cancel-download")) == 0, "menus: a move has no Cancel download…");
+    check(std::ranges::count(page(SteamId(41)), std::string("cancel-download")) == 0,
+          "menus: an update putting its files in place has no Cancel download…");
+    check(std::ranges::count(page(SteamId(36)), std::string("cancel-download")) == 0, "menus: nothing to cancel, no row");
+
+    // An imported game playing from its folder: Remove from library… on Home too, and Home stays open.
+    const auto rally_page = page(local);
+    check(rally_page.size() >= 2 && rally_page[rally_page.size() - 2] == "import-remove" &&
+              std::ranges::count(rally_page, std::string("uninstall")) == 0,
+          "menus: the page removes an in-place game from the library");
+    const auto rally_home = tile(Route::Home, local);
+    check(rally_home.size() >= 2 && rally_home[rally_home.size() - 2] == "import-remove" &&
+              std::ranges::count(rally_home, std::string("uninstall")) == 0 && in_order(rally_home, rally_page),
+          "menus: the Home tile removes it from the library too, in the page's order");
+    activate(model, "import-remove");
+    check(model.state().navigation.modals.back().title == "Remove Rally from the library?", "menus: it asks about Home's game");
+    activate(model, "confirm-destructive");
+    const auto removed = model.TakeImportRequests();
+    check(removed.size() == 1 && removed[0].kind == ImportRequestKind::Remove && removed[0].game_id == local &&
+              model.state().navigation.route == Route::Home && model.state().navigation.modals.empty(),
+          "menus: confirmed, the game leaves the library and Home stays open");
+}
+
+// The Library's Game actions uninstall an installed game, with the question Home and its page ask, and the uninstall
+// joins the Queue. An imported game playing from its folder leaves the library instead; one not installed has no row.
+// A game that runs, waits in Queue or is uninstalling already says so and can't be uninstalled from there.
+void live_library_actions_offer_uninstall() {
+    using namespace playden::homebrew;
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    const auto local = playden::GameId::Local("6d1f3a52-0c55-4f3e-9b2a-5d1c7e0a9f11");
+    const auto copied = playden::GameId::Local("7c9e6679-7425-40de-944b-e07fc1f90ae7");
+    check(model.UpdateLibrary({{game(SteamId(36), "Doom 3"), game(SteamId(37), "Elsewhere"), game(SteamId(38), "Running"),
+                                game(SteamId(39), "Moving"), game(SteamId(40), "Updating"), game(SteamId(41), "Update failed")},
+                               false, {}, false, false, {}}),
+          "library loaded");
+    LibraryUpdate imported{{game(local, "Rally"), game(copied, "Copied")}, false, {}, false, false, {}};
+    imported.source = playden::Store::kLocal;
+    check(model.UpdateLibrary(imported), "imported library");
+    LiveInstallJob moving{SteamId(39), JobState::Downloading, 50, 200, {}, "usb0"};
+    moving.move = true;
+    moving.from_volume_id = "internal";
+    LiveInstallJob updating{SteamId(40), JobState::Downloading, 50, 200, {}};
+    updating.update = true;
+    // An update that failed while putting its files in place stays in Queue, locked: only an uninstall ends it.
+    LiveInstallJob failed{SteamId(41), JobState::Failed, 50, 200, "Disk error"};
+    failed.update = true;
+    failed.locked = true;
+    model.UpdateInstalls({moving, updating, failed},
+                         {{SteamId(36), 600'000'000}, {SteamId(38), 700'000'000}, {SteamId(39), 100}, {SteamId(40), 100},
+                          {SteamId(41), 100}, {copied, 300'000'000}});
+    model.UpdateExternalGames({{local, "usb0", true, ""}});
+    LiveRuntimeGame running; running.game_id = SteamId(38); running.status = "Ready"; running.activity = TitleActivity::Running;
+    model.UpdateRuntime(RuntimeState::Ready, {running});
+    const auto options = [&model](playden::GameId id) {
+        check(model.action("select:" + ToKey(id)) && model.action("options") && !model.state().navigation.modals.empty() &&
+                  model.state().navigation.modals.back().id == "context",
+              "the tile's Game actions open");
+    };
+    const auto close = [&model] { while (!model.state().navigation.modals.empty()) model.action("circle"); };
+    check(model.action("r1") && model.state().navigation.route == Route::Library, "Library opened");
+
+    // A page opened earlier must not decide which game the Library's actions act on.
+    check(model.action("details:37") && model.action("circle") && model.state().navigation.route == Route::Library,
+          "another game's page was opened before");
+    options(SteamId(36));
+    check(has_row(model, "uninstall") && find_row(model, "uninstall")->enabled && !has_row(model, "import-remove"),
+          "an installed game can be uninstalled from the Library");
+    activate(model, "uninstall");
+    check(model.state().navigation.modals.size() == 2 && model.state().navigation.modals.back().title == "Uninstall this game?",
+          "it asks first, as Home and the game page do");
+    close();
+    check(model.state().navigation.route == Route::Library && model.TakeInstallRequests().empty(), "Cancel asks for nothing");
+    options(SteamId(36));
+    activate(model, "uninstall");
+    activate(model, "confirm-destructive");
+    const auto requests = model.TakeInstallRequests();
+    check(requests.size() == 1 && requests[0].kind == InstallRequestKind::Uninstall && requests[0].game_id == SteamId(36) &&
+              model.state().navigation.modals.empty() && model.state().navigation.route == Route::Library &&
+              model.state().navigation.focus_key == "game-36",
+          "confirmed, that game is uninstalled and focus stays on its tile");
+    options(SteamId(36));
+    check(has_row(model, "uninstall") && !find_row(model, "uninstall")->enabled &&
+              find_row(model, "uninstall")->subtitle == "Uninstalling…",
+          "an uninstall already asked for is not asked again");
+    close();
+
+    // Not installed: nothing to uninstall.
+    options(SteamId(37));
+    check(!has_row(model, "uninstall") && !has_row(model, "import-remove"), "a game that isn't installed has no row");
+    close();
+    // Running or waiting in Queue: the row says why it can't start.
+    options(SteamId(38));
+    check(has_row(model, "uninstall") && !find_row(model, "uninstall")->enabled && find_row(model, "uninstall")->subtitle == "Playing",
+          "a running game is not uninstalled");
+    close();
+    options(SteamId(39));
+    check(has_row(model, "uninstall") && !find_row(model, "uninstall")->enabled && find_row(model, "uninstall")->subtitle == "Moving",
+          "a moving game is not uninstalled");
+    close();
+    // An update, running or failed, doesn't stop it: the uninstall drops the update.
+    options(SteamId(40));
+    check(has_row(model, "uninstall") && find_row(model, "uninstall")->enabled, "a game with an update in Queue can be uninstalled");
+    close();
+    options(SteamId(41));
+    check(has_row(model, "uninstall") && find_row(model, "uninstall")->enabled, "a failed update can still be uninstalled");
+    close();
+
+    // An imported game copied into storage is uninstalled like any other.
+    options(copied);
+    check(has_row(model, "uninstall") && find_row(model, "uninstall")->enabled && !has_row(model, "import-remove"),
+          "a copied imported game is uninstalled");
+    close();
+    // An imported game playing from its folder leaves the library, and the Library stays open.
+    options(local);
+    check(has_row(model, "import-remove") && !has_row(model, "uninstall"), "an in-place imported game is removed from the library");
+    activate(model, "import-remove");
+    check(model.state().navigation.modals.back().title == "Remove Rally from the library?", "it asks about the Library's game");
+    activate(model, "confirm-destructive");
+    const auto removed = model.TakeImportRequests();
+    check(removed.size() == 1 && removed[0].kind == ImportRequestKind::Remove && removed[0].game_id == local &&
+              model.state().navigation.route == Route::Library && model.state().navigation.modals.empty(),
+          "confirmed, that game leaves the library and the Library stays open");
+    LibraryUpdate without{{game(copied, "Copied")}, false, {}, false, false, {}};
+    without.source = playden::Store::kLocal;
+    model.UpdateExternalGames({});
+    check(model.UpdateLibrary(without), "the library drops the game");
+    check(model.state().navigation.selected_game_id.valid() &&
+              model.state().navigation.focus_key == "game-" + ToKey(model.state().navigation.selected_game_id),
+          "focus moves to a neighbouring tile");
+}
+
 // A setup an earlier kit left (its title or bottle from that kit) can't be finished by Try again: Queue and the
 // game page offer Recreate bottle instead, say so in plain words, and ask before it runs.
 void live_setup_from_an_earlier_kit_offers_recreate() {
@@ -3728,7 +4418,8 @@ void live_details_prepare_next() {
 }
 
 // A Steam game's art is at the addresses Playden always used (the artwork backend accepts exactly
-// these); a game from another store has none yet, so its tile shows its title.
+// these); a GOG game's is what its gamesdb entry named, kept on the game, in the one shape the
+// artwork backend fetches; an imported game has none, so its tile shows its title.
 void store_art_follows_the_store() {
     using namespace playden::homebrew;
     Game steam;
@@ -3740,6 +4431,41 @@ void store_art_follows_the_store() {
     local.id = playden::GameId::Local("0f8fad5b-d9cb-469f-a165-70867728950e");
     check(CoverUrl(local).empty() && HeroUrl(local).empty() && LogoUrl(local).empty(), "imported games have no store art");
     check(CoverUrl(playden::GameId{}).empty(), "an invalid game has no art");
+
+    const std::string cover = "https://images.gog.com/" + std::string(64, 'a') + ".jpg?namespace=gamesdb";
+    const std::string hero = "https://images.gog.com/" + std::string(64, 'b') + "_bg_crop_1920x655.jpg?namespace=gamesdb";
+    Game gog;
+    gog.id = playden::GameId::Gog(1207658924);
+    gog.artwork_source = cover;
+    gog.hero_source = hero;
+    check(CoverUrl(gog) == cover && HeroUrl(gog) == hero, "GOG art from the game's gamesdb addresses");
+    check(LogoUrl(gog).empty(), "GOG has no logo");
+    check(CoverUrl(gog.id).empty() && HeroUrl(gog.id).empty() && LogoUrl(gog.id).empty(),
+          "a GOG game's ID alone names no art");
+    gog.artwork_source = "https://images.gog.com/" + std::string(64, 'a') + ".jpg?namespace=gamesdb&x=1";
+    gog.hero_source = "https://example.invalid/hero.jpg";
+    check(CoverUrl(gog).empty() && HeroUrl(gog).empty(), "another address shape is never used");
+    gog.artwork_source = hero;
+    gog.hero_source = cover;
+    check(CoverUrl(gog).empty() && HeroUrl(gog).empty(), "nor the other slot's shape");
+    // A Steam game keeps its ID's addresses whatever it carries.
+    steam.artwork_source = cover;
+    steam.hero_source = hero;
+    check(CoverUrl(steam) == "https://cdn.cloudflare.steamstatic.com/steam/apps/440/library_600x900.jpg" &&
+              HeroUrl(steam) == "https://cdn.cloudflare.steamstatic.com/steam/apps/440/library_hero.jpg",
+          "Steam art ignores the stored addresses");
+
+    // The library fills a game's hero from its summary.
+    auto model = make_live();
+    auto summary = game(playden::GameId::Gog(1207658924), "Synthetic GOG title", cover, "Summary");
+    summary.hero_source = hero;
+    LibraryUpdate update{{summary}, false, {}, false, true, 100};
+    update.source = playden::Store::kGog;
+    check(model.UpdateLibrary(update), "a GOG library is accepted");
+    const auto* listed = find_game(model, playden::GameId::Gog(1207658924));
+    check(listed != nullptr && listed->artwork_source == cover && listed->hero_source == hero,
+          "the hero comes with the game");
+    check(CoverUrl(*listed) == cover && HeroUrl(*listed) == hero, "and its art follows");
 }
 
 // A game of a store without Cloud saves (an imported game Playden copied in), with Steam signed in or
@@ -3846,16 +4572,35 @@ void live_import_sheet_sends_requests() {
     check(model.TakeImportRequests().empty(), "no second scan while one runs");
     LiveImportCandidate delores;
     delores.volume_id = "usb0"; delores.folder = "playden/import/Delores"; delores.path = "/mnt/usb0/playden/import/Delores";
-    delores.title = "Delores"; delores.total_bytes = 230'000'000; delores.ascii_ok = true;
+    delores.title = "Delores"; delores.ascii_ok = true;
     delores.programs = {{"Delores.exe", 9'000'000, false}, {"setup.exe", 1'000'000, true}};
     LiveImportCandidate drop = delores;
     drop.volume_id = "internal"; drop.folder = "playden-import/Delores"; drop.path = "/data/playden-import/Delores";
-    model.UpdateImportCandidates({delores, drop}, false);
+    // Folders without a program say why the search may have missed one.
+    LiveImportCandidate empty = delores;
+    empty.folder = "playden/import/Empty"; empty.path = "/mnt/usb0/playden/import/Empty"; empty.programs.clear();
+    LiveImportCandidate huge = empty, deep = empty, unreadable = empty, failed = empty;
+    huge.folder = "playden/import/Huge"; huge.gap = playden::homebrew::ImportScanGap::TooManyFiles;
+    deep.folder = "playden/import/Deep"; deep.gap = playden::homebrew::ImportScanGap::TooDeep;
+    unreadable.folder = "playden/import/Locked"; unreadable.gap = playden::homebrew::ImportScanGap::Unreadable;
+    failed.folder = "playden/import/Failed"; failed.gap = playden::homebrew::ImportScanGap::Failed;
+    model.UpdateImportCandidates({delores, drop, empty, huge, deep, unreadable, failed}, false);
     check(model.state().navigation.focus_key == "import-look" && find_row(model, "import-look")->enabled,
           "the focus stays on Look for games when the scan ends");
     check(has_row(model, "import-group-usb0") && has_row(model, "import-group-internal") &&
-              find_row(model, "import-candidate-usb0:playden/import/Delores")->value == "230 MB",
-          "candidates are listed by drive");
+              find_row(model, "import-candidate-usb0:playden/import/Delores")->value.empty(),
+          "candidates are listed by drive, without a size (the scan doesn't measure folders)");
+    const auto gap_text = [&](const char* folder) {
+        const auto* row = find_row(model, std::string("import-candidate-usb0:playden/import/") + folder);
+        return row && !row->enabled ? row->subtitle : std::string("enabled");
+    };
+    check(gap_text("Empty") == "No Windows program found" &&
+              gap_text("Huge") == "No Windows program found · The search stopped after 1,000,000 files and folders" &&
+              gap_text("Deep") == "No Windows program found · Folders more than 15 levels deep were not searched" &&
+              gap_text("Locked") == "No Windows program found · Some files or folders could not be read" &&
+              gap_text("Failed") == "Playden could not read this folder",
+          "a folder without a program can't be added, and says why the search may have missed one");
+    model.UpdateImportCandidates({delores, drop}, false);
     activate(model, "import-candidate-internal:playden-import/Delores");
     check(model.view().surface == "import-choice" &&
               model.view().subtitle.rfind("Starts with Delores.exe, which you can change in Game settings.", 0) == 0,
@@ -3896,7 +4641,7 @@ void live_import_choice_and_details() {
                          {"tiny", "Tiny drive", true, 16'000'000'000, 8'000'000'000}}, "internal");
     LiveImportCandidate rally;
     rally.volume_id = "usb0"; rally.folder = "playden/import/Rally"; rally.path = "/mnt/usb0/playden/import/Rally";
-    rally.title = "Rally"; rally.total_bytes = 8'900'000'000; rally.ascii_ok = true; rally.file_count = 5000;
+    rally.title = "Rally"; rally.ascii_ok = true;
     rally.programs = {{"Rally.exe", 9'000'000, false}};
     LiveImportCandidate cafe = rally;
     cafe.folder = "playden/import/Café"; cafe.path = "/mnt/usb0/playden/import/Café"; cafe.title = "Café"; cafe.ascii_ok = false;
@@ -3925,23 +4670,23 @@ void live_import_choice_and_details() {
     check(model.view().surface == "import-choice" && model.TakeImportRequests().empty(), "its Play from the drive does nothing");
     model.action("circle");
 
-    // A drive folder: play in place, or Copy to storage with its size (no estimate), then the drive.
+    // A drive folder: play in place, or Copy to storage, then the drive. The scan doesn't measure the folder: no size
+    // yet, and free space is checked when the copy plan has measured it (the install service refuses it then).
     activate(model, "import-candidate-usb0:playden/import/Rally");
     check(find_row(model, "import-play-in-place")->title == "Play from the USB drive" &&
               find_row(model, "import-play-in-place")->value.empty() &&
-              find_row(model, "import-copy")->value == "8.9 GB" && !has_row(model, "import-move") && !has_row(model, "storage-picker"),
-          "a drive folder plays from there or is imported, with its size");
+              find_row(model, "import-copy")->value.empty() && !has_row(model, "import-move") && !has_row(model, "storage-picker"),
+          "a drive folder plays from there or is imported");
     activate(model, "import-copy");
-    check(model.view().surface == "import-storage" && model.view().subtitle == "8.9 GB will be copied there." &&
+    check(model.view().surface == "import-storage" && model.view().subtitle == "The game will be copied there." &&
               find_row(model, "volume-internal")->subtitle == "Default · Available" &&
               find_row(model, "volume-usb1")->subtitle == "Available" &&
               find_row(model, "volume-usb0")->subtitle == "The game is on this drive" && !find_row(model, "volume-usb0")->enabled &&
               find_row(model, "volume-usb0")->tone.empty() &&
-              find_row(model, "volume-tiny")->subtitle == "Not enough space" && !find_row(model, "volume-tiny")->enabled &&
-              find_row(model, "volume-tiny")->tone == "warn" && model.state().navigation.focus_key == "volume-internal",
-          "step 2 lists the drives: the default, the game's own drive and one too small disabled");
+              find_row(model, "volume-tiny")->subtitle == "Available" && find_row(model, "volume-tiny")->enabled &&
+              model.state().navigation.focus_key == "volume-internal",
+          "step 2 lists the drives: the default, and the game's own drive disabled");
     activate(model, "volume-usb0");
-    activate(model, "volume-tiny");
     check(model.view().surface == "import-storage" && model.TakeImportRequests().empty(), "a disabled drive does nothing");
     model.action("circle");
     check(model.view().surface == "import-choice", "Back returns to step 1");
@@ -4029,11 +4774,11 @@ void live_import_choice_and_details() {
         check(find_row(model, "details-copy")->title == "Move to storage…", "a game in the drop folder moves");
         model.UpdateExternalGames({{id, "usb0", true, ""}});
     }
-    // The page's Copy to storage opens step 2 with the folder's size (from the scan, the game has none).
+    // The page's Copy to storage opens step 2 (the game has no size until a copy plan measures it).
     activate(model, "details-copy");
-    check(model.view().surface == "import-storage" && model.view().subtitle == "8.9 GB will be copied there." &&
+    check(model.view().surface == "import-storage" && model.view().subtitle == "The game will be copied there." &&
               !find_row(model, "volume-usb0")->enabled && model.view().eyebrow == "Import games · Rally",
-          "the page's Copy to storage opens the drive choice with the folder's size");
+          "the page's Copy to storage opens the drive choice");
     model.action("circle");
     check(model.state().navigation.modals.empty(), "Back closes the page's drive choice");
     // A folder the PS5 can't play from (its name) still offers the copy.
@@ -4103,7 +4848,7 @@ void live_import_choice_and_details() {
     activate(model, "import-copy");
     check(find_row(model, "volume-internal")->subtitle == "Instant · moves the folder" && find_row(model, "volume-internal")->enabled &&
               find_row(model, "volume-usb0")->subtitle == "Copies, then frees the drop folder" &&
-              find_row(model, "volume-tiny")->subtitle == "Not enough space",
+              find_row(model, "volume-tiny")->subtitle == "Copies, then frees the drop folder",
           "the drop folder's step 2: console storage moves, other drives copy");
     activate(model, "volume-internal");
     requests = model.TakeImportRequests();
@@ -4302,9 +5047,9 @@ void leftover_titles_require_confirmation_and_follow_the_queue() {
     check(!has_row(model, "settings-leftovers"), "no leftover row without titles");
     model.UpdateLeftoverTitles({{"FAKE78001", "Lost game (Steam)", 12'000'000}, {"FAKE78002", "", 3'000'000}});
     const auto* row = find_row(model, "settings-leftovers");
-    check(row && row->title == "Leftover PS5 titles" && row->value == "2 titles · 15 MB" && row->section == "Storage" &&
+    check(row && row->title == "Leftover PS5 titles" && row->value == "2 titles · 15 MB" && row->section == "Games" &&
               !has_row(model, "settings-leftover-FAKE78001"),
-          "Storage has one Leftover PS5 titles row with their count and size, like Kept game data");
+          "Games has one Leftover PS5 titles row with their count and size, like Kept game data");
     activate(model, "settings-leftovers");
     check(model.state().navigation.modals.back().id == "leftover-titles" && model.view().surface == "leftover-titles",
           "the row opens the leftover titles manager");
@@ -4483,8 +5228,59 @@ void live_game_update() {
           "after the update, no button and Play again");
 }
 
+// Settings › System › Uninstall Playden (#868): a dangerous row; the dialog keeps saves unless asked, its focus starts on Cancel;
+// the request reaches the runtime once; the progress screen takes no input; the end screen quits to Home.
+void live_remove_playden() {
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    model.action("l1");
+    check(model.state().navigation.route == Route::Settings, "Settings opens");
+    const auto* row = find_row(model, "settings-remove-playden");
+    check(row && row->dangerous && row->section == "System" && row->title == "Uninstall Playden…", "Uninstall Playden is a dangerous row in System");
+    activate(model, "settings-remove-playden");
+    const auto& modal = model.state().navigation.modals.back();
+    check(modal.destructive && modal.title == "Uninstall Playden?", "it asks first");
+    check(modal.focused_action == 0 && modal.action_keys.front() == "cancel", "Cancel has the focus");
+    check(modal.body.find("saves are kept") != std::string::npos, "saves are kept by default");
+    const auto* toggle = find_row(model, "remove-playden-delete-saves");
+    check(toggle && toggle->kind == RowKind::Toggle && !toggle->selected, "deleting saves is a choice, off by default");
+    activate(model, "remove-playden-delete-saves");
+    check(model.state().navigation.modals.back().body.find("saves on this console are deleted") != std::string::npos,
+          "the dialog says the saves go when the choice is on");
+    activate(model, "cancel");
+    check(model.state().navigation.modals.empty() && !model.TakePlaydenRemovalRequest(), "Cancel asks for nothing");
+    activate(model, "settings-remove-playden");
+    activate(model, "remove-playden-confirm");
+    const auto request = model.TakePlaydenRemovalRequest();
+    check(request && *request && !model.TakePlaydenRemovalRequest(), "the request (keep saves) is taken once");
+    check(model.state().removing_playden && model.view().title == "Uninstalling Playden…", "the progress screen shows");
+    check(!model.action("circle") || model.state().removing_playden, "it can't be left while it runs");
+    check(!model.state().quit_requested, "nor quit");
+    // A game still running stops it before anything goes: back to Settings with the reason.
+    model.UpdatePlaydenRemoval(false, "Close every game first.");
+    check(!model.state().removing_playden && model.state().navigation.route == Route::Settings, "back to Settings");
+    {
+        // Under the alert that says why: Uninstall Playden, in Settings › System.
+        while (!model.state().navigation.modals.empty()) model.action("circle");
+        const auto& focused = model.view().rows[static_cast<std::size_t>(model.view().focused_row)];
+        check(focused.key == "settings-remove-playden" && focused.section == "System" &&
+                  !model.state().navigation.settings_rail_focused,
+              "on Uninstall Playden in Settings › System");
+    }
+    // Done: the end screen, and Cross quits to Home.
+    model.UpdatePlaydenRemoval(true, {});
+    model.ShowPlaydenRemoved(true, {"Kept: saves in /data/playden/games/steam-220.kept"});
+    check(model.view().title == "Playden is uninstalled" &&
+              model.view().subtitle.find("Delete the Playden tile from the Home screen") != std::string::npos,
+          "the end screen says how to finish");
+    check(find_row(model, "removed-note-0") != nullptr, "it says what was kept");
+    check(model.action("cross") && model.state().quit_requested, "Cross quits to Home");
+}
+
 int main() {
+    live_remove_playden();
     live_filters_sheet_sections();
+    live_game_menus_regrouped();
     live_game_update();
     live_install_language_row();
     live_install_version_row();
@@ -4492,8 +5288,11 @@ int main() {
     live_install_exact_size();
     live_install_version_title();
     live_install_dlc_row();
+    live_install_dlc_gog();
+    live_manage_dlc();
     live_install_optional_dlc();
     details_ask_follows_licenses_and_install_state();
+    details_page_asks_only_while_open();
     live_page_matches_install_sheet();
     leftover_titles_require_confirmation_and_follow_the_queue();
     live_download_server_picker();
@@ -4534,6 +5333,7 @@ int main() {
     live_demos_filter_defaults_on();
     live_family_shared_projected();
     live_family_filter_defaults_on();
+    live_store_filter();
     live_sort_sheet_refreshes_the_library();
     continue_playing_more_keeps_the_chosen_sort();
     live_empty_filter_keeps_the_signed_in_account();
@@ -4544,10 +5344,12 @@ int main() {
     live_details_keep_personal_edits_and_block_fixture_operations();
     refresh_actions_preserve_authentication_and_wall_clock_is_external();
     live_queue_shows_downloads_and_preparations();
+    live_waiting_for_ps5_stays_ready_with_a_queued_check();
     live_queue_counts_copies();
     live_queue_history_and_empty_states();
     live_queue_lists_preparations_needing_attention();
     live_refused_preparation_offers_uninstall();
+    live_library_actions_offer_uninstall();
     live_setup_from_an_earlier_kit_offers_recreate();
     live_queue_lists_uninstalls();
     live_details_prepare_next();

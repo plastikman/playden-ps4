@@ -17,7 +17,7 @@ endif()
 add_library(playden_web_logs STATIC "${CMAKE_SOURCE_DIR}/src/web/logs_source.cpp")
 target_include_directories(playden_web_logs PUBLIC "${CMAKE_SOURCE_DIR}/src")
 target_compile_features(playden_web_logs PUBLIC cxx_std_17)
-target_link_libraries(playden_web_logs PUBLIC playden_web_http PRIVATE playden_diagnostic_log playden_steam_protocol)
+target_link_libraries(playden_web_logs PUBLIC playden_web_http PRIVATE playden_diagnostic_log playden_steam_protocol playden_library)
 if(PLAYDEN_PLATFORM_PS5)
     target_compile_definitions(playden_web_logs PRIVATE PLAYDEN_PLATFORM_PS5=1)
     target_compile_options(playden_web_logs PRIVATE -fno-exceptions -fno-rtti)
@@ -27,6 +27,7 @@ endif()
 set(playden_web_fonts "${CMAKE_SOURCE_DIR}/fixtures/ui-comparison/assets/fonts")
 set(playden_web_assets
     "/|html|${CMAKE_SOURCE_DIR}/src/web/page/index.html"
+    "/gog|html|${CMAKE_SOURCE_DIR}/src/web/page/gog.html"
     "/assets/barlow-regular.ttf|ttf|${playden_web_fonts}/Barlow-Regular.ttf"
     "/assets/barlow-semibold.ttf|ttf|${playden_web_fonts}/Barlow-SemiBold.ttf"
     "/assets/barlow-OFL.txt|text|${playden_web_fonts}/barlow-OFL.txt")
@@ -48,13 +49,14 @@ add_library(playden_web STATIC
     "${CMAKE_SOURCE_DIR}/src/web/service.cpp"
     "${CMAKE_SOURCE_DIR}/src/web/files_api.cpp"
     "${CMAKE_SOURCE_DIR}/src/web/file_policy.cpp"
+    "${CMAKE_SOURCE_DIR}/src/web/gog_relay.cpp"
     "${CMAKE_SOURCE_DIR}/src/web/file_store.cpp"
     "${CMAKE_SOURCE_DIR}/src/web/pairing.cpp"
     "${playden_web_assets_cpp}")
 target_include_directories(playden_web PUBLIC "${CMAKE_SOURCE_DIR}/src")
 target_compile_features(playden_web PUBLIC cxx_std_17)
-target_link_libraries(playden_web PUBLIC playden_web_logs playden_web_http playden_managed_directory
-    playden_runtime_artifact_hash playden_storage)
+target_link_libraries(playden_web PUBLIC playden_web_logs playden_web_http playden_managed_directory playden_library
+    playden_runtime_artifact_hash playden_runtime_private_directories playden_storage playden_steam_protocol)
 if(PLAYDEN_PLATFORM_PS5)
     target_compile_definitions(playden_web PRIVATE PLAYDEN_PLATFORM_PS5=1)
     target_compile_options(playden_web PRIVATE -fno-exceptions -fno-rtti)
@@ -74,23 +76,51 @@ if(BUILD_TESTING AND NOT PLAYDEN_PLATFORM_PS5)
         "${CMAKE_SOURCE_DIR}/tests/web_logs_source_test.cpp"
         "${CMAKE_SOURCE_DIR}/src/web/logs_source.cpp")
     target_compile_definitions(web_logs_source_native_policy_test PRIVATE PLAYDEN_PLATFORM_PS5=1)
-    target_link_libraries(web_logs_source_native_policy_test PRIVATE playden_web_http playden_diagnostic_log playden_steam_protocol)
+    target_link_libraries(web_logs_source_native_policy_test PRIVATE playden_web_http playden_diagnostic_log playden_steam_protocol playden_library)
     add_test(NAME web_logs_source_native_policy COMMAND web_logs_source_native_policy_test)
     add_executable(web_service_test "${CMAKE_SOURCE_DIR}/tests/web_service_test.cpp")
     target_link_libraries(web_service_test PRIVATE playden_web)
     add_test(NAME web_service COMMAND web_service_test)
+    add_executable(web_gog_relay_test "${CMAKE_SOURCE_DIR}/tests/web_gog_relay_test.cpp")
+    target_link_libraries(web_gog_relay_test PRIVATE playden_web)
+    add_test(NAME web_gog_relay COMMAND web_gog_relay_test)
+    # A real server with a stub GOG account: the relay's posts over HTTP, then what web.log kept.
+    add_executable(web_gog_fixture_server "${CMAKE_SOURCE_DIR}/tests/web_gog_fixture_server.cpp")
+    target_link_libraries(web_gog_fixture_server PRIVATE playden_web)
+    add_test(NAME web_gog_relay_smoke COMMAND python3 -I "${CMAKE_SOURCE_DIR}/tests/test_web_gog_relay_smoke.py" $<TARGET_FILE:web_gog_fixture_server>)
     add_executable(web_pairing_test "${CMAKE_SOURCE_DIR}/tests/web_pairing_test.cpp")
     target_link_libraries(web_pairing_test PRIVATE playden_web)
     add_test(NAME web_pairing COMMAND web_pairing_test)
+    # The console's path handling for remembered browsers (no descriptor-relative opens), run on the host.
+    add_executable(web_pairing_native_policy_test
+        "${CMAKE_SOURCE_DIR}/tests/web_pairing_test.cpp"
+        "${CMAKE_SOURCE_DIR}/src/web/pairing.cpp"
+        "${CMAKE_SOURCE_DIR}/src/runtime/private_directories.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/managed_directory.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/storage.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/durable_storage.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/effective_uid.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/random_id.cpp")
+    target_include_directories(web_pairing_native_policy_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    target_compile_features(web_pairing_native_policy_test PRIVATE cxx_std_17)
+    target_compile_definitions(web_pairing_native_policy_test PRIVATE PLAYDEN_PLATFORM_PS5=1 PLAYDEN_TEST_AT_UNAVAILABLE=1)
+    target_link_libraries(web_pairing_native_policy_test PRIVATE playden_runtime_artifact_hash Threads::Threads)
+    add_test(NAME web_pairing_native_policy COMMAND web_pairing_native_policy_test)
     add_executable(web_file_policy_test "${CMAKE_SOURCE_DIR}/tests/web_file_policy_test.cpp")
     target_link_libraries(web_file_policy_test PRIVATE playden_web)
     add_test(NAME web_file_policy COMMAND web_file_policy_test)
     add_executable(web_file_store_test "${CMAKE_SOURCE_DIR}/tests/web_file_store_test.cpp")
     target_link_libraries(web_file_store_test PRIVATE playden_web)
     add_test(NAME web_file_store COMMAND web_file_store_test)
+    add_executable(web_file_move_test "${CMAKE_SOURCE_DIR}/tests/web_file_move_test.cpp")
+    target_link_libraries(web_file_move_test PRIVATE playden_web)
+    add_test(NAME web_file_move COMMAND web_file_move_test)
     add_executable(web_files_api_test "${CMAKE_SOURCE_DIR}/tests/web_files_api_test.cpp")
     target_link_libraries(web_files_api_test PRIVATE playden_web)
     add_test(NAME web_files_api COMMAND web_files_api_test)
+    add_executable(web_files_move_job_test "${CMAKE_SOURCE_DIR}/tests/web_files_move_job_test.cpp")
+    target_link_libraries(web_files_move_job_test PRIVATE playden_web)
+    add_test(NAME web_files_move_job COMMAND web_files_move_job_test)
     # A real server over a made-up game for a browser or a script; prints each pairing code.
     add_executable(web_files_fixture_server "${CMAKE_SOURCE_DIR}/tests/web_files_fixture_server.cpp")
     target_link_libraries(web_files_fixture_server PRIVATE playden_web)
@@ -107,4 +137,15 @@ if(BUILD_TESTING AND NOT PLAYDEN_PLATFORM_PS5)
     target_compile_definitions(web_file_store_native_policy_test PRIVATE PLAYDEN_PLATFORM_PS5=1 PLAYDEN_TEST_AT_UNAVAILABLE=1)
     target_link_libraries(web_file_store_native_policy_test PRIVATE playden_runtime_artifact_hash playden_storage playden_curl_8_22 Threads::Threads)
     add_test(NAME web_file_store_native_policy COMMAND web_file_store_native_policy_test)
+    add_executable(web_file_move_native_policy_test
+        "${CMAKE_SOURCE_DIR}/tests/web_file_move_test.cpp"
+        "${CMAKE_SOURCE_DIR}/src/web/file_store.cpp"
+        "${CMAKE_SOURCE_DIR}/src/web/file_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/web/zip.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/managed_directory.cpp")
+    target_include_directories(web_file_move_native_policy_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    target_compile_features(web_file_move_native_policy_test PRIVATE cxx_std_17)
+    target_compile_definitions(web_file_move_native_policy_test PRIVATE PLAYDEN_PLATFORM_PS5=1 PLAYDEN_TEST_AT_UNAVAILABLE=1)
+    target_link_libraries(web_file_move_native_policy_test PRIVATE playden_runtime_artifact_hash playden_storage playden_curl_8_22 Threads::Threads)
+    add_test(NAME web_file_move_native_policy COMMAND web_file_move_native_policy_test)
 endif()

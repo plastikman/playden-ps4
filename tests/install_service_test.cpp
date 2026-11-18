@@ -593,6 +593,257 @@ void SignInEndsSteamWait(const std::filesystem::path& root) {
   std::filesystem::remove_all(root);
 }
 
+// A GOG game's runner as far as the queue sees it: it waits for a sign-in while `signed_out`, and holds while `block`.
+class GogRunner final : public playden::installs::InstallRunner {
+ public:
+  std::atomic<bool> signed_out{false};
+  std::atomic<bool> block{false};
+  std::atomic<int> installs{0};
+  Result Install(const GameId&, const std::string& root, const InstallOptions&, const std::atomic<bool>& cancel,
+                 const std::function<void(std::uint64_t, std::uint64_t, std::uint64_t)>& progress,
+                 const std::function<void(InstallStep)>& step) override {
+    ++installs;
+    step(InstallStep::kDownloading);
+    if (signed_out) return {false, false, {}, 0, true, "Downloads paused · Sign in to GOG"};
+    std::filesystem::create_directories(std::filesystem::path(root) / ".playden-download");
+    progress(10, 100, 0);
+    while (block) {
+      if (cancel) return {false, true, {}, 0};
+      std::this_thread::sleep_for(1ms);
+    }
+    std::filesystem::remove_all(std::filesystem::path(root) / ".playden-download");
+    std::ofstream(std::filesystem::path(root) / ".playden-install.json") << "{\"install_bytes\":2048,\"store\":\"gog\"}";
+    progress(100, 100, 0);
+    return {true, false, {}, 2048};
+  }
+  std::string Remove(const std::string& root) override {
+    std::filesystem::remove_all(root);
+    return {};
+  }
+  // Updates: it records the options, holds while `block` (staging) or `apply_block` (past staging), then finishes.
+  std::atomic<bool> apply_block{false};
+  std::atomic<int> updates{0};
+  std::mutex mutex;
+  std::vector<InstallOptions> update_options;
+  Result Update(const GameId&, const std::string& root, const InstallOptions& options, const std::atomic<bool>& cancel,
+                const std::function<void(std::uint64_t, std::uint64_t, std::uint64_t)>&,
+                const std::function<void(InstallStep)>& step, const std::function<bool()>&) override {
+    ++updates;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      update_options.push_back(options);
+    }
+    const auto state = playden::installs::ReadUpdateState(root);
+    const bool applying = state && state->phase != playden::installs::UpdatePhase::kStaging;
+    step(applying ? InstallStep::kApplying : InstallStep::kDownloading);
+    while (applying ? apply_block.load() : block.load()) {
+      if (cancel && !applying) return {false, true, {}, 0};
+      std::this_thread::sleep_for(1ms);
+    }
+    std::filesystem::remove_all(std::filesystem::path(root) / ".playden-update");
+    return {true, false, {}, 4096};
+  }
+  std::string DiscardUpdate(const std::string& root) override {
+    std::filesystem::remove_all(std::filesystem::path(root) / ".playden-update");
+    return {};
+  }
+};
+
+std::uint64_t InstalledBytes(const InstallSnapshot& snapshot, GameId id);
+
+// An installed GOG game at <root>/gog-1900000001 with its record (the Steam language `language`), listed in the
+// registry.
+void WriteInstalledGog(const std::filesystem::path& root, const std::string& language) {
+  const auto folder = root / "gog-1900000001";
+  std::filesystem::create_directories(folder);
+  playden::installs::GogRecord record;
+  record.build_id = "1000000000000000101";
+  record.products = {1900000001};
+  record.language = "de-DE";
+  record.meta_id = std::string(32, 'a');
+  std::ofstream(folder / ".playden-install.json")
+      << playden::installs::FormatGogInstallRecord(GameId::Gog(1900000001), 5555, 3, language, record,
+                                                   {{"bin/Game.exe", "", "", "Synthetic Game"}});
+  std::ofstream(root / ".playden-games") << "gog-1900000001\tinternal\t5555\n";
+}
+
+// Update() of an installed GOG game queues an update with its record's language; it runs on GOG's runner.
+void GogUpdateUsesTheRecordLanguage(const std::filesystem::path& root) {
+  std::filesystem::remove_all(root);
+  WriteInstalledGog(root, "german");
+  const auto game = GameId::Gog(1900000001);
+  GogRunner gog;
+  gog.block = true;
+  InstallService service({{Store::kGog, &gog}}, {{InstallService::kPrimaryVolumeId, "Console storage", root.string(), true}});
+  CHECK(service.Update(game).empty());
+  AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) {
+    const auto* job = JobOf(s, game);
+    return job && job->kind == InstallJobKind::kUpdate && job->state == InstallJobState::kRunning;
+  });
+  {
+    std::lock_guard<std::mutex> lock(gog.mutex);
+    CHECK(gog.update_options.size() == 1 && gog.update_options[0].language == "german");
+  }
+  CHECK(!service.Locked(game) && gog.installs == 0);
+  gog.block = false;
+  AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) { return !JobOf(s, game) && InstalledBytes(s, game) == 4096; });
+  std::filesystem::remove_all(root);
+}
+
+// At start a GOG game whose update.json says replacing comes back as an update job, locked until it finishes.
+void GogUpdateAtReplacingRestoresLocked(const std::filesystem::path& root) {
+  std::filesystem::remove_all(root);
+  WriteInstalledGog(root, "english");
+  const auto game = GameId::Gog(1900000001);
+  std::filesystem::create_directories(root / "gog-1900000001" / ".playden-update");
+  playden::installs::UpdateState state;
+  state.phase = playden::installs::UpdatePhase::kReplacing;
+  std::ofstream(root / "gog-1900000001" / ".playden-update" / "update.json") << playden::installs::FormatUpdateState(state);
+  GogRunner gog;
+  gog.apply_block = true;
+  InstallService service({{Store::kGog, &gog}}, {{InstallService::kPrimaryVolumeId, "Console storage", root.string(), true}});
+  {
+    const auto snapshot = service.Snapshot();
+    const auto* job = JobOf(snapshot, game);
+    CHECK(job && job->kind == InstallJobKind::kUpdate && job->locked && Installed(snapshot, game));
+    CHECK(service.Locked(game));
+  }
+  AwaitAt(__LINE__, service, [&](const InstallSnapshot&) { return gog.updates == 1; });
+  CHECK(service.Locked(game));
+  gog.apply_block = false;
+  AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) { return !JobOf(s, game) && InstalledBytes(s, game) == 4096; });
+  CHECK(!service.Locked(game) && gog.installs == 0);
+  std::filesystem::remove_all(root);
+}
+
+// A GOG job is in the registry like any other: one paused (or running) when Playden stopped comes back paused (or
+// queued, carrying on by itself) under its gog-<id> folder.
+void GogJobSurvivesARestart(const std::filesystem::path& root) {
+  std::filesystem::remove_all(root);
+  const auto game = GameId::Gog(1900000001);
+  const std::vector<InstallVolume> volumes{{InstallService::kPrimaryVolumeId, "Console storage", root.string(), true}};
+  GogRunner gog;
+  gog.block = true;
+  {
+    InstallService service({{Store::kGog, &gog}}, volumes);
+    service.Install(game);
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) {
+      const auto* job = JobOf(s, game);
+      return job && job->state == InstallJobState::kRunning;
+    });
+    service.Pause(game);
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) {
+      const auto* job = JobOf(s, game);
+      return job && job->state == InstallJobState::kPaused;
+    });
+  }
+  CHECK(std::filesystem::exists(root / "gog-1900000001" / ".playden-download"));
+  {
+    std::ifstream registry(root / ".playden-games");
+    const std::string text{std::istreambuf_iterator<char>(registry), {}};
+    CHECK(text.find("gog-1900000001\tinternal\t0\tpaused") != std::string::npos);
+  }
+  {
+    InstallService service({{Store::kGog, &gog}}, volumes);
+    const auto snapshot = service.Snapshot();
+    const auto* job = JobOf(snapshot, game);
+    CHECK(job && job->state == InstallJobState::kPaused && job->failure == "Interrupted. Resume to continue.");
+    CHECK(gog.installs == 1);
+    // Running when Playden stops: it carries on by itself at the next start.
+    service.Resume(game);
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) {
+      const auto* running = JobOf(s, game);
+      return running && running->state == InstallJobState::kRunning;
+    });
+  }
+  {
+    InstallService service({{Store::kGog, &gog}}, volumes);
+    gog.block = false;
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) { return Installed(s, game) && s.jobs.empty(); });
+    CHECK(gog.installs == 3);
+    CHECK(service.RootFor(game) == (root / "gog-1900000001").string());
+  }
+  std::filesystem::remove_all(root);
+}
+
+// A GOG sign-in wakes GOG's waiting jobs only: Steam's keep waiting for Steam.
+void GogSignInWakesOnlyGogJobs(const std::filesystem::path& root) {
+  std::filesystem::remove_all(root);
+  Sessions sessions;
+  sessions.present = false;
+  Runner steam(sessions);
+  GogRunner gog;
+  gog.signed_out = true;
+  const auto game = GameId::Gog(1900000001);
+  InstallService service({{Store::kSteam, &steam}, {Store::kGog, &gog}},
+                         {{InstallService::kPrimaryVolumeId, "Console storage", root.string(), true}});
+  service.SetRetryDelays(60s, 60s);
+  service.Install(SteamId(80));
+  service.Install(game);
+  AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) {
+    const auto* steam_job = JobOf(s, SteamId(80));
+    const auto* gog_job = JobOf(s, game);
+    return steam_job && steam_job->failure == "Waiting for the Steam sign-in." && gog_job &&
+           gog_job->state == InstallJobState::kQueued && gog_job->failure == "Downloads paused · Sign in to GOG";
+  });
+  CHECK(gog.installs == 1 && steam.installs == 0);
+  sessions.present = true;  // Steam could go on now, but only its own sign-in says so
+  gog.signed_out = false;
+  service.RetryWaiting(Store::kGog);
+  AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) { return Installed(s, game) && !JobOf(s, game); });
+  std::this_thread::sleep_for(50ms);
+  CHECK(gog.installs == 2 && steam.installs == 0);
+  const auto snapshot = service.Snapshot();
+  const auto* steam_job = JobOf(snapshot, SteamId(80));
+  CHECK(steam_job && steam_job->failure == "Waiting for the Steam sign-in." && !Installed(snapshot, SteamId(80)));
+  std::filesystem::remove_all(root);
+}
+
+// The gog-store line off: no GOG runner. An installed GOG game stays listed with its record, and its registry line
+// survives the registry's next save.
+void GogGameStaysWithoutItsRunner(const std::filesystem::path& root) {
+  std::filesystem::remove_all(root);
+  const auto folder = root / "gog-1900000001";
+  std::filesystem::create_directories(folder);
+  {
+    playden::installs::GogRecord record;
+    record.build_id = "1000000000000000101";
+    record.products = {1900000001};
+    record.language = "en-US";
+    record.meta_id = std::string(32, 'a');
+    std::ofstream(folder / ".playden-install.json")
+        << playden::installs::FormatGogInstallRecord(GameId::Gog(1900000001), 5555, 3, "english", record,
+                                                     {{"bin/Game.exe", "", "", "Synthetic Game"}});
+    std::ofstream(root / ".playden-games") << "gog-1900000001\tinternal\t5555\n";
+  }
+  Sessions sessions;
+  Runner steam(sessions);
+  {
+    InstallService service({{Store::kSteam, &steam}},
+                           {{InstallService::kPrimaryVolumeId, "Console storage", root.string(), true}});
+    const auto snapshot = service.Snapshot();
+    const auto game = std::find_if(snapshot.installed.begin(), snapshot.installed.end(),
+                                   [](const InstalledGame& entry) { return entry.id == GameId::Gog(1900000001); });
+    CHECK(game != snapshot.installed.end() && game->available && game->install_bytes == 5555);
+    CHECK(game->record && game->record->gog && game->record->launches.size() == 1);
+    // A Steam install saves the registry: the GOG line stays.
+    service.Install(SteamId(70));
+    AwaitAt(__LINE__, service, [](const InstallSnapshot& s) { return Installed(s, SteamId(70)) && s.jobs.empty(); });
+    // Without a runner nothing deletes it: an uninstall lists it again with a failure.
+    service.Uninstall(GameId::Gog(1900000001));
+    AwaitAt(__LINE__, service, [](const InstallSnapshot& s) {
+      return Installed(s, GameId::Gog(1900000001)) && s.uninstalling.empty();
+    });
+    const auto failures = service.TakeRemovalFailures();
+    CHECK(failures.size() == 1 && failures[0].id == GameId::Gog(1900000001));
+  }
+  std::ifstream registry(root / ".playden-games");
+  const std::string text{std::istreambuf_iterator<char>(registry), {}};
+  CHECK(text.find("gog-1900000001\tinternal\t5555") != std::string::npos);
+  CHECK(std::filesystem::exists(folder / ".playden-install.json"));
+  std::filesystem::remove_all(root);
+}
+
 // A running job reports its step, so a slow license check can show before the download starts (issue #47).
 void RunningJobReportsItsStep(const std::filesystem::path& root) {
   std::filesystem::remove_all(root);
@@ -771,6 +1022,101 @@ void InstallRecordsParse(const std::filesystem::path& root) {
   CHECK(!ParseInstallRecord("[1]"));
   CHECK(!ParseInstallRecord("{\"install_bytes\":"));
   CHECK(!ParseInstallRecord("{\"depots\":[{\"manifest\":\"5\"}]}"));
+  // A Steam v2 record reads no GOG fields.
+  CHECK(!v2->gog && v2->launches.empty());
+
+  // A GOG record round-trips: its build, products and launches come back as written.
+  using playden::installs::FormatGogInstallRecord;
+  using playden::installs::GogRecord;
+  using playden::installs::RecordedLaunch;
+  GogRecord gog;
+  gog.build_id = "50000000000000002";
+  gog.products = {1900000001ull, 1900000002ull, 18446744073709551615ull};
+  gog.language = "en-US";
+  gog.meta_id = "0123456789abcdef0123456789abcdef";
+  const std::vector<RecordedLaunch> launches = {
+      {"SyntheticLauncher.exe", "", "", "Synthetic Game"},
+      {"bin/game.exe", "-windowed \"a b\"", "bin", "Quoted \"name\" \\ and\ttab"},
+  };
+  const auto gog_text =
+      FormatGogInstallRecord(playden::GameId::Gog(1900000001), 123456789, 42, "english", gog, launches);
+  CHECK(gog_text.rfind("{\"version\":2,\"app_id\":0,\"store\":\"gog\",\"game\":\"1900000001\",\"install_bytes\":123456789,", 0) == 0);
+  const auto gog_read = ParseInstallRecord(gog_text);
+  CHECK(gog_read && gog_read->version == 2 && gog_read->app_id == 0 && gog_read->install_bytes == 123456789);
+  CHECK(gog_read->branch == "public" && gog_read->language == "english" && gog_read->depots.empty());
+  CHECK(!playden::installs::HoldsDlc(*gog_read));
+  CHECK(gog_read->gog && *gog_read->gog == gog && gog_read->launches == launches);
+  // A malformed launch entry is skipped, and the rest of the record still reads.
+  const auto skipped = ParseInstallRecord(
+      "{\"version\":2,\"app_id\":0,\"install_bytes\":9,\"launches\":[{\"executable\":\"a.exe\"},7,"
+      "{\"executable\":\"\"},{\"executable\":\"b.exe\",\"arguments\":3},{\"arguments\":\"x\"},"
+      "{\"executable\":\"c.exe\",\"label\":\"C\"}]}");
+  CHECK(skipped && skipped->install_bytes == 9 &&
+        (skipped->launches == std::vector<RecordedLaunch>{{"a.exe", "", "", ""}, {"c.exe", "", "", "C"}}));
+  // A malformed gog object is left out, never the record.
+  for (const char* bad : {"\"gog\":7", "\"gog\":{\"products\":[\"1\"]}", "\"gog\":{\"build_id\":\"1\",\"products\":[\"01\"]}",
+                          "\"gog\":{\"build_id\":\"1\",\"products\":[\"1\"],\"generation\":3}",
+                          "\"gog\":{\"build_id\":\"1\",\"products\":[\"1\"],\"meta\":\"xyz\"}"}) {
+    const auto read = ParseInstallRecord(std::string("{\"install_bytes\":5,") + bad + "}");
+    CHECK(read && read->install_bytes == 5 && !read->gog);
+  }
+  // A record without DLC turned off has no "excluded" key: byte for byte what earlier builds wrote.
+  CHECK(gog_text.find("excluded") == std::string::npos);
+  CHECK(gog_text.find("\"meta\":\"0123456789abcdef0123456789abcdef\"},\"launches\":[") != std::string::npos);
+  // The DLC turned off round-trip, written sorted and once each, never the base game.
+  {
+    GogRecord off = gog;
+    off.products = {1900000001ull};
+    off.excluded = {1900000003ull, 1900000002ull, 1900000003ull, 1900000001ull};
+    const auto text = FormatGogInstallRecord(playden::GameId::Gog(1900000001), 5, 1, "english", off, {});
+    CHECK(text.find("\"meta\":\"0123456789abcdef0123456789abcdef\",\"excluded\":[\"1900000002\",\"1900000003\"]},") !=
+          std::string::npos);
+    const auto read = ParseInstallRecord(text);
+    CHECK(read && read->gog && (read->gog->excluded == std::vector<std::uint64_t>{1900000002ull, 1900000003ull}));
+    off.excluded = {1900000002ull, 1900000003ull};
+    CHECK(*read->gog == off);
+    // Numbers read too; an empty list reads as none.
+    const auto numbers = ParseInstallRecord(
+        "{\"gog\":{\"build_id\":\"1\",\"products\":[\"5\"],\"excluded\":[7,\"6\",7,5]}}");
+    CHECK(numbers && numbers->gog && (numbers->gog->excluded == std::vector<std::uint64_t>{6, 7}));
+    const auto none = ParseInstallRecord("{\"gog\":{\"build_id\":\"1\",\"products\":[\"5\"],\"excluded\":[]}}");
+    CHECK(none && none->gog && none->gog->excluded.empty());
+  }
+  // A malformed "excluded" leaves the gog object out, never the record; so do more than 1024 entries.
+  for (const char* bad : {"\"excluded\":[\"01\"]", "\"excluded\":[-1]", "\"excluded\":[{}]", "\"excluded\":[\"0\"]",
+                          "\"excluded\":[\"x\"]", "\"excluded\":\"1900000002\"", "\"excluded\":{}"}) {
+    const auto read = ParseInstallRecord(
+        std::string("{\"install_bytes\":5,\"gog\":{\"build_id\":\"1\",\"products\":[\"1\"],") + bad + "}}");
+    CHECK(read && read->install_bytes == 5 && !read->gog);
+  }
+  {
+    std::string many = "{\"install_bytes\":5,\"gog\":{\"build_id\":\"1\",\"products\":[\"1\"],\"excluded\":[";
+    for (int index = 0; index < 1025; ++index)
+      many += std::string(index ? "," : "") + "\"" + std::to_string(index + 2) + "\"";
+    const auto over = ParseInstallRecord(many + "]}}");
+    CHECK(over && over->install_bytes == 5 && !over->gog);
+    many = "{\"install_bytes\":5,\"gog\":{\"build_id\":\"1\",\"products\":[\"1\"],\"excluded\":[";
+    for (int index = 0; index < 1024; ++index)
+      many += std::string(index ? "," : "") + "\"" + std::to_string(index + 2) + "\"";
+    const auto full = ParseInstallRecord(many + "]}}");
+    CHECK(full && full->gog && full->gog->excluded.size() == 1024);
+    // The writer keeps to the cap, so its record always reads.
+    GogRecord capped = gog;
+    for (std::uint64_t id = 2; id < 1200; ++id) capped.excluded.push_back(id);
+    const auto capped_read =
+        ParseInstallRecord(FormatGogInstallRecord(playden::GameId::Gog(1900000001), 5, 1, "english", capped, {}));
+    CHECK(capped_read && capped_read->gog && capped_read->gog->excluded.size() == 1024);
+  }
+  // Launch strings over 4096 bytes are left out, and at most 32 are read.
+  {
+    std::string many = "{\"launches\":[";
+    for (int index = 0; index < 40; ++index) many += std::string(index ? "," : "") + "{\"executable\":\"x.exe\"}";
+    many += ",{\"executable\":\"" + std::string(4097, 'a') + "\"}]}";
+    const auto read = ParseInstallRecord(many);
+    CHECK(read && read->launches.size() == 32);
+    const auto too_long = ParseInstallRecord("{\"launches\":[{\"executable\":\"" + std::string(4097, 'a') + "\"}]}");
+    CHECK(too_long && too_long->launches.empty());
+  }
 
   // Scan reads each installed game's record into the installed view.
   std::filesystem::remove_all(root);
@@ -780,7 +1126,19 @@ void InstallRecordsParse(const std::filesystem::path& root) {
       << "{\"version\":2,\"app_id\":220,\"install_bytes\":10,\"branch\":\"beta\",\"language\":\"german\","
          "\"depots\":[{\"id\":221,\"manifest\":\"5\",\"owner\":220,\"source\":220}]}";
   std::ofstream(root / "230" / ".playden-install.json") << "not json";
-  std::ofstream(root / ".playden-games") << "220\tinternal\t10\n230\tinternal\t20\n";
+  // A GOG record with 32 long launches: install_bytes still sits in the first 4096 bytes.
+  std::vector<RecordedLaunch> long_launches;
+  for (int index = 0; index < 32; ++index)
+    long_launches.push_back({"bin/" + std::string(200, 'p') + std::to_string(index) + ".exe", std::string(3000, 'a'),
+                             "bin", std::string(120, 'l')});
+  const auto long_text =
+      FormatGogInstallRecord(playden::GameId::Gog(1900000001), 987654321, 3, "english", gog, long_launches);
+  CHECK(long_text.size() > 64 * 1024 && long_text.find("\"install_bytes\":987654321,") < 4096 - 32);
+  const auto long_read = ParseInstallRecord(long_text);
+  CHECK(long_read && long_read->launches == long_launches && long_read->gog == gog);
+  std::filesystem::create_directories(root / "gog-1900000001");
+  std::ofstream(root / "gog-1900000001" / ".playden-install.json") << long_text;
+  std::ofstream(root / ".playden-games") << "220\tinternal\t10\n230\tinternal\t20\ngog-1900000001\tinternal\t30\n";
   Sessions sessions;
   Runner runner(sessions);
   InstallService service(runner, root.string());
@@ -795,6 +1153,9 @@ void InstallRecordsParse(const std::filesystem::path& root) {
         (game(SteamId(220))->record->depots == std::vector<RecordedDepot>{{221, 5, 220, 220}}));
   // A record that doesn't read still lists the game (by its bytes, as before), without a record.
   CHECK(game(SteamId(230)) && !game(SteamId(230))->record);
+  const auto* gog_game = game(playden::GameId::Gog(1900000001));
+  CHECK(gog_game && gog_game->install_bytes == 987654321 && gog_game->record && gog_game->record->gog == gog &&
+        gog_game->record->launches.size() == 32);
   // A finished install has its record at once.
   service.Install(SteamId(240));
   AwaitAt(__LINE__, service, [](const InstallSnapshot& s) { return Installed(s, SteamId(240)); });
@@ -802,6 +1163,83 @@ void InstallRecordsParse(const std::filesystem::path& root) {
   CHECK(game(SteamId(240)) && game(SteamId(240))->record && game(SteamId(240))->record->install_bytes == 4096 &&
         game(SteamId(240))->record->language == "english");
   service.Shutdown();
+  std::filesystem::remove_all(root);
+}
+
+// A registry a crash left zero-filled names no game (#907): the log says so, and each game whose PS5 title starts
+// it from its Playden folder comes back with Recover, which saves the registry again.
+void DamagedRegistryRecoversFromTitles(const std::filesystem::path& root) {
+  std::filesystem::remove_all(root);
+  InstalledGameFolder(root / "310");
+  InstalledGameFolder(root / "320");
+  std::filesystem::create_directories(root / "330");  // a download that never finished: no install record
+  InstalledGameFolder(root / "340");
+  Runner::WriteState((root / "340").string(), "replacing");  // an update putting its files in place
+  { std::ofstream(root / ".playden-games") << std::string(512, '\0'); }
+  Sessions sessions;
+  Runner runner(sessions);
+  std::vector<std::string> lines;
+  std::mutex lines_mutex;
+  const auto log = [&](const std::string& line) {
+    std::lock_guard<std::mutex> lock(lines_mutex);
+    lines.push_back(line);
+  };
+  const auto logged = [&](const std::string& text) {
+    std::lock_guard<std::mutex> lock(lines_mutex);
+    return std::any_of(lines.begin(), lines.end(), [&](const std::string& line) { return line == text; });
+  };
+  {
+    InstallService service(runner, root.string());
+    service.SetLog(log);
+    CHECK(logged("registry games=0 skipped=1"));
+    CHECK(service.Snapshot().installed.empty());
+    // 320's title starts it from another folder, 330 has no install record, and an invalid game or an empty
+    // folder names nothing: only 310 is listed, with one registry save.
+    runner.apply_block = true;
+    CHECK(service.Recover({{SteamId(310), (root / "310").string()},
+                           {SteamId(320), (root / "elsewhere" / "320").string()},
+                           {SteamId(330), (root / "330").string()},
+                           {GameId{}, (root / "310").string()},
+                           {SteamId(320), ""}}) == 1);
+    CHECK(logged("registry recovered game=310 volume=internal"));
+    // An update on disk comes back with its game, locked as at a normal start: the game can't run until it ends.
+    CHECK(service.Recover({{SteamId(340), (root / "340").string()}}) == 1);
+    CHECK(logged("registry recovered game=340 volume=internal update=1"));
+    CHECK(service.Locked(SteamId(340)));
+    {
+      const auto recovered = service.Snapshot();
+      const auto* job = JobOf(recovered, SteamId(340));
+      CHECK(Installed(recovered, SteamId(340)) && job && job->kind == InstallJobKind::kUpdate && job->locked);
+    }
+    runner.apply_block = false;
+    AwaitAt(__LINE__, service, [](const InstallSnapshot& s) { return s.jobs.empty(); });
+    auto snapshot = service.Snapshot();
+    CHECK(Installed(snapshot, SteamId(310)) && snapshot.installed.front().install_bytes == 4096 &&
+          snapshot.installed.front().record);
+    CHECK(service.Recover({{SteamId(310), (root / "310").string()}}) == 0);  // already listed
+    CHECK(!Installed(service.Snapshot(), SteamId(320)) && !Installed(service.Snapshot(), SteamId(330)));
+    service.Shutdown();
+  }
+  {
+    std::lock_guard<std::mutex> lock(lines_mutex);
+    lines.clear();
+  }
+  {
+    // Saved: the next start lists it from the registry.
+    InstallService service(runner, root.string());
+    service.SetLog(log);
+    CHECK(logged("registry games=2 skipped=0"));
+    CHECK(Installed(service.Snapshot(), SteamId(310)) && Installed(service.Snapshot(), SteamId(340)) &&
+          !Installed(service.Snapshot(), SteamId(320)));
+    service.Shutdown();
+  }
+  std::filesystem::remove(root / ".playden-games");
+  {
+    InstallService service(runner, root.string());
+    service.SetLog(log);
+    CHECK(logged("registry missing"));
+    service.Shutdown();
+  }
   std::filesystem::remove_all(root);
 }
 
@@ -829,12 +1267,12 @@ void InstallOptionsReachTheRunner(const std::filesystem::path& root) {
     // Values the registry can't hold are dropped: the defaults apply.
     service.Install(SteamId(903), std::nullopt, {}, {"bad value", "a\tb"});
     // DLC turned off, kept sorted; hundreds of them still fit a registry line.
-    service.Install(SteamId(906), std::nullopt, {}, {{}, {}, {30, 10, 20, 10, 0}});
+    service.Install(SteamId(906), std::nullopt, {}, {{}, {}, SteamIds({30, 10, 20, 10, 0})});
     // What the job was asked with, which its drive reserves, also comes back.
     service.Install(SteamId(909), 4096);
     service.Pause(SteamId(909));
-    std::vector<std::uint32_t> many;
-    for (std::uint32_t dlc = 0; dlc < 900; ++dlc) many.push_back(4000000000u + dlc);
+    std::vector<GameId> many;
+    for (std::uint32_t dlc = 0; dlc < 900; ++dlc) many.push_back(SteamId(4000000000u + dlc));
     service.Install(SteamId(907), std::nullopt, {}, {{}, {}, many});
   }
   {
@@ -864,9 +1302,9 @@ void InstallOptionsReachTheRunner(const std::filesystem::path& root) {
     return Installed(s, SteamId(900)) && Installed(s, SteamId(901)) && Installed(s, SteamId(903)) && Installed(s, SteamId(905)) &&
            Installed(s, SteamId(906)) && Installed(s, SteamId(907)) && Installed(s, SteamId(908));
   });
-  CHECK(options_at(root / "906") == (InstallOptions{{}, {}, {10, 20, 30}}));
+  CHECK(options_at(root / "906") == (InstallOptions{{}, {}, SteamIds({10, 20, 30})}));
   CHECK(options_at(root / "907") && options_at(root / "907")->excluded_dlc.size() == 900);
-  CHECK(options_at(root / "908") == (InstallOptions{{}, {}, {7, 9}}));
+  CHECK(options_at(root / "908") == (InstallOptions{{}, {}, SteamIds({7, 9})}));
   CHECK(options_at(root / "900") == (InstallOptions{"german", "beta"}));
   CHECK(options_at(root / "901") == InstallOptions{});
   CHECK(options_at(root / "903") == InstallOptions{});
@@ -1012,6 +1450,172 @@ void UpdatesAnInstalledGame(const std::filesystem::path& root) {
   CHECK(!std::filesystem::exists(root / "700") && RegistryLine(root, "700").empty());
   runner.block = false;
   again.Shutdown();
+  std::filesystem::remove_all(root);
+}
+
+// Manage DLC: an update with the whole DLC choice. Turning every DLC on leaves nothing out, so only the flag says the
+// choice replaces the record's; it reaches the runner with the record's branch and language, and a change Playden stopped
+// keeps it across a restart, also with nothing left out.
+void DlcChangeKeepsItsChoice(const std::filesystem::path& root) {
+  std::filesystem::remove_all(root);
+  Sessions sessions;
+  Runner runner(sessions);
+  const auto game = SteamId(710);
+  {
+    InstallService service(runner, root.string());
+    service.Install(game);
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) { return Installed(s, game) && !JobOf(s, game); });
+  }
+  std::ofstream(root / "710" / ".playden-install.json")
+      << "{\"version\":2,\"install_bytes\":4096,\"branch\":\"public\",\"language\":\"german\",\"excluded_dlc\":[711,712]}";
+  runner.block = true;
+  {
+    InstallService service(runner, root.string());
+    InstallOptions all_on;
+    all_on.dlc_choice = true;
+    CHECK(service.Update(game, all_on, 2048).empty());
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot&) { return runner.updates == 1; });
+    {
+      std::lock_guard<std::mutex> lock(runner.mutex);
+      CHECK(runner.update_options.back() == (InstallOptions{"german", "public", {}, true}));
+    }
+    const auto running = service.Snapshot();
+    const auto* job = JobOf(running, game);
+    CHECK(job && job->dlc_change && job->estimated_bytes == std::optional<std::uint64_t>(2048));
+    CHECK(RegistryLine(root, "710") == "710\tinternal\t4096\tupdate\tlang=german\tbranch=public\tdlcset\test=2048");
+    // Playden closes while it downloads: the change waits in the registry.
+  }
+  {
+    InstallService again(runner, root.string());
+    AwaitAt(__LINE__, again, [&](const InstallSnapshot&) { return runner.updates == 2; });
+    const auto restored = again.Snapshot();
+    const auto* job = JobOf(restored, game);
+    CHECK(job && job->kind == InstallJobKind::kUpdate && job->dlc_change);
+    {
+      std::lock_guard<std::mutex> lock(runner.mutex);
+      CHECK(runner.update_options.back() == (InstallOptions{"german", "public", {}, true}));
+    }
+    runner.block = false;
+    AwaitAt(__LINE__, again, [&](const InstallSnapshot& s) { return !JobOf(s, game); });
+    // Completed lists it as an update, whatever it downloaded (a change that only removes DLC downloads nothing).
+    const auto done = again.Snapshot();
+    const auto finished = std::find_if(done.completed.begin(), done.completed.end(),
+                                       [&](const playden::installs::CompletedDownload& entry) { return entry.id == game; });
+    CHECK(finished != done.completed.end() && finished->updated);
+    // A plain update is no DLC change: the runner keeps the record's DLC left out.
+    CHECK(again.Update(game).empty());
+    AwaitAt(__LINE__, again, [&](const InstallSnapshot& s) { return !JobOf(s, game) && runner.updates == 3; });
+    std::lock_guard<std::mutex> lock(runner.mutex);
+    CHECK(!runner.update_options.back().dlc_choice);
+  }
+  // A Steam game's DLC are its app IDs in the registry, as before they were named by game ID.
+  runner.block = true;
+  {
+    InstallService service(runner, root.string());
+    InstallOptions some_off;
+    some_off.excluded_dlc = SteamIds({712, 711, 712});
+    some_off.dlc_choice = true;
+    CHECK(service.Update(game, some_off).empty());
+    // Awaited by what it was asked with: the runner counts an update before it records the options.
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot&) {
+      std::lock_guard<std::mutex> lock(runner.mutex);
+      return runner.update_options.size() == 4;
+    });
+    // The runner's last update wrote the record this one starts from.
+    CHECK(RegistryLine(root, "710") == "710\tinternal\t8192\tupdate\tlang=english\tbranch=beta\tnodlc=711,712\tdlcset");
+    std::lock_guard<std::mutex> lock(runner.mutex);
+    CHECK(runner.update_options.back().excluded_dlc == SteamIds({711, 712}));
+  }
+  runner.block = false;
+
+  // A GOG game's DLC are GOG keys. Only the game's own store's DLC stay, other than the game itself.
+  const auto gog_game = GameId::Gog(1900000001);
+  const std::vector<InstallVolume> volumes{{InstallService::kPrimaryVolumeId, "Console storage", root.string(), true}};
+  const auto gog_options = [](GogRunner& gog) {
+    std::lock_guard<std::mutex> lock(gog.mutex);
+    return gog.update_options.empty() ? InstallOptions{} : gog.update_options.back();
+  };
+  const auto gog_line = [&root] { return RegistryLine(root, "gog-1900000001"); };
+  // The runner counts an update before it records the options: they are what is awaited.
+  const auto gog_asked = [](GogRunner& gog) {
+    std::lock_guard<std::mutex> lock(gog.mutex);
+    return gog.update_options.size() == 1;
+  };
+  std::filesystem::remove_all(root);
+  WriteInstalledGog(root, "english");
+  {
+    GogRunner gog;
+    gog.block = true;
+    InstallService service({{Store::kGog, &gog}}, volumes);
+    InstallOptions mixed;
+    mixed.excluded_dlc = {GameId::Steam(711), gog_game, GameId::Gog(1900000003), GameId{}};
+    mixed.dlc_choice = true;
+    CHECK(service.Update(gog_game, mixed).empty());
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot&) { return gog_asked(gog); });
+    CHECK(gog_options(gog).excluded_dlc == std::vector<GameId>{GameId::Gog(1900000003)});
+    CHECK(gog_line().find("\tnodlc=gog-1900000003\tdlcset") != std::string::npos);
+  }
+  // A DLC change keeps its GOG keys across a restart, up to the largest product ID.
+  std::filesystem::remove_all(root);
+  WriteInstalledGog(root, "english");
+  const std::vector<GameId> two{GameId::Gog(1900000002), GameId::Gog(18446744073709551615ull)};
+  {
+    GogRunner gog;
+    gog.block = true;
+    InstallService service({{Store::kGog, &gog}}, volumes);
+    InstallOptions choice;
+    choice.excluded_dlc = {two[1], two[0]};
+    choice.dlc_choice = true;
+    CHECK(service.Update(gog_game, choice).empty());
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot&) { return gog_asked(gog); });
+    CHECK(gog_line().find("\tnodlc=gog-1900000002,gog-18446744073709551615\tdlcset") != std::string::npos);
+  }
+  {
+    GogRunner gog;
+    gog.block = true;
+    InstallService again({{Store::kGog, &gog}}, volumes);
+    AwaitAt(__LINE__, again, [&](const InstallSnapshot&) { return gog_asked(gog); });
+    const auto restored = gog_options(gog);
+    CHECK(restored.excluded_dlc == two && restored.dlc_choice);
+  }
+  // A line written by hand: an entry that isn't a key is skipped, and the line and its other entries stay.
+  std::filesystem::remove_all(root);
+  WriteInstalledGog(root, "english");
+  std::ofstream(root / ".playden-games") << "gog-1900000001\tinternal\t5555\tupdate\tnodlc=gog-01,abc,gog-5,711\tdlcset\n";
+  {
+    GogRunner gog;
+    gog.block = true;
+    InstallService service({{Store::kGog, &gog}}, volumes);
+    CHECK(Installed(service.Snapshot(), gog_game));
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot&) { return gog_asked(gog); });
+    const auto restored = gog_options(gog);
+    CHECK(restored.excluded_dlc == std::vector<GameId>{GameId::Gog(5)} && restored.dlc_choice);
+  }
+  // As many GOG DLC as the registry keeps, each with the longest key, fit its line.
+  std::filesystem::remove_all(root);
+  WriteInstalledGog(root, "english");
+  std::vector<GameId> most;
+  for (std::uint64_t dlc = 0; dlc < 1000; ++dlc) most.push_back(GameId::Gog(18446744073709551615ull - dlc));
+  std::sort(most.begin(), most.end());
+  {
+    GogRunner gog;
+    gog.block = true;
+    InstallService service({{Store::kGog, &gog}}, volumes);
+    InstallOptions choice;
+    choice.excluded_dlc = most;
+    choice.dlc_choice = true;
+    CHECK(service.Update(gog_game, choice).empty());
+    AwaitAt(__LINE__, service, [&](const InstallSnapshot&) { return gog_asked(gog); });
+    CHECK(gog_line().size() > 24 * 1024);
+  }
+  {
+    GogRunner gog;
+    gog.block = true;
+    InstallService again({{Store::kGog, &gog}}, volumes);
+    CHECK(Installed(again.Snapshot(), gog_game));
+    AwaitAt(__LINE__, again, [&](const InstallSnapshot&) { return gog_asked(gog); });
+    CHECK(gog_options(gog).excluded_dlc == most);
+  }
   std::filesystem::remove_all(root);
 }
 
@@ -1265,11 +1869,14 @@ void UsbDrivesChangePlaces(const std::filesystem::path& base) {
 }
 
 int main() {
+  DamagedRegistryRecoversFromTitles(std::filesystem::temp_directory_path() /
+                                    ("playden-registry-recover-" + std::to_string(::getpid())));
   UsbDrivesChangePlaces(std::filesystem::temp_directory_path() / ("playden-usb-swap-" + std::to_string(::getpid())));
   UpdateWaitsLongerWhenTheConsoleDoesNotSay(std::filesystem::temp_directory_path() /
                                             ("playden-update-unknown-" + std::to_string(::getpid())));
   UpdateWaitsForTheGameToClose(std::filesystem::temp_directory_path() / ("playden-update-wait-" + std::to_string(::getpid())));
   UpdatesAnInstalledGame(std::filesystem::temp_directory_path() / ("playden-update-service-" + std::to_string(::getpid())));
+  DlcChangeKeepsItsChoice(std::filesystem::temp_directory_path() / ("playden-dlc-change-service-" + std::to_string(::getpid())));
   ScanFindsUpdatesFirst(std::filesystem::temp_directory_path() / ("playden-update-scan-" + std::to_string(::getpid())));
   InstallRecordsParse(std::filesystem::temp_directory_path() / ("playden-record-service-" + std::to_string(::getpid())));
   InstallOptionsReachTheRunner(std::filesystem::temp_directory_path() / ("playden-options-service-" + std::to_string(::getpid())));
@@ -1283,6 +1890,11 @@ int main() {
   WaitingJobsDontBlockTheQueue(std::filesystem::temp_directory_path() / ("playden-waiting-service-" + std::to_string(::getpid())));
   LateCancelKeepsTheInstall(std::filesystem::temp_directory_path() / ("playden-late-cancel-service-" + std::to_string(::getpid())));
   SignInEndsSteamWait(std::filesystem::temp_directory_path() / ("playden-signin-wait-service-" + std::to_string(::getpid())));
+  GogJobSurvivesARestart(std::filesystem::temp_directory_path() / ("playden-gog-restart-service-" + std::to_string(::getpid())));
+  GogSignInWakesOnlyGogJobs(std::filesystem::temp_directory_path() / ("playden-gog-wait-service-" + std::to_string(::getpid())));
+  GogGameStaysWithoutItsRunner(std::filesystem::temp_directory_path() / ("playden-gog-no-runner-service-" + std::to_string(::getpid())));
+  GogUpdateUsesTheRecordLanguage(std::filesystem::temp_directory_path() / ("playden-gog-update-service-" + std::to_string(::getpid())));
+  GogUpdateAtReplacingRestoresLocked(std::filesystem::temp_directory_path() / ("playden-gog-locked-service-" + std::to_string(::getpid())));
   CompletedDownloadsList(std::filesystem::temp_directory_path() / ("playden-completed-service-" + std::to_string(::getpid())));
   const auto requests = ParseInstallRequests("uninstall 439490\n439490\ncancel 108600\n108600\n");
   CHECK(requests.size() == 4);
@@ -1327,6 +1939,16 @@ int main() {
     CHECK(ParseInstallRequests("cancel local-" + uuid + "\nlocal-XYZ\nlocal-" + uuid + " extra\n"
                                "import usb0 Delores\nimport usb0 Delores a.exe b.exe\nimport usb0 \"Delores a.exe\n"
                                "import usb0 \"\" a.exe\nimport usb0 \"Del\"ores a.exe\nimport\n").empty());
+  }
+  {
+    // GOG games by their key: install, uninstall and cancel; the product ID is strict decimal.
+    const auto gog = ParseInstallRequests("gog-1207658924\nuninstall gog-1207658924\ncancel gog-1207658924\n");
+    CHECK(gog.size() == 3);
+    CHECK(gog[0].action == InstallRequest::Action::kInstall && gog[0].game == playden::GameId::Gog(1207658924) &&
+          gog[0].app == 0);
+    CHECK(gog[1].action == InstallRequest::Action::kUninstall && gog[1].game == playden::GameId::Gog(1207658924));
+    CHECK(gog[2].action == InstallRequest::Action::kCancel && gog[2].game == playden::GameId::Gog(1207658924));
+    CHECK(ParseInstallRequests("gog-\ngog-0\ngog-012\ngog-12x\ngog--1\ngog-99999999999999999999\ngog-12 extra\n").empty());
   }
   std::string many_requests;
   for (int app = 1; app <= 70; ++app) many_requests += std::to_string(app) + "\n";

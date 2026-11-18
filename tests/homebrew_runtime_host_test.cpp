@@ -1,18 +1,23 @@
 #include "homebrew/runtime_host.hpp"
+#include "gog/dependencies.h"
 #include "installs/install_record.h"
 #include "runtime_host_fixture.h"
 #include "msi_fixture.h"
+#include "stored_zip.h"
+#include "runtime/steam_client_install.h"
 #include "platform/managed_directory.h"
 #include "platform/ps5/title_allow_list.h"
 #include "platform/storage.h"
 #include "runtime/layout_migration.h"
 #include "runtime/artifact_hash.h"
+#include "runtime/steam_host.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -234,7 +239,8 @@ void NoKitRefusesPreparationWithoutDurableEffects() {
   CHECK(!started.kit_available && started.kit_reason == "No verified runtime kit is installed.");
   CHECK(started.installs.empty());
   struct stat info{};
-  CHECK(stat((fixture.root / "data/runtime-state").c_str(), &info) == 0 && (info.st_mode & 0777) == 0700);
+  // Open, so the console owner can delete it over FTP (#868).
+  CHECK(stat((fixture.root / "data/runtime-state").c_str(), &info) == 0 && (info.st_mode & 0777) == 0777);
   host.Prepare(Hl2());
   const auto refused = WaitFor(host, [](const RuntimeSnapshot& s) { return s.refusals.count(220) != 0; });
   CHECK(refused.refusals.at(220) == "No verified runtime kit is installed.");
@@ -383,7 +389,7 @@ void PrepareNextReordersWaitingPreparations() {
   host.Prepare(Game(20));
   {
     std::unique_lock<std::mutex> lock(gate_mutex);
-    CHECK(gate_changed.wait_for(lock, std::chrono::seconds(5), [&] { return blocked; }));
+    CHECK(gate_changed.wait_for(lock, std::chrono::seconds(30), [&] { return blocked; }));
   }
   CHECK((host.Snapshot().queued_prepares == std::vector<std::uint32_t>{10, 20, 30, 40}));
   CHECK(host.PrepareNext(30));
@@ -402,6 +408,48 @@ void PrepareNextReordersWaitingPreparations() {
   CHECK(done.queued_prepares.empty() && !done.preparing_app);
   CHECK((log.Order() == std::vector<std::uint32_t>{30, 10, 40}));
   CHECK(!host.PrepareNext(30));  // handled: no longer queued
+  host.Shutdown();
+}
+
+// Pause all in Queue (#880): no waiting preparation starts, the waiting ones keep their order, a game asked for
+// meanwhile joins the end, and resuming runs them in that order. A quit's hold ending doesn't resume a paused queue.
+// (A pause never stops the preparation running: the worker only checks it before taking the next request.)
+void PausedPreparationsWaitInOrder() {
+  Fixture fixture;
+  auto config = fixture.Config();
+  PrepareLog log;
+  log.Attach(config);
+  RuntimeHost host(std::move(config));
+  CHECK(host.Start());
+  CHECK(WaitFor(host, Started).status == RuntimeHostStatus::kReady);
+  host.Prepare(Game(10));
+  WaitFor(host, [](const RuntimeSnapshot& s) { return s.prepares_handled == 1 && !s.preparing_app; });
+  host.PausePreparations(true);
+  host.Prepare(Game(20));
+  host.Prepare(Game(30));
+  usleep(200000);
+  auto paused = host.Snapshot();
+  CHECK(paused.prepares_handled == 1 && !paused.preparing_app);
+  CHECK((paused.queued_prepares == std::vector<std::uint32_t>{20, 30}));
+  // Prepare next and a withdrawal still work on a paused queue.
+  host.Prepare(Game(40));
+  CHECK(host.PrepareNext(30));
+  CHECK(host.WithdrawPrepare(40));
+  // A quit's hold that comes and goes leaves the pause in place.
+  host.HoldPreparations(true);
+  host.HoldPreparations(false);
+  usleep(200000);
+  paused = host.Snapshot();
+  CHECK(paused.prepares_handled == 1 && (paused.queued_prepares == std::vector<std::uint32_t>{30, 20}));
+  // Resuming under a quit's hold still waits for the hold.
+  host.HoldPreparations(true);
+  host.PausePreparations(false);
+  usleep(200000);
+  CHECK(host.Snapshot().prepares_handled == 1);
+  host.HoldPreparations(false);
+  const auto done = WaitFor(host, [](const RuntimeSnapshot& s) { return s.prepares_handled == 3; });
+  CHECK(done.queued_prepares.empty() && !done.preparing_app);
+  CHECK((log.Order() == std::vector<std::uint32_t>{10, 30, 20}));
   host.Shutdown();
 }
 
@@ -429,7 +477,7 @@ void StartupReportsJournalsWithoutResuming() {
   auto config = fixture.Config();
   fs::create_directories(config.state_root); CHECK(chmod(config.state_root.c_str(), 0700) == 0);
   {
-    playden::Storage storage(config.state_root.string());
+    auto storage = playden::Storage(config.state_root.string()).OpenTree();
     RuntimeInstallRepository repository(storage, "installs.json", [](const std::string&) {
       return NativeTitleAvailability{TitleAvailability::kFree, TitleAvailability::kFree};
     });
@@ -474,7 +522,7 @@ void LocalGameGetsRuntimeNumber() {
   // A Local game with a record from an earlier run: its view carries the game.
   fs::create_directories(config.state_root); CHECK(chmod(config.state_root.c_str(), 0700) == 0);
   {
-    playden::Storage storage(config.state_root.string());
+    auto storage = playden::Storage(config.state_root.string()).OpenTree();
     RuntimeInstallRepository repository(storage, "installs.json", [](const std::string&) {
       return NativeTitleAvailability{TitleAvailability::kFree, TitleAvailability::kFree};
     });
@@ -533,11 +581,22 @@ void LocalGameGetsRuntimeNumber() {
   CHECK(!host.RuntimeNumberFor(playden::GameId::Local("9a1d1f2e-0000-4000-8000-000000000001")));
 }
 
-// A public or foreign state root is refused rather than taken over.
+// A state root of the app user's at any mode is Playden's own (#868); a link in its place is refused
+// rather than followed.
 void PublicStateRootIsUnavailable() {
   Fixture fixture;
   auto config = fixture.Config();
-  fs::create_directories(config.state_root); CHECK(chmod(config.state_root.c_str(), 0755) == 0);
+  {
+    fs::create_directories(config.state_root); CHECK(chmod(config.state_root.c_str(), 0755) == 0);
+    RuntimeHost host(config);
+    CHECK(host.Start());
+    CHECK(WaitFor(host, Started).status == RuntimeHostStatus::kReady);
+    host.Shutdown();
+  }
+  fs::remove_all(config.state_root);
+  fs::create_directories(fixture.root / "elsewhere");
+  CHECK(chmod((fixture.root / "elsewhere").c_str(), 0755) == 0);
+  fs::create_directory_symlink(fixture.root / "elsewhere", config.state_root);
   RuntimeHost host(config);
   CHECK(host.Start());
   const auto started = WaitFor(host, Started);
@@ -547,7 +606,9 @@ void PublicStateRootIsUnavailable() {
   CHECK(refused.refusals.at(220) == started.reason);
   host.Shutdown();
   struct stat info{};
-  CHECK(stat(config.state_root.c_str(), &info) == 0 && (info.st_mode & 0777) == 0755);
+  CHECK(lstat(config.state_root.c_str(), &info) == 0 && S_ISLNK(info.st_mode));
+  CHECK(stat((fixture.root / "elsewhere").c_str(), &info) == 0 && (info.st_mode & 0777) == 0755 &&
+        fs::is_empty(fixture.root / "elsewhere"));
 }
 
 // ShadowMountPlus registers a submitted title only once no title runs (Playden
@@ -672,10 +733,10 @@ void PreparesExistingDownloadToReady() {
   CHECK(stat(game.c_str(), &game_info) == 0 && (game_info.st_mode & 07777) == 0777);
   const auto metadata = Read(fixture.root / "data/playden/games/steam-220/library/profiles/.playden-publication");
   CHECK(metadata.find("schema=3\n") != std::string::npos && metadata.find("game_root.unowned=1\n") != std::string::npos);
-  // The staged title is readable by ShadowMount but not writable by others.
+  // The staged title is readable by ShadowMount and open to FTP (#868).
   struct stat title_info{};
   for (const auto* relative : {"data/homebrew/FAKE78001", "data/homebrew/FAKE78001/sce_sys"})
-    CHECK(stat((fixture.root / relative).c_str(), &title_info) == 0 && (title_info.st_mode & 07777) == 0755);
+    CHECK(stat((fixture.root / relative).c_str(), &title_info) == 0 && (title_info.st_mode & 07777) == 0777);
   // The PS5 title shows the game's own name and icon, not the kit's.
   const auto param = Read(fixture.root / "data/homebrew/FAKE78001/sce_sys/param.json");
   CHECK(param.find(R"("titleName": "Half-Life \"2\"")") != std::string::npos);
@@ -852,8 +913,8 @@ void TitleRefusalNamesTheSourceThatCannotAnswer() {
   }
 }
 
-// A capture refused after control setup (the console's world-writable game
-// folder) leaves a settings-control journal. An explicit Prepare resumes the
+// A capture refused after control setup (a PS5 title folder of an unexpected
+// mode) leaves a settings-control journal. An explicit Prepare resumes the
 // saved request and reaches Ready with one registration.
 void ResumesInterruptedCaptureFromSavedRequest(bool tamper_backup = false) {
   Fixture fixture;
@@ -872,10 +933,10 @@ void ResumesInterruptedCaptureFromSavedRequest(bool tamper_backup = false) {
   const auto game = fixture.root / "data/homebrew/FAKE77031/games/220";
   const auto staged = fixture.root / "data/homebrew/FAKE78001";
   unsigned uuids = 0;
-  // Called just before capture: the first attempt sees a world-writable PS5 title folder,
-  // which the capture's preflight refuses (game folders may be anything).
+  // Called just before capture: the first attempt sees a PS5 title folder of a mode Playden never
+  // gives it (group-writable), which the capture's preflight refuses (game folders may be anything).
   config.uuid = [&uuids, staged]() -> std::optional<std::string> {
-    if (++uuids == 1) CHECK(chmod(staged.c_str(), 0777) == 0);
+    if (++uuids == 1) CHECK(chmod(staged.c_str(), 0775) == 0);
     return std::string("00000000-0000-4000-8000-00000000000") + std::to_string(uuids);
   };
   config.unix_time = [] { return std::int64_t{1760000000}; };
@@ -887,7 +948,7 @@ void ResumesInterruptedCaptureFromSavedRequest(bool tamper_backup = false) {
   const auto failed = WaitFor(host, [](const RuntimeSnapshot& s) { return !s.preparing_app && s.refusals.count(220); }, 60);
   CHECK(failed.installs.size() == 1 && failed.installs[0].state != PreparationState::kReady);
   CHECK(failed.installs[0].recovery_pending);
-  CHECK(chmod(staged.c_str(), 0755) == 0);
+  CHECK(chmod(staged.c_str(), 0777) == 0);
   // The saved request the journal names is in use: never leftover, never removed.
   CHECK(failed.leftover_requests == 0);
   host.CleanUpRequests();
@@ -1530,6 +1591,143 @@ void ReplacedKitAsksForRestart() {
   CHECK(held.refusals.at(220).find("changed while Playden was running") != std::string::npos);
 }
 
+// Finish setup quits to Home, where the game waiting for the PS5 starts for the first time with nothing of Playden
+// running. A game set to Online gets the Steam session there, as Play would hand it, but only with the settings its
+// title published: newer ones reach it at Playden's next start. A game not set to Online, and a game that is not
+// waiting for the PS5, are left alone.
+void FinishSetupHandsOverForHome() {
+  Fixture fixture;
+  fixture.registers = false;
+  auto config = fixture.Config();
+  config.host_namespace_prefix = fixture.root;
+  config.package_paths.console_data_root = "/data";
+  config.package_paths.host_data_root = fixture.root / "data";
+  config.package_operations.hash_file = HashArtifactFile;
+  config.package_operations.hash_bytes = HashArtifactBytes;
+  config.package_operations.free_space_unverifiable = true;
+  config.package_operations.validate_bottle = [](const fs::path& bottle) {
+    return fs::is_regular_file(bottle / "system.reg") && fs::is_regular_file(bottle / "user.reg");
+  };
+  auto kit = SyntheticKit(fixture.root / "kit");
+  kit.capabilities.push_back(kKitHelperProcess);
+  std::sort(kit.capabilities.begin(), kit.capabilities.end());
+  config.admit_kit = [&kit](std::string*) { return std::optional<RuntimeKit>(kit); };
+  unsigned uuids = 0;
+  config.uuid = [&uuids]() -> std::optional<std::string> {
+    ++uuids; return std::string("00000000-0000-4000-8000-00000000000") + std::to_string(uuids);
+  };
+  config.unix_time = [] { return std::int64_t{1760000000}; };
+  config.session_data_root = fixture.root / "data";
+  std::mutex log_mutex;
+  std::vector<std::string> lines;
+  config.log = [&](const std::string& line) { std::lock_guard<std::mutex> lock(log_mutex); lines.push_back(line); };
+  const auto logged = [&](const std::string& prefix) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    return std::any_of(lines.begin(), lines.end(), [&](const std::string& line) { return line.rfind(prefix, 0) == 0; });
+  };
+  // Valve's client, downloaded by the preparation of a game set to Online.
+  const std::string client_dll = "MZ valve steamclient64";
+  const auto client_zip = playden::test::StoredZip({{"steamclient64.dll", client_dll}});
+  const std::string client_manifest = "\"win64\"\n{\n\t\"version\"\t\"1792618285\"\n\t\"bins_win64\"\n\t{\n\t\t\"file\"\t\"bins_win64.zip.t\"\n"
+                                      "\t\t\"size\"\t\"" + std::to_string(client_zip.size()) + "\"\n\t\t\"sha2\"\t\"" +
+                                      *HashArtifactBytes(client_zip) + "\"\n\t}\n}\n";
+  config.fetch_text = [&](const std::string&, std::size_t, const std::atomic<bool>&, std::string*) -> std::optional<std::string> {
+    return client_manifest;
+  };
+  config.fetch_range = [&](const std::string&, std::uint64_t offset, std::uint64_t length, const std::atomic<bool>&,
+                           std::string*) -> std::optional<std::string> { return client_zip.substr(offset, length); };
+  std::mutex settings_mutex;
+  // Half-Life 2's recipe keeps its own Steam library; the player changed it anyway.
+  const std::map<std::string, std::string> online = {{"steam_features", "online"}, {"unlock.steam_features", "1"}};
+  const std::map<std::string, std::string> offline = {{"steam_features", "game"}};
+  GameSettingsRecord saved;
+  saved.overrides = online;
+  config.settings_record = [&](const playden::GameId&) -> std::optional<GameSettingsRecord> {
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    return saved;
+  };
+  config.online_session = []() -> std::optional<OnlineSession> {
+    OnlineSession session;
+    session.steam_id = 76561198000000001ull;
+    session.account_name = "player";
+    session.refresh_token = "eyJ.token";
+    session.login_id = 5;
+    return session;
+  };
+  Write(fixture.root / "data/homebrew/FAKE77031/games/220/hl2.exe", "existing-game", 0644);
+  RuntimeHost host(config);
+  host.SetSteamAccount("player", 76561198000000001ull);
+  CHECK(host.Start());
+  CHECK(WaitFor(host, Started).kit_available);
+  host.Prepare(Hl2());
+  const auto waiting = WaitFor(host, [](const RuntimeSnapshot& s) {
+    return !s.preparing_app && !s.installs.empty() && (s.refusals.count(220) || s.installs[0].awaiting_registration);
+  }, 60);
+  if (waiting.refusals.count(220)) std::fprintf(stderr, "Prepare refused: %s\n", waiting.refusals.at(220).c_str());
+  CHECK(!waiting.refusals.count(220) && waiting.installs[0].awaiting_registration);
+  const auto handoff = fixture.root / "data/playden/games/steam-220/library/prefixes/game/drive_c/playden/online-session.txt";
+  // At each Play: the preparation hands nothing over, so a start from Home would run without Steam.
+  CHECK(!fs::exists(handoff));
+
+  // Finish setup: the session, as Play writes it, for this start only.
+  CHECK(host.HandOverForHome(220, std::chrono::seconds(30)));
+  CHECK(logged("home handoff app=220 handed over"));
+  const auto text = Read(handoff);
+  CHECK(text.find("app_id=220\n") != std::string::npos && text.find("\nkeep=1\n") == std::string::npos);
+  CHECK(text.find("eyJ.token") != std::string::npos);
+  // Settings › Accounts › Steam sign-in notice is on unless the saved choice says otherwise: the host names the
+  // account as the game starts.
+  CHECK(text.find("\nnotice=1\n") != std::string::npos);
+  CHECK(fs::remove(handoff));
+  host.SetSteamOnlineNotice(false);
+  CHECK(host.HandOverForHome(220, std::chrono::seconds(30)));
+  CHECK(Read(handoff).find("notice=") == std::string::npos);
+  host.SetSteamOnlineNotice(true);
+
+  // Settings saved after the title was published don't reach it before Playden starts again: no session for a title
+  // that may still be Offline.
+  CHECK(fs::remove(handoff));
+  {
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    saved.revision = 1;
+  }
+  CHECK(host.HandOverForHome(220, std::chrono::seconds(30)));
+  CHECK(logged("home handoff app=220 skipped: the title has older settings (revision 0, saved 1)"));
+  CHECK(!fs::exists(handoff));
+
+  // A game not set to Online is left as it was.
+  {
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    saved.revision = 0;
+    saved.overrides = offline;
+  }
+  const auto before = [&] { std::lock_guard<std::mutex> lock(log_mutex); return lines.size(); }();
+  CHECK(host.HandOverForHome(220, std::chrono::seconds(30)));
+  CHECK(!fs::exists(handoff));
+  {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    CHECK(std::none_of(lines.begin() + static_cast<std::ptrdiff_t>(before), lines.end(),
+                       [](const std::string& line) { return line.rfind("home handoff", 0) == 0; }));
+  }
+
+  // Registered once Playden quit: Ready, and Play hands the session over from now on.
+  {
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    saved.overrides = online;
+  }
+  fixture.registered = true;
+  host.Prepare(Hl2());
+  const auto ready = WaitFor(host, [](const RuntimeSnapshot& s) {
+    return !s.preparing_app && (s.refusals.count(220) ||
+        (!s.installs.empty() && s.installs[0].state == PreparationState::kReady));
+  }, 30);
+  CHECK(!ready.refusals.count(220) && ready.installs[0].state == PreparationState::kReady);
+  CHECK(host.HandOverForHome(220, std::chrono::seconds(30)));
+  CHECK(logged("home handoff app=220 skipped: not waiting for the PS5"));
+  CHECK(!fs::exists(handoff));
+  host.Shutdown();
+}
+
 void PreparesGameWithoutShippedRecipe() {
   Fixture fixture;
   auto config = fixture.Config();
@@ -1542,7 +1740,12 @@ void PreparesGameWithoutShippedRecipe() {
   config.package_operations.validate_bottle = [](const fs::path& bottle) {
     return fs::is_regular_file(bottle / "system.reg") && fs::is_regular_file(bottle / "user.reg");
   };
-  const auto kit = SyntheticKit(fixture.root / "kit");
+  // A kit whose title runs Steam beside the game (helper-process), for the Online cases below. It can turn the network
+  // adapters off (nsiproxy-switch), which the handoff passes on.
+  auto kit = SyntheticKit(fixture.root / "kit");
+  kit.capabilities.push_back(kKitHelperProcess);
+  kit.capabilities.push_back(kKitNsiproxySwitch);
+  std::sort(kit.capabilities.begin(), kit.capabilities.end());
   config.admit_kit = [&kit](std::string*) { return std::optional<RuntimeKit>(kit); };
   unsigned uuids = 0;
   config.uuid = [&uuids]() -> std::optional<std::string> {
@@ -1562,8 +1765,24 @@ void PreparesGameWithoutShippedRecipe() {
     launches.emplace_back(title, arguments);
     return TitleResult{true, 0, "launch"};
   };
+  // Copied after the start is published (CopyTitleLogs): read under the lock, waiting for the copy.
+  std::mutex title_logs_mutex;
   std::map<std::string, std::string> title_logs;
-  config.title_log = [&title_logs](const std::string& title, const std::string& text) { title_logs[title] = text; };
+  config.title_log = [&](const std::string& title, const std::string& text) {
+    std::lock_guard<std::mutex> lock(title_logs_mutex);
+    title_logs[title] = text;
+  };
+  const auto title_log_of = [&](const std::string& title) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lock(title_logs_mutex);
+        if (const auto found = title_logs.find(title); found != title_logs.end()) return found->second;
+      }
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  };
   const auto game = fixture.root / "data/homebrew/FAKE77031/games/4242";
   // A 64-bit PE header is all the generator reads.
   std::string pe(0x80 + 26, '\0');
@@ -1573,8 +1792,8 @@ void PreparesGameWithoutShippedRecipe() {
   // The game's own Steam library (a 64-bit PE that asks for one interface).
   const std::string own_api = pe + std::string("\0SteamUser021\0", 14);
   Write(game / "Bin/steam_api64.dll", own_api, 0644);
-  // 4270 was turned off at install: the game isn't told about it.
-  Write(game / ".playden-steam", "depots=4243\ndlc=4250\nnodlc=4270\n", 0644);
+  // 4270 was turned off at install: the game isn't told about it. Its Cloud saves go in a LocalLow folder (#714).
+  Write(game / ".playden-steam", "depots=4243\ndlc=4250\nnodlc=4270\nsave=AppData/LocalLow/Studio/Example Game/Saves\n", 0644);
   // A Steam Input map whose right stick moves the mouse: the emulator can't drive it.
   Write(game / "Input/steam_input_manifest.vdf",
         "\"Action Manifest\" { \"configurations\" { \"controller_xboxone\" { \"0\" { \"path\" \"xbox.vdf\" } } } }\n", 0644);
@@ -1599,12 +1818,40 @@ void PreparesGameWithoutShippedRecipe() {
     return sdk_owned;
   };
 
+  // Valve's current client, as its manifest and package serve it (a stand-in DLL and its crash reporter), for the
+  // Online cases: read at a Play.
+  const std::string client_dll = "MZ valve steamclient64";
+  const auto client_zip = playden::test::StoredZip({{"steamclient64.dll", client_dll}, {"crashhandler64.dll", "MZ reporter"}});
+  const auto client_sha = *HashArtifactBytes(client_dll);
+  const std::string client_manifest = "\"win64\"\n{\n\t\"version\"\t\"1792618285\"\n\t\"bins_win64\"\n\t{\n\t\t\"file\"\t\"bins_win64.zip.t\"\n"
+                                      "\t\t\"size\"\t\"" + std::to_string(client_zip.size()) + "\"\n\t\t\"sha2\"\t\"" +
+                                      *HashArtifactBytes(client_zip) + "\"\n\t}\n}\n";
+  int manifest_reads = 0;
+  config.fetch_text = [&](const std::string& url, std::size_t, const std::atomic<bool>&, std::string*) -> std::optional<std::string> {
+    CHECK(url == std::string(kSteamClientCdn) + kSteamClientManifest);
+    ++manifest_reads;
+    return client_manifest;
+  };
+  config.fetch_range = [&](const std::string& url, std::uint64_t offset, std::uint64_t length, const std::atomic<bool>&,
+                           std::string*) -> std::optional<std::string> {
+    CHECK(url == std::string(kSteamClientCdn) + "bins_win64.zip.t");
+    return client_zip.substr(offset, length);
+  };
+
   std::map<std::string, std::string> saved_settings;
   config.settings_record = [&saved_settings](const playden::GameId&) -> std::optional<GameSettingsRecord> {
     if (saved_settings.empty()) return std::nullopt;
     GameSettingsRecord record;
     record.overrides = saved_settings;
     return record;
+  };
+  config.online_session = []() -> std::optional<OnlineSession> {
+    OnlineSession session;
+    session.steam_id = 76561198000000001ull;
+    session.account_name = "player";
+    session.refresh_token = "eyJ.token";
+    session.login_id = 5;
+    return session;
   };
   CHECK(chmod(game.c_str(), 0755) == 0);
   RuntimePrepareRequest request{4242, "/data/homebrew/FAKE77031/games/4242", "internal", "Example Game"};
@@ -1641,8 +1888,18 @@ void PreparesGameWithoutShippedRecipe() {
   CHECK(Read(game / "Bin/steam_settings/configs.user.ini").find("account_name=player\n") != std::string::npos);
   CHECK(Read(game / "Bin/steam_settings/configs.app.ini") == "[app::dlcs]\nunlock_all=0\n4250=dlc4250\n4260=dlc4260\n");
   CHECK(!dlc_asked.empty() && dlc_asked.back() == std::make_pair(std::uint64_t{76561198000000001ull}, std::uint32_t{4242}));
+  // runtime.log names the added DLC, so a report shows whether the one a player misses reached the emulator.
+  {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    CHECK(std::count(lines.begin(), lines.end(), "steamworks app=4242 owned dlc added=1 total=2 ids=4260") > 0);
+  }
   // The added DLC and SDK apps stay with the download's facts, for a start before the next license read.
-  CHECK(Read(game / ".playden-steam") == "depots=4243\ndlc=4250,4260\nnodlc=4270\napps=215\napps_account=76561198000000001\n");
+  CHECK(Read(game / ".playden-steam") == "depots=4243\ndlc=4250,4260\nnodlc=4270\napps=215\napps_account=76561198000000001\n"
+                                         "save=AppData/LocalLow/Studio/Example Game/Saves\n");
+  // The game's Cloud save folder is in the bottle before its first start, which may come from the PS5 Home screen.
+  CHECK(fs::is_directory(fixture.root / "data/playden/games/steam-4242/library/prefixes/game/drive_c/users/prospero/"
+                                        "AppData/LocalLow/Studio/Example Game/Saves"));
+  CHECK(logged("save folders app=4242 added=AppData/LocalLow/Studio/Example Game/Saves"));
   // Owned SDK apps reach the emulator as owned_app_ids.txt; the depots stay the game's own.
   CHECK(Read(game / "Bin/steam_settings/owned_app_ids.txt") == "215\n");
   CHECK(Read(game / "Bin/steam_settings/depots.txt") == "4243\n");
@@ -1654,12 +1911,27 @@ void PreparesGameWithoutShippedRecipe() {
   // Steam Input on Automatic: the map would lose the right stick, so the game gets none and reads the pad itself.
   CHECK(!fs::exists(game / "Bin/steam_settings/controller"));
   CHECK(logged("steamworks app=4242 steam input map left out: lost=1 drive/look"));
-  // The player asks for the game's own Steam files: Play puts them back before the game starts.
+  // The player asks for the game's own Steam files: Play puts them back before the game starts. What a Play asks of the
+  // online bridge (join a lobby, invite friends) is not written for a game that is not Online.
+  const auto handoff = fixture.root / "data/playden/games/steam-4242/library/prefixes/game/drive_c/playden/online-session.txt";
+  const auto launch_file = handoff.parent_path() / "online-launch.txt";
+  // Valve's Steam client saves its sign-in, a token, in the bottle, and its account list in the client folder: they go
+  // with Playden's handoff, the list once no game keeps its sign-in.
+  const auto client_token = handoff.parent_path().parent_path() / "users/prospero/AppData/Local/Steam/local.vdf";
+  const auto client_list = fixture.root / "data/playden/steam-client/client/config/loginusers.vdf";
+  const auto save_client_sign_in = [&] {
+    Write(client_token, "\"MachineUserConfigStore\"\n", 0600);
+    Write(client_list, "\"users\"\n", 0666);
+  };
+  const OnlineLaunch join_and_invite{109775241000000001ull, {76561198000000002ull, 76561198000000003ull}};
+  // A game that is no longer Online: its Play removes the token the client saved while it was.
+  save_client_sign_in();
   saved_settings = {{"steam_features", "game"}};
-  host.Play(4242);
+  host.Play(4242, {}, join_and_invite);
   WaitFor(host, [](const RuntimeSnapshot& s) { return s.handoff_ready; }, 30);
   CHECK(host.Handoff() && launches.size() == 1 && launches[0].first == "FAKE78001");
   CHECK(Read(game / "Bin/steam_api64.dll") == own_api);
+  CHECK(!fs::exists(handoff) && !fs::exists(launch_file) && !fs::exists(client_token));
   const auto session = launches[0].second[0].substr(std::strlen("session="));
   const auto sessions = fixture.root / "data/playden/games/steam-4242/logs/sessions";
   fs::create_directories(sessions);
@@ -1677,6 +1949,157 @@ void PreparesGameWithoutShippedRecipe() {
     return s.launch && s.launch->state != LaunchState::kRunning && s.launch->state != LaunchState::kLaunching;
   }, 30);
   CHECK(ended.launch->state == LaunchState::kExited);
+  // Online, kept for the Home screen: Play leaves the session in the bottle with keep=1, and the game's end keeps it.
+  // Game invites is Ask by default, which a runtime kit without title-notify runs as Off. The Play's request to the
+  // host goes beside it, owner-only, for this start only.
+  saved_settings = {{"steam_features", "online"}, {"steam_sign_in", "kept"}};
+  save_client_sign_in();
+  host.Play(4242, {}, join_and_invite);
+  WaitFor(host, [](const RuntimeSnapshot& s) { return s.handoff_ready; }, 30);
+  CHECK(host.Handoff() && launches.size() == 2 && fs::exists(client_token));
+  const auto kept_text = Read(handoff);
+  CHECK(kept_text.find("app_id=4242\n") != std::string::npos && kept_text.find("\nkeep=1\n") != std::string::npos);
+  // The Play took Valve's current client from its manifest: installed without its crash reporter, recorded in Playden's
+  // own state (version and DLL hash), and the handoff names the DLL so the host checks it. Before the install the kept
+  // handoff waited: the host has nothing to check against yet.
+  {
+    const auto client_folder = fixture.root / "data/playden/steam-client/client";
+    CHECK(manifest_reads >= 1 && logged("steam client app=4242 installed version=1792618285"));
+    CHECK(logged("online session app=4242 none: Valve's client is not installed yet"));
+    CHECK(Read(client_folder / "steamclient64.dll") == client_dll && !fs::exists(client_folder / "crashhandler64.dll"));
+    CHECK(Read(config.state_root / "steam-client") == "1792618285 " + client_sha + "\n");
+    struct stat status {};
+    CHECK(::stat((config.state_root / "steam-client").c_str(), &status) == 0 && (status.st_mode & 0777) == 0666);
+    CHECK(kept_text.find("\nclient_sha256=" + client_sha + "\n") != std::string::npos);
+    CHECK(host.Snapshot().steam_client_version == "1792618285");
+    // Logging isn't Verbose: no notify file for the title.
+    CHECK(!fs::exists(handoff.parent_path() / "steam-host.ready.notify"));
+  }
+  CHECK(kept_text.find("\ninvites=off\n") != std::string::npos && kept_text.find("\npersona=online\n") != std::string::npos);
+  {
+    // Dated, so the bridge can tell it from one a failed start left behind.
+    const auto launch_text = Read(launch_file);
+    const auto body = launch_text.find('\n');
+    CHECK(launch_text.rfind("written=", 0) == 0 && body != std::string::npos);
+    const auto written = std::strtoll(launch_text.c_str() + std::strlen("written="), nullptr, 10);
+    CHECK(written > 0 && std::llabs(written - static_cast<long long>(std::time(nullptr))) <= 60);
+    CHECK(launch_text.substr(body + 1) ==
+          "connect_lobby=109775241000000001\ninvite=76561198000000002\ninvite=76561198000000003\n");
+    struct stat status {};
+    CHECK(::stat(launch_file.c_str(), &status) == 0 && (status.st_mode & 0777) == 0600);
+  }
+  // The title runs and exits (its session record, as the title shell writes it). It shows as active while it runs:
+  // seen stopped too often, a running session counts as ended.
+  const auto run_session = [&](const std::string& id) {
+    const auto phase = [&](const std::string& name) {
+      return R"({"schema_version":1,"session_id":")" + id +
+             R"(","install_id":"steam-4242","title_id":"FAKE78001","origin":"playden","settings_revision":0,)"
+             R"("runtime_bundle_id":"wine-wow64","phase":")" + name + "\"}\n";
+    };
+    fixture.activity->store(static_cast<int>(NativeActivity::kActive));
+    Write(sessions / (id + ".json"), phase("running"), 0600);
+    WaitFor(host, [](const RuntimeSnapshot& s) { return s.launch && s.launch->state == LaunchState::kRunning; }, 30);
+    fixture.activity->store(static_cast<int>(NativeActivity::kStopped));
+    Write(sessions / (id + ".json"), phase("exited"), 0600);
+    WaitFor(host, [](const RuntimeSnapshot& s) {
+      return s.launch && s.launch->state != LaunchState::kRunning && s.launch->state != LaunchState::kLaunching;
+    }, 30);
+  };
+  run_session(launches[1].second[0].substr(std::strlen("session=")));
+  // The game ended without taking the request: it goes, the kept session stays.
+  for (int i = 0; i < 300 && fs::exists(launch_file); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CHECK(fs::exists(handoff) && !fs::exists(launch_file) && fs::exists(client_token));
+  // A Play that does not start leaves no request behind, even beside a kept session; one that asks nothing writes none
+  // and takes an earlier one away.
+  {
+    fixture.registered = false;  // the title is not installed: Play is refused after the handoff
+    const auto handled = host.Snapshot().plays_handled;
+    host.Play(4242, {}, join_and_invite);
+    const auto refused = WaitFor(host, [handled](const RuntimeSnapshot& s) { return s.plays_handled > handled; }, 30);
+    fixture.registered = true;
+    CHECK(refused.play_refusals.count(4242) && !refused.handoff_ready && launches.size() == 2);
+    CHECK(fs::exists(handoff) && !fs::exists(launch_file));
+    CHECK(WriteOnlineLaunch(handoff.parent_path().parent_path().parent_path(), join_and_invite));
+    host.Play(4242);
+    WaitFor(host, [](const RuntimeSnapshot& s) { return s.handoff_ready; }, 30);
+    CHECK(host.Handoff() && launches.size() == 3 && !fs::exists(launch_file));
+    // The title ends (it may already be taken as ended without a record: the console's lists were just read again).
+    const auto id = launches[2].second[0].substr(std::strlen("session="));
+    Write(sessions / (id + ".json"),
+          R"({"schema_version":1,"session_id":")" + id +
+              R"(","install_id":"steam-4242","title_id":"FAKE78001","origin":"playden","settings_revision":0,)"
+              R"("runtime_bundle_id":"wine-wow64","phase":"exited"})" "\n",
+          0600);
+    WaitFor(host, [](const RuntimeSnapshot& s) {
+      return s.launch && s.launch->state != LaunchState::kRunning && s.launch->state != LaunchState::kLaunching;
+    }, 30);
+  }
+  // Game invites changed in Game settings reaches the kept session at once, for the next start from the Home screen.
+  {
+    CHECK(Read(handoff).find("\ninvites=off\n") != std::string::npos);
+    saved_settings["game_invites"] = "join";
+    const auto maintained = host.Snapshot().maintenance_handled;
+    host.Maintain(4242, RuntimeMaintenance::kApplySettings);
+    WaitFor(host, [maintained](const RuntimeSnapshot& s) { return s.maintenance_handled > maintained; }, 60);
+    CHECK(Read(handoff).find("\ninvites=join\n") != std::string::npos && !fs::exists(launch_file));
+    saved_settings.erase("game_invites");
+    // Appear invisible reaches a handoff written from then on.
+    CHECK(Read(handoff).find("\npersona=online\n") != std::string::npos);
+    host.SetSteamInvisible(true);
+    const auto again = host.Snapshot().maintenance_handled;
+    host.Maintain(4242, RuntimeMaintenance::kApplySettings);
+    WaitFor(host, [again](const RuntimeSnapshot& s) { return s.maintenance_handled > again; }, 60);
+    CHECK(Read(handoff).find("\npersona=invisible\n") != std::string::npos);
+    host.SetSteamInvisible(false);
+    // Network adapters Off holds for the Steam host too (adapters=off); by default there's no such line, and the host
+    // lists them for Valve's client.
+    CHECK(Read(handoff).find("adapters=") == std::string::npos);
+    saved_settings["network_adapters"] = "off";
+    const auto adapters = host.Snapshot().maintenance_handled;
+    host.Maintain(4242, RuntimeMaintenance::kApplySettings);
+    WaitFor(host, [adapters](const RuntimeSnapshot& s) { return s.maintenance_handled > adapters; }, 60);
+    CHECK(Read(handoff).find("\nadapters=off\n") != std::string::npos);
+    saved_settings.erase("network_adapters");
+  }
+  // Online at each Play: the client's saved sign-in goes as the settings apply, before anything is done about Valve's
+  // client (outside a Play no manifest is read, and the installed client stays).
+  {
+    saved_settings = {{"steam_features", "online"}};
+    save_client_sign_in();
+    auto maintained = host.Snapshot().maintenance_handled;
+    host.Maintain(4242, RuntimeMaintenance::kApplySettings);
+    WaitFor(host, [maintained](const RuntimeSnapshot& s) { return s.maintenance_handled > maintained; }, 60);
+    CHECK(!fs::exists(handoff) && !fs::exists(client_token) && !fs::exists(client_list));
+    // Kept again: the handoff comes back, and the client's saved sign-in stays.
+    saved_settings = {{"steam_features", "online"}, {"steam_sign_in", "kept"}};
+    save_client_sign_in();
+    maintained = host.Snapshot().maintenance_handled;
+    host.Maintain(4242, RuntimeMaintenance::kApplySettings);
+    WaitFor(host, [maintained](const RuntimeSnapshot& s) { return s.maintenance_handled > maintained; }, 60);
+    CHECK(fs::exists(handoff) && fs::exists(client_token) && fs::exists(client_list));
+    // Logging = Verbose: the notify file is there for the title (the host adds its steps to it); otherwise it isn't.
+    const auto notify = handoff.parent_path() / "steam-host.ready.notify";
+    saved_settings = {{"steam_features", "online"}, {"steam_sign_in", "kept"}, {"logging", "verbose"}};
+    maintained = host.Snapshot().maintenance_handled;
+    host.Maintain(4242, RuntimeMaintenance::kApplySettings);
+    WaitFor(host, [maintained](const RuntimeSnapshot& s) { return s.maintenance_handled > maintained; }, 60);
+    struct stat status {};
+    CHECK(fs::exists(notify) && Read(notify).empty() && ::stat(notify.c_str(), &status) == 0 && (status.st_mode & 0777) == 0600);
+    saved_settings = {{"steam_features", "online"}, {"steam_sign_in", "kept"}};
+    maintained = host.Snapshot().maintenance_handled;
+    host.Maintain(4242, RuntimeMaintenance::kApplySettings);
+    WaitFor(host, [maintained](const RuntimeSnapshot& s) { return s.maintenance_handled > maintained; }, 60);
+    CHECK(!fs::exists(notify) && fs::exists(handoff));
+  }
+  // A sign-out removes it, and the client's saved sign-in with it; signing in again does not bring it back without a
+  // Play.
+  CHECK(fs::exists(client_token) && fs::exists(client_list));
+  host.SetSteamAccount({}, 0);
+  for (int i = 0; i < 300 && fs::exists(client_list); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CHECK(!fs::exists(handoff) && !fs::exists(client_token) && !fs::exists(client_list));
+  host.SetSteamAccount("player", 76561198000000001ull);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK(!fs::exists(handoff));
   // Steam Input asked for: Play gives the map without the lost stick. Game's own: the next Play takes it away. The
   // files are written before the handoff.
   saved_settings = {{"steam_input", "on"}};
@@ -1699,7 +2122,98 @@ void PreparesGameWithoutShippedRecipe() {
   WaitFor(host, [](const RuntimeSnapshot& s) { return s.handoff_ready; }, 30);
   CHECK(!fs::exists(game / "Bin/steam_settings/controller"));
   CHECK(logged("steamworks app=4242 steam input off: settings"));
+  // Back to Online, kept for the Home screen, for the restarts below.
+  saved_settings = {{"steam_features", "online"}, {"steam_sign_in", "kept"}};
   host.Shutdown();
+  // A kept file stays across a restart; once its game goes back to At each Play, Playden's next start removes it.
+  OnlineSession left;
+  left.app_id = 4242;
+  left.steam_id = 76561198000000001ull;
+  left.account_name = "player";
+  left.refresh_token = "eyJ.token";
+  left.login_id = 5;
+  left.keep = true;
+  CHECK(WriteOnlineSession(handoff.parent_path().parent_path().parent_path(), left) && fs::exists(handoff));
+  CHECK(WriteOnlineLaunch(handoff.parent_path().parent_path().parent_path(), join_and_invite));
+  save_client_sign_in();
+  {
+    RuntimeHost kept(config);  // still kept: a restart leaves it, but not a Play's request to the bridge
+    CHECK(kept.Start());
+    WaitFor(kept, Started);
+    CHECK(fs::exists(handoff) && !fs::exists(launch_file) && fs::exists(client_token) && fs::exists(client_list));
+    kept.Shutdown();
+  }
+  // Signed out (no stored session) by the next start: the kept file goes even while the game is still set to keep it.
+  {
+    auto signed_out = config;
+    signed_out.online_session = []() -> std::optional<OnlineSession> { return std::nullopt; };
+    RuntimeHost stale(signed_out);
+    CHECK(stale.Start());
+    WaitFor(stale, Started);
+    CHECK(!fs::exists(handoff) && !fs::exists(client_token) && !fs::exists(client_list));
+    stale.Shutdown();
+  }
+  // Without online-steam in features.txt a game set to keep it is not Online, so the next start removes the file and a
+  // Play's request to the bridge (a Play then hands over nothing, as for a game not set to Online above).
+  CHECK(WriteOnlineSession(handoff.parent_path().parent_path().parent_path(), left) && fs::exists(handoff));
+  CHECK(WriteOnlineLaunch(handoff.parent_path().parent_path().parent_path(), join_and_invite));
+  save_client_sign_in();
+  saved_settings = {{"steam_features", "online"}, {"steam_sign_in", "kept"}, {"game_invites", "off"}};
+  SetOnlineSteamEnabled(false);
+  {
+    RuntimeHost flag_off(config);
+    CHECK(flag_off.Start());
+    WaitFor(flag_off, Started);
+    CHECK(!fs::exists(handoff) && !fs::exists(launch_file) && !fs::exists(client_token) && !fs::exists(client_list));
+    flag_off.Shutdown();
+  }
+  SetOnlineSteamEnabled(true);
+  // A runtime kit whose title shows notifications (title-notify) runs Game invites as chosen: a kept session the
+  // account's next sign-in rewrites says so for the Home screen too.
+  {
+    auto notify_kit = kit;
+    notify_kit.capabilities.push_back(kKitTitleNotify);
+    std::sort(notify_kit.capabilities.begin(), notify_kit.capabilities.end());
+    auto notify_config = config;
+    notify_config.admit_kit = [&notify_kit](std::string*) { return std::optional<RuntimeKit>(notify_kit); };
+    for (const auto& [chosen, written] : std::vector<std::pair<std::string, std::string>>{
+             {"show", "show"}, {"", "ask"}, {"off", "off"}}) {
+      saved_settings = {{"steam_features", "online"}, {"steam_sign_in", "kept"}};
+      if (!chosen.empty()) saved_settings["game_invites"] = chosen;
+      CHECK(WriteOnlineSession(handoff.parent_path().parent_path().parent_path(), left));
+      CHECK(Read(handoff).find("invites=") == std::string::npos);
+      RuntimeHost notify(notify_config);
+      CHECK(notify.Start());
+      WaitFor(notify, Started);
+      notify.SetSteamAccount("player", 76561198000000001ull);
+      for (int i = 0; i < 500 && Read(handoff).find("invites=") == std::string::npos; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      CHECK(Read(handoff).find("\ninvites=" + written + "\n") != std::string::npos);
+      CHECK(!fs::exists(launch_file));  // a sign-in asks the bridge nothing
+      notify.Shutdown();
+    }
+    // Without the capability, Only show is Off.
+    saved_settings = {{"steam_features", "online"}, {"steam_sign_in", "kept"}, {"game_invites", "show"}};
+    CHECK(WriteOnlineSession(handoff.parent_path().parent_path().parent_path(), left));
+    RuntimeHost plain(config);
+    CHECK(plain.Start());
+    WaitFor(plain, Started);
+    plain.SetSteamAccount("player", 76561198000000001ull);
+    for (int i = 0; i < 500 && Read(handoff).find("invites=") == std::string::npos; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(Read(handoff).find("\ninvites=off\n") != std::string::npos);
+    plain.Shutdown();
+  }
+  CHECK(WriteOnlineSession(handoff.parent_path().parent_path().parent_path(), left) && fs::exists(handoff));
+  saved_settings = {{"steam_features", "online"}};
+  {
+    RuntimeHost cleaned(config);
+    CHECK(cleaned.Start());
+    WaitFor(cleaned, Started);
+    CHECK(!fs::exists(handoff));
+    cleaned.Shutdown();
+  }
+  saved_settings = {{"steam_features", "game"}};
 
   // After a restart the saved recipe is found without Steam, and the title log carries the
   // session report followed by the engine's own log from the bottle.
@@ -1711,25 +2225,52 @@ void PreparesGameWithoutShippedRecipe() {
   CHECK(restarted.Start());
   const auto reloaded = WaitFor(restarted, [](const RuntimeSnapshot& s) { return Started(s) && !s.generated_recipes.empty(); });
   CHECK(reloaded.generated_recipes[0].id == "steam-4242-auto");
-  CHECK(title_logs.count("FAKE78001"));
-  const auto& title_log = title_logs.at("FAKE78001");
+  const auto title_log = title_log_of("FAKE78001");
   CHECK(title_log.find("== session-0.log\nPW_REPORT/1 stopped") != std::string::npos);
   CHECK(title_log.find("AppData/LocalLow/Studio/Game/Player.log\nNullReferenceException at Boot") != std::string::npos);
+  // No Steam host ran: neither of its logs is there.
+  CHECK(title_log.find("== steam-host.log") == std::string::npos && title_log.find("== helper-wine.log") == std::string::npos);
   restarted.Prepare({4242, "/data/homebrew/FAKE77031/games/4242", "internal", "Example Game"});
   const auto prepared = WaitFor(restarted, [](const RuntimeSnapshot& s) { return s.refusals.count(4242) != 0; });
   CHECK(prepared.refusals.at(4242) == "This game is already prepared.");
   restarted.Shutdown();
+  // The start doesn't wait for the copies: with the copy held, the runtime is ready all the same (the first frame waits
+  // for ready). Released, the copy is made.
+  {
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool gate_open = false, copying = false;
+    auto held = config;
+    held.title_log = [&](const std::string&, const std::string&) {
+      std::unique_lock<std::mutex> lock(gate_mutex);
+      copying = true;
+      gate_changed.notify_all();
+      gate_changed.wait(lock, [&] { return gate_open; });
+    };
+    RuntimeHost waiting(held);
+    CHECK(waiting.Start());
+    CHECK(WaitFor(waiting, Started).status == RuntimeHostStatus::kReady);
+    {
+      std::unique_lock<std::mutex> lock(gate_mutex);
+      CHECK(gate_changed.wait_for(lock, std::chrono::seconds(30), [&] { return copying; }));
+      gate_open = true;
+    }
+    gate_changed.notify_all();
+    waiting.Shutdown();
+  }
 
   // Unity 5 writes output_log.txt beside the program instead; the newer log is the one shown.
   Write(game / "Bin/Game_Data/output_log.txt", "Initialize engine version: 5.3.6p5\n", 0600);
   std::filesystem::last_write_time(game / "Bin/Game_Data/output_log.txt",
                                    std::filesystem::file_time_type::clock::now() + std::chrono::seconds(10));
-  title_logs.clear();
+  {
+    std::lock_guard<std::mutex> lock(title_logs_mutex);
+    title_logs.clear();
+  }
   RuntimeHost legacy(config);
   CHECK(legacy.Start());
   WaitFor(legacy, [](const RuntimeSnapshot& s) { return Started(s) && !s.generated_recipes.empty(); });
-  CHECK(title_logs.count("FAKE78001"));
-  CHECK(title_logs.at("FAKE78001").find("== Game_Data/output_log.txt\nInitialize engine version: 5.3.6p5") !=
+  CHECK(title_log_of("FAKE78001").find("== Game_Data/output_log.txt\nInitialize engine version: 5.3.6p5") !=
         std::string::npos);
   legacy.Prepare({4242, "/data/homebrew/FAKE77031/games/4242", "internal", "Example Game"});
   const auto again = WaitFor(legacy, [](const RuntimeSnapshot& s) { return s.refusals.count(4242) != 0; });
@@ -1738,7 +2279,8 @@ void PreparesGameWithoutShippedRecipe() {
 
   // Back on emulation: each start below is a fresh Playden (Play, then its title stays unstarted).
   saved_settings.clear();
-  const std::string facts_215 = "depots=4243\ndlc=4250,4260\nnodlc=4270\napps=215\napps_account=76561198000000001\n";
+  const std::string facts_215 = "depots=4243\ndlc=4250,4260\nnodlc=4270\napps=215\napps_account=76561198000000001\n"
+                                "save=AppData/LocalLow/Studio/Example Game/Saves\n";
   const auto play_as = [&](std::uint64_t steam_id) {
     RuntimeHost started(config);
     started.SetSteamAccount("player", steam_id);
@@ -1748,9 +2290,13 @@ void PreparesGameWithoutShippedRecipe() {
     WaitFor(started, [](const RuntimeSnapshot& s) { return s.handoff_ready; }, 30);
     started.Shutdown();
   };
-  // No license read yet (or offline): the account keeps the SDK app the facts recorded for it.
+  // No license read yet (or offline): the account keeps the SDK app the facts recorded for it. A save folder gone since
+  // (deleted over FTP) is made again at Play.
+  const auto save_folder = data / "library/prefixes/game/drive_c/users/prospero/AppData/LocalLow/Studio/Example Game/Saves";
+  CHECK(fs::remove(save_folder));
   sdk_owned = std::nullopt;
   play_as(76561198000000001ull);
+  CHECK(fs::is_directory(save_folder));
   CHECK(Read(game / "Bin/steam_api64.dll") == emulator);
   CHECK(Read(game / "Bin/steam_settings/owned_app_ids.txt") == "215\n");
   CHECK(Read(game / ".playden-steam") == facts_215);
@@ -1762,7 +2308,194 @@ void PreparesGameWithoutShippedRecipe() {
   sdk_owned = std::vector<std::uint32_t>{};
   play_as(76561198000000001ull);
   CHECK(!fs::exists(game / "Bin/steam_settings/owned_app_ids.txt"));
-  CHECK(Read(game / ".playden-steam") == "depots=4243\ndlc=4250,4260\nnodlc=4270\n");
+  CHECK(Read(game / ".playden-steam") == "depots=4243\ndlc=4250,4260\nnodlc=4270\nsave=AppData/LocalLow/Studio/Example Game/Saves\n");
+  // A game that ran the Steam host (Steam features = Online): its log and the Wine log of its process follow.
+  Write(data / "library/prefixes/game/drive_c/playden/steam-host.log", "client: pinned\nlogon: ok\n", 0600);
+  Write(data / "library/helper-wine.log", "0024:err:module:import_dll Library x not found\n", 0600);
+  {
+    std::lock_guard<std::mutex> lock(title_logs_mutex);
+    title_logs.clear();
+  }
+  RuntimeHost hosted(config);
+  CHECK(hosted.Start());
+  WaitFor(hosted, [](const RuntimeSnapshot& s) { return Started(s) && !s.generated_recipes.empty(); });
+  CHECK(title_log_of("FAKE78001").find("== steam-host.log\nclient: pinned\nlogon: ok") != std::string::npos);
+  CHECK(title_log_of("FAKE78001").find("== helper-wine.log\n0024:err:module:import_dll") != std::string::npos);
+  hosted.Shutdown();
+  // A long Wine log keeps its start, where the host's libraries load, and its end.
+  Write(data / "library/helper-wine.log",
+        "0024:trace:loaddll:build_module Loaded vulkan-1.dll\n" + std::string(200 * 1024, '.') + "\nlast line\n", 0600);
+  {
+    std::lock_guard<std::mutex> lock(title_logs_mutex);
+    title_logs.clear();
+  }
+  RuntimeHost long_log(config);
+  CHECK(long_log.Start());
+  WaitFor(long_log, [](const RuntimeSnapshot& s) { return Started(s) && !s.generated_recipes.empty(); });
+  CHECK(title_log_of("FAKE78001").find("== helper-wine.log\n0024:trace:loaddll:build_module Loaded vulkan-1.dll") !=
+        std::string::npos);
+  CHECK(title_log_of("FAKE78001").find("bytes left out") != std::string::npos);
+  CHECK(title_log_of("FAKE78001").find("\nlast line\n") != std::string::npos);
+  long_log.Shutdown();
+
+  // The game closed, the player started it again and opened Playden a few seconds later: the run that closed is the
+  // one before the newest, and its end is shown as well as its start. An SCS game's own log and its crash file from
+  // that run follow; a crash file from an older run does not.
+  const auto now = std::filesystem::file_time_type::clock::now();
+  Write(data / "library/logs/session-6.log", "PW_REPORT/1 older run\n", 0600);
+  std::filesystem::last_write_time(data / "library/logs/session-6.log", now - std::chrono::seconds(600));
+  Write(data / "library/logs/session-7.log",
+        "PW_REPORT/1 closed run\n" + std::string(200 * 1024, '.') + "\nREC fault at the end\n", 0600);
+  std::filesystem::last_write_time(data / "library/logs/session-7.log", now - std::chrono::seconds(60));
+  Write(data / "library/logs/session-0.log", "PW_REPORT/1 short run\n", 0600);
+  std::filesystem::last_write_time(data / "library/logs/session-0.log", now);
+  const auto scs = data / "library/prefixes/game/drive_c/users/prospero/Documents/Euro Truck Simulator 2";
+  Write(scs / "game.log.txt", "00:00:01.000 : [sys] Loading base.scs\n", 0600);
+  std::filesystem::last_write_time(scs / "game.log.txt", now + std::chrono::seconds(20));
+  Write(scs / "game.crash.txt", "Crash: Access violation at eurotrucks2.exe\n", 0600);
+  std::filesystem::last_write_time(scs / "game.crash.txt", now - std::chrono::seconds(61));
+  {
+    std::lock_guard<std::mutex> lock(title_logs_mutex);
+    title_logs.clear();
+  }
+  RuntimeHost reopened(config);
+  CHECK(reopened.Start());
+  WaitFor(reopened, [](const RuntimeSnapshot& s) { return Started(s) && !s.generated_recipes.empty(); });
+  const auto reopened_log = title_log_of("FAKE78001");
+  CHECK(reopened_log.find("== session-0.log\nPW_REPORT/1 short run") != std::string::npos);
+  CHECK(reopened_log.find("== session-7.log (start and end)\nPW_REPORT/1 closed run") != std::string::npos);
+  CHECK(reopened_log.find("\nREC fault at the end\n") != std::string::npos);
+  CHECK(reopened_log.find("Documents/Euro Truck Simulator 2/game.log.txt\n00:00:01.000 : [sys] Loading base.scs") !=
+        std::string::npos);
+  CHECK(reopened_log.find("Documents/Euro Truck Simulator 2/game.crash.txt\nCrash: Access violation") != std::string::npos);
+  reopened.Shutdown();
+  // The newest run was long and left its older chunk, session-0.previous.log: that chunk is not a run, so the run
+  // that closed is still session-7, and the crash file from it still shows.
+  Write(data / "library/logs/session-0.previous.log", "PW_REPORT/1 short run, older chunk\n", 0600);
+  std::filesystem::last_write_time(data / "library/logs/session-0.previous.log", now - std::chrono::seconds(30));
+  {
+    std::lock_guard<std::mutex> lock(title_logs_mutex);
+    title_logs.clear();
+  }
+  RuntimeHost rotated(config);
+  CHECK(rotated.Start());
+  WaitFor(rotated, [](const RuntimeSnapshot& s) { return Started(s) && !s.generated_recipes.empty(); });
+  CHECK(title_log_of("FAKE78001").find("== session-7.log (start and end)") != std::string::npos);
+  CHECK(title_log_of("FAKE78001").find("game.crash.txt\nCrash: Access violation") != std::string::npos);
+  rotated.Shutdown();
+  CHECK(std::filesystem::remove(data / "library/logs/session-0.previous.log"));
+  std::filesystem::last_write_time(scs / "game.crash.txt", now - std::chrono::seconds(900));
+  {
+    std::lock_guard<std::mutex> lock(title_logs_mutex);
+    title_logs.clear();
+  }
+  RuntimeHost stale_crash(config);
+  CHECK(stale_crash.Start());
+  WaitFor(stale_crash, [](const RuntimeSnapshot& s) { return Started(s) && !s.generated_recipes.empty(); });
+  CHECK(title_log_of("FAKE78001").find("game.crash.txt") == std::string::npos);
+  stale_crash.Shutdown();
+}
+
+// A Steam game set to Steam library folder = Steam's folder, on a runtime kit that shows it in steamapps\\common
+// (steam-library-path): its profile names its folder there, Steam's installdir when the preparation had it (kept on the
+// record for later publications), the app ID otherwise, and with Steam features = Online the bottle's Steam library
+// lists it (SteamLibraryStep). The profile keeps the game's real paths. A kit without the capability writes no [steam];
+// nor does a game on Playden's folder: one installed before this Playden (no saved value) or the player's choice.
+void SteamGameShownInSteamLibrary() {
+  using Overrides = std::map<std::string, std::string>;
+  const Overrides installed_here = {{"default.steam_library_path", "steam"}};
+  struct Case { bool capability; const char* folder; Overrides overrides; const char* expected; };
+  for (const Case& test : {Case{true, "The Named Game", installed_here, "\n[steam]\ninstall_dir = The Named Game\n"},
+                           Case{true, "", installed_here, "\n[steam]\ninstall_dir = 4250\n"},
+                           Case{false, "The Named Game", installed_here, nullptr},
+                           Case{true, "The Named Game", {}, nullptr},
+                           Case{true, "The Named Game", {{"default.steam_library_path", "steam"}, {"steam_library_path", "playden"}}, nullptr},
+                           Case{true, "The Named Game", {{"steam_library_path", "steam"}}, "\n[steam]\ninstall_dir = The Named Game\n"}}) {
+    Fixture fixture;
+    auto config = fixture.Config();
+    config.host_namespace_prefix = fixture.root;
+    config.package_paths.console_data_root = "/data";
+    config.package_paths.host_data_root = fixture.root / "data";
+    config.package_operations.hash_file = HashArtifactFile;
+    config.package_operations.hash_bytes = HashArtifactBytes;
+    config.package_operations.free_space_unverifiable = true;
+    config.package_operations.validate_bottle = [](const fs::path& bottle) {
+      return fs::is_regular_file(bottle / "system.reg") && fs::is_regular_file(bottle / "user.reg");
+    };
+    // Steam features = Online runs Valve's client beside the game (helper-process), which the preparation downloads.
+    auto kit = SyntheticKit(fixture.root / "kit");
+    kit.capabilities.push_back(kKitHelperProcess);
+    if (test.capability) kit.capabilities.push_back(kKitSteamLibraryPath);
+    std::sort(kit.capabilities.begin(), kit.capabilities.end());
+    const auto client_zip = playden::test::StoredZip({{"steamclient64.dll", "MZ valve steamclient64"}});
+    const std::string client_manifest = "\"win64\"\n{\n\t\"version\"\t\"1792618285\"\n\t\"bins_win64\"\n\t{\n\t\t\"file\"\t\"bins_win64.zip.t\"\n"
+                                        "\t\t\"size\"\t\"" + std::to_string(client_zip.size()) + "\"\n\t\t\"sha2\"\t\"" +
+                                        *HashArtifactBytes(client_zip) + "\"\n\t}\n}\n";
+    config.fetch_text = [&](const std::string&, std::size_t, const std::atomic<bool>&, std::string*) -> std::optional<std::string> {
+      return client_manifest;
+    };
+    config.fetch_range = [&](const std::string&, std::uint64_t offset, std::uint64_t length, const std::atomic<bool>&,
+                             std::string*) -> std::optional<std::string> { return client_zip.substr(offset, length); };
+    config.online_session = []() -> std::optional<OnlineSession> {
+      OnlineSession session;
+      session.steam_id = 76561198000000001ull;
+      session.account_name = "player";
+      session.refresh_token = "eyJ.token";
+      session.login_id = 5;
+      return session;
+    };
+    std::mutex log_mutex;
+    std::vector<std::string> lines;
+    config.log = [&](const std::string& line) { std::lock_guard<std::mutex> lock(log_mutex); lines.push_back(line); };
+    config.admit_kit = [&kit](std::string*) { return std::optional<RuntimeKit>(kit); };
+    unsigned uuids = 0;
+    config.uuid = [&uuids]() -> std::optional<std::string> {
+      ++uuids; return std::string("00000000-0000-4000-8000-0000000000") + (uuids < 10 ? "0" : "") + std::to_string(uuids);
+    };
+    config.unix_time = [] { return std::int64_t{1760000000}; };
+    config.session_data_root = fixture.root / "data";
+    config.launch_title = [](const std::string&, const std::vector<std::string>&) { return TitleResult{true, 0, "launch"}; };
+    std::string pe(0x80 + 26, '\0');
+    pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+    pe[0x44] = 0x64; pe[0x45] = static_cast<char>(0x86); pe[0x40 + 24] = 0x0b; pe[0x40 + 25] = 0x02;
+    const auto game = fixture.root / "data/homebrew/FAKE77031/games/4250";
+    Write(game / "Bin/Game.exe", pe, 0644);
+    CHECK(chmod(game.c_str(), 0755) == 0);
+    GameSettingsRecord saved;
+    saved.overrides = test.overrides;
+    saved.overrides["steam_features"] = "online";
+    config.settings_record = [saved](const playden::GameId&) -> std::optional<GameSettingsRecord> { return saved; };
+    RuntimePrepareRequest request{4250, "/data/homebrew/FAKE77031/games/4250", "internal", "Named Game"};
+    request.launches = {{"", "", "Bin/Game.exe", "", ""}};
+    request.steam_install_dir = test.folder;
+    RuntimeHost host(config);
+    host.SetSteamAccount("player", 76561198000000001ull);
+    CHECK(host.Start());
+    CHECK(WaitFor(host, Started).kit_available);
+    host.Prepare(request);
+    const auto ready = WaitFor(host, [](const RuntimeSnapshot& s) {
+      return !s.preparing_app && (s.refusals.count(4250) || (!s.installs.empty() && s.installs[0].state == PreparationState::kReady));
+    }, 60);
+    if (ready.refusals.count(4250)) std::fprintf(stderr, "Prepare refused: %s\n", ready.refusals.at(4250).c_str());
+    CHECK(ready.installs.size() == 1 && ready.installs[0].state == PreparationState::kReady);
+    const auto profile =
+        Read(fixture.root / "data/playden/games/steam-4250/library/profiles/playden-steam-4250.profile");
+    CHECK(profile.find("executable = Z:\\data\\homebrew\\FAKE77031\\games\\4250\\Bin\\Game.exe\n") != std::string::npos);
+    CHECK(test.expected ? profile.find(test.expected) != std::string::npos : profile.find("[steam]") == std::string::npos);
+    host.Shutdown();
+    {
+      std::lock_guard<std::mutex> lock(log_mutex);
+      CHECK(std::any_of(lines.begin(), lines.end(), [](const std::string& line) {
+        return line.rfind("steam client app=4250 installed", 0) == 0;
+      }));
+      CHECK(std::any_of(lines.begin(), lines.end(), [](const std::string& line) {
+        return line.rfind("steam library app=4250", 0) == 0;
+      }) == (test.expected != nullptr));
+    }
+    // The name stays on the record for later publications, also from a kit without the capability.
+    const auto installs = Read(config.state_root / "installs.json");
+    CHECK((installs.find("\"steam_install_dir\":\"The Named Game\"") != std::string::npos) == (test.folder[0] != 0));
+  }
 }
 
 // A game set up before Playden's defaults for its engine changed takes the new ones on the next Play: its saved
@@ -2516,7 +3249,7 @@ void MaintainsReadyTitle() {
     else if (line.rfind("package inspect ", 0) == 0) ++full_inspections;
     if (loosen_next && line.rfind("settings update request", 0) == 0 && line.find(" state=0 ") != std::string::npos) {
       loosen_next = false;
-      CHECK(chmod(staged.c_str(), 0777) == 0);
+      CHECK(chmod(staged.c_str(), 0775) == 0);  // a mode Playden never gives a title: the capture refuses it
     }
   };
   std::int64_t now = 1760000000;
@@ -2600,7 +3333,10 @@ void MaintainsReadyTitle() {
     CHECK(lstat((data / folder).c_str(), &info) == 0 && (info.st_mode & 07777) == 0700);
   CHECK(lstat((data / "library/prefixes/game/drive_c/users/prospero/Documents/save.dat").c_str(), &info) == 0 &&
         (info.st_mode & 07777) == 0600);
-  CHECK(lstat(backups.c_str(), &info) == 0 && (info.st_mode & 07777) == 0700);
+  // No title uses a backup: it is open to FTP (#868).
+  CHECK(lstat(backups.c_str(), &info) == 0 && (info.st_mode & 07777) == 0777);
+  CHECK(lstat((backups / "1760000003/users/prospero/Documents/save.dat").c_str(), &info) == 0 &&
+        (info.st_mode & 07777) == 0666);
 
   // An update interrupted after its arm keeps its journal: Play waits, and Resume (Prepare)
   // finishes the saved request instead of making a new one.
@@ -3502,6 +4238,68 @@ void LocalGameSteamworksAppId() {
       return line.find("steam_app_id=" + std::to_string(number)) != std::string::npos;
     }));
   }
+
+  // Offline emulation, game's library: the game's own DLL stays where it is, gbe_fork's client goes in the bottle with
+  // its settings, and the bottle's user.reg names it as a running Steam would. Any other mode takes those values away.
+  fs::path bottle;
+  for (const auto& entry : fs::recursive_directory_iterator(fixture.root / "data/playden/games"))
+    if (entry.path().filename() == "user.reg" && entry.path().parent_path().filename() == "game")
+      bottle = entry.path().parent_path();
+  CHECK(!bottle.empty());
+  const auto client = bottle / "drive_c/playden/steamclient";
+  const auto set_features = [&](const char* value) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    saved.overrides["steam_features"] = value;
+  };
+  host.SetSteamAccount("player", 76561198000000001ull);
+  set_field(4000);
+  set_features("steamclient");
+  apply();
+  CHECK(Read(game / "Bin/steam_api64.dll") == own_api && !fs::exists(game / "Bin/steam_settings/steamclient64.dll"));
+  CHECK(Read(client / "steamclient64.dll") == Read(fs::path(g_runtime_dir) / "steamworks/steamclient64.dll"));
+  CHECK(Read(client / "steamclient.dll") == Read(fs::path(g_runtime_dir) / "steamworks/steamclient.dll"));
+  CHECK(Read(client / "steam_settings/steam_appid.txt") == "4000");
+  CHECK(Read(client / "steam_settings/configs.user.ini").find("account_name=player\n") != std::string::npos);
+  // Another store's game gets no steam_appid.txt of Playden's in its folder, as with the Steam host: the (empty) one
+  // above stays as it is, and none appears in the game folder.
+  CHECK(Read(game / "Bin/steam_appid.txt").empty() && !fs::exists(game / "steam_appid.txt"));
+  auto reg = Read(bottle / "user.reg");
+  CHECK(reg.find("[Software\\\\Valve\\\\Steam\\\\ActiveProcess]") != std::string::npos);
+  CHECK(reg.find("\"pid\"=dword:00000020\n") != std::string::npos);
+  CHECK(reg.find("\"SteamClientDll64\"=\"C:\\\\playden\\\\steamclient\\\\steamclient64.dll\"\n") != std::string::npos);
+  CHECK(reg.find("\"SteamClientDll\"=\"C:\\\\playden\\\\steamclient\\\\steamclient.dll\"\n") != std::string::npos);
+  CHECK(reg.find("\"ActiveUser\"=dword:025e4c01\n") != std::string::npos);
+  CHECK(reg.find("\"SteamPath\"=\"C:\\\\playden\\\\steamclient\"\n") != std::string::npos);
+  CHECK(logged("steamworks app=" + std::to_string(number) + " mode=steamclient found=1 changed=- client=written"));
+  // The next start finds the client in place.
+  apply();
+  CHECK(logged("steamworks app=" + std::to_string(number) + " mode=steamclient found=1 changed=- client=kept"));
+  // Game's own files: Valve's library must not find the client any more; the files may stay.
+  set_features("game");
+  apply();
+  reg = Read(bottle / "user.reg");
+  CHECK(reg.find("steamclient") == std::string::npos && reg.find("\"pid\"=dword:00000020") == std::string::npos);
+  CHECK(logged("steamworks app=" + std::to_string(number) + " steamclient registry removed=6"));
+  // Offline emulation takes the DLL's place again, with no client values left either.
+  set_features("steamclient");
+  apply();
+  set_features("emulate");
+  apply();
+  CHECK(Read(game / "Bin/steam_api64.dll") == emulator && Read(bottle / "user.reg").find("steamclient") == std::string::npos);
+  // A user.reg Playden can't read (here a link) stops the preparation instead of passing for one without the values.
+  const auto hive_copy = bottle / "user.reg.test-copy";
+  fs::rename(bottle / "user.reg", hive_copy);
+  fs::create_symlink(hive_copy, bottle / "user.reg");
+  {
+    const auto before = host.Snapshot().maintenance_handled;
+    host.Maintain(number, RuntimeMaintenance::kApplySettings);
+    const auto done = WaitFor(host, [before](const RuntimeSnapshot& s) { return s.maintenance_handled > before; });
+    CHECK(!done.maintenance.at(number).ok);
+    CHECK(done.maintenance.at(number).message.find("registry") != std::string::npos);
+  }
+  fs::remove(bottle / "user.reg");
+  fs::rename(hive_copy, bottle / "user.reg");
+  apply();
   host.Shutdown();
 }
 
@@ -3921,6 +4719,7 @@ void RemovesTitleKeepingSaves() {
   const auto bottle = fixture.root / "data/playden/games/steam-220";
   const auto kept = fixture.root / "data/playden/games/steam-220.kept";
   const auto save = fs::path("library/prefixes/game/drive_c/users/steamuser/AppData/Roaming/Game/save.dat");
+  const auto client_token = fs::path("library/prefixes/game/drive_c/users/prospero/AppData/Local/Steam/local.vdf");
   const auto prepare = [](RuntimeHost& host) {
     host.Prepare(Hl2());
     const auto done = WaitFor(host, [](const RuntimeSnapshot& s) {
@@ -3992,10 +4791,12 @@ void RemovesTitleKeepingSaves() {
     CHECK(removed.installs.size() == 1 && removed.installs[0].step == "bottle");
     CHECK(removed.removal_failures.at(220).find("could not be kept") != std::string::npos);
     CHECK(!fixture.registered && *remover_calls == 2);
+    // Valve's Steam client's saved sign-in (an Online game) does not stay in a bottle kept without its game.
+    Write(bottle / client_token, "\"MachineUserConfigStore\"\n", 0600);
     removed = remove(host, true);
     CHECK(!removed.removal_failures.count(220) && removed.installs.empty());
     CHECK(*remover_calls == 2);  // the console no longer listed the title: never sent again
-    CHECK(!fs::exists(bottle) && Read(kept / save) == "player-save");
+    CHECK(!fs::exists(bottle) && Read(kept / save) == "player-save" && !fs::exists(kept / client_token));
     CHECK(removed.kept_bottles.size() == 1 && removed.kept_bottles[0].runtime_number == 220);
     CHECK(removed.kept_bottles[0].name == "Half-Life 2" && removed.kept_bottles[0].kept_at == 1760000000);
     CHECK(removed.kept_bottles[0].bytes > 0);
@@ -5189,7 +5990,7 @@ void WorkerMovesGamesUnderPublicationLease() {
   config.layout_paths = LayoutPaths{old.parent_path(), fixture.root / "data/playden/user",
       fixture.root / "data/playden/logs", target, config.state_root, fixture.root / "data"};
   const std::string text = "{\"step\":\"games\",\"from\":\"" + old.string() + "\",\"to\":\"" + target.string() + "\"}";
-  CHECK(playden::Storage(config.state_root.string()).WriteDurable(kLayoutJournal, playden::Bytes(text.begin(), text.end())).ok());
+  CHECK(playden::Storage(config.state_root.string()).OpenTree().WriteDurable(kLayoutJournal, playden::Bytes(text.begin(), text.end())).ok());
   const auto lock_path = fixture.root / "data/playden/games/steam-220/.playden-control/publication.lock";
   const auto busy = [&] {
     const int fd = ::open(lock_path.c_str(), O_RDONLY);
@@ -5863,7 +6664,7 @@ void MigrationSkipsRecordsOutsideOldPrefix() {
       {600, "/data/homebrew/FAKE77031/games-old/600"}, {700, "/data/homebrew/FAKE77031/games"},
       {220, "/data/homebrew/FAKE77031/games/220"}};
   {
-    playden::Storage storage(config.state_root.string());
+    auto storage = playden::Storage(config.state_root.string()).OpenTree();
     RuntimeInstallRepository repository(storage, "installs.json", [](const std::string&) {
       return NativeTitleAvailability{TitleAvailability::kFree, TitleAvailability::kFree};
     });
@@ -5886,13 +6687,13 @@ void MigrationSkipsRecordsOutsideOldPrefix() {
     // A trailing slash on the old root is ignored.
     const std::string journal = std::string(R"({"step":"games-moved","from":")") + kOldGames + R"(/","to":")" + kNewGames +
                                 R"(","postponed":0})";
-    CHECK(playden::Storage(config.state_root.string()).WriteDurable(kLayoutJournal, playden::Bytes(journal.begin(), journal.end())).ok());
+    CHECK(playden::Storage(config.state_root.string()).OpenTree().WriteDurable(kLayoutJournal, playden::Bytes(journal.begin(), journal.end())).ok());
   }
   RuntimeHost host(config);
   CHECK(host.Start());
   WaitFor(host, Started);
   host.Shutdown();
-  playden::Storage storage(config.state_root.string());
+  auto storage = playden::Storage(config.state_root.string()).OpenTree();
   RuntimeInstallRepository repository(storage, "installs.json", {});
   CHECK(repository.Load().ok());
   std::map<std::uint32_t, RuntimeInstall> records;
@@ -6227,11 +7028,11 @@ void SharedProfileKitOpensSaves() {
   auto result = run.Maintain(host, RuntimeMaintenance::kRepair);
   CHECK(result.maintenance.at(220).ok);
   for (const auto& folder : ProfileWay(run.data)) CHECK(ModeOf(folder) == 0711);
-  // Backups live in Playden's private backup folder.
+  // Backups live in Playden's backup folder, open to FTP (#868).
   result = run.Maintain(host, RuntimeMaintenance::kBackupSaves);
   CHECK(result.maintenance.at(220).ok);
   const auto backups = run.fixture.root / "data/playden/games/steam-220.saves";
-  CHECK(ModeOf(backups) == 0700 && ModeOf(backups / "1760000000/users/prospero/AppData/Roaming/Game/save.dat") == 0600);
+  CHECK(ModeOf(backups) == 0777 && ModeOf(backups / "1760000000/users/prospero/AppData/Roaming/Game/save.dat") == 0666);
 
   // Uninstalled keeping saves, prepared again: the saves come back open.
   const auto removals = host.Snapshot().removals_handled;
@@ -6853,7 +7654,7 @@ void RelocationResumesAfterRestart() {
     };
     if (step == 2) {
       // The record written (moved_from), then Playden stopped before the republish.
-      playden::Storage storage(config.state_root.string());
+      auto storage = playden::Storage(config.state_root.string()).OpenTree();
       RuntimeInstallRepository repository(storage, "installs.json", {});
       CHECK(repository.Load().ok());
       auto record = repository.Snapshot().front();
@@ -7122,7 +7923,7 @@ void DeletesLeftoverTitleAndResumesFailures() {
           CHECK(!fs::exists(title));
           const auto journal = config.state_root / "leftover-FAKE78001.json";
           struct stat info{};
-          CHECK(lstat(journal.c_str(), &info) == 0 && (info.st_mode & 07777) == 0600);
+          CHECK(lstat(journal.c_str(), &info) == 0 && (info.st_mode & 07777) == 0666);
           CHECK(Read(journal).find("\"step\":\"unregister\"") != std::string::npos);
           CHECK(fs::is_directory(config.state_root / "trash" / (std::string("FAKE78001-") + kLeftoverOperation)));
           if (scenario == 3) CHECK(done.leftover_delete_failures.at("FAKE78001").find("could not start") != std::string::npos);
@@ -7206,7 +8007,7 @@ void LeftoverRemovalRecoversRetireWriteGap(int scenario) {
   const auto text = std::string("{\"schema\":1,\"title\":\"FAKE78001\",\"operation_id\":\"") + kLeftoverOperation +
       "\",\"step\":\"retire\",\"device\":" + std::to_string(info.st_dev) + ",\"inode\":" +
       std::to_string(info.st_ino) + ",\"name\":\"Left Behind\",\"bytes\":11}\n";
-  playden::Storage storage(config.state_root.string());
+  auto storage = playden::Storage(config.state_root.string()).OpenTree();
   CHECK(storage.WriteDurable("leftover-FAKE78001.json", playden::Bytes(text.begin(), text.end())).ok());
   const auto trash = config.state_root / "trash";
   fs::create_directory(trash);
@@ -7217,7 +8018,10 @@ void LeftoverRemovalRecoversRetireWriteGap(int scenario) {
     fs::rename(retired, config.state_root / "protected-original");
     Write(retired / "replacement", "another-title", 0644);
   } else if (scenario == 2) {
-    CHECK(chmod((config.state_root / "leftover-FAKE78001.json").c_str(), 0644) == 0);
+    // A journal that is a link (any mode of Playden's own is read, #868) is never followed.
+    const auto journal = config.state_root / "leftover-FAKE78001.json";
+    fs::rename(journal, config.state_root / "elsewhere.json");
+    fs::create_symlink(config.state_root / "elsewhere.json", journal);
   }
   unsigned calls = 0;
   config.unregister_title = [&fixture, &calls](const std::string&, const std::string&) {
@@ -7245,6 +8049,84 @@ void LeftoverRemovalRecoversRetireWriteGap(int scenario) {
     }
   }
   restarted.Shutdown();
+}
+
+// A game a later build prepared, from a store this build can't read ("epic" stands for one): the runtime stays
+// available, the game is not listed, and its title is neither a leftover nor dropped from the allow-list. Its
+// pending request and its bottle stay for that build, and so do the community recipes it was published with.
+void ForeignRecordKeepsItsTitleAtStartup() {
+  Fixture fixture;
+  auto config = LeftoverConfig(fixture);
+  config.package_operations.hash_file = HashArtifactFile;
+  config.package_operations.hash_bytes = HashArtifactBytes;
+  const auto kit = AnyTitleKit(fixture.root / "kit");
+  config.admit_kit = [&kit](std::string*) { return std::optional<RuntimeKit>(kit); };
+  std::vector<std::string> lists;
+  config.write_title_allow_list = [&lists](const std::string& contents, std::string*) {
+    lists.push_back(contents);
+    return true;
+  };
+  const std::string id = "epic-0f8fad5bd9cb469fa16570867728950e";
+  fs::create_directories(config.state_root);
+  CHECK(chmod(config.state_root.c_str(), 0700) == 0);
+  Write(config.state_root / "installs.json",
+        R"({"schema_version":1,"reservations":[{"install_id":")" + id + R"(","title_id":"FAKE78007"}],"installs":[)"
+        R"({"schema_version":1,"install_id":")" + id + R"(","title_id":"FAKE78007","app_id":4026531845,"store":"epic",)"
+        R"("game":"0f8fad5bd9cb469fa16570867728950e","build_id":"123","data_root":"/data/playden/games/)" + id +
+        R"(","state":"ready","recipe_id":"community-epic-0f8fad5bd9cb469fa16570867728950e-fast",)"
+        R"("recipe_version":")" + std::string(32, 'a') +
+        R"(","journal":{"operation_id":"op-epic","operation":"settings-request","step":"capture"}}]})",
+        0600);
+  // The registry values its community recipe left in its bottle.
+  const auto registry_revision = std::string(64, 'b');
+  Write(config.state_root / ("recipe-registry-" + id + ".json"),
+        R"({"recipe_id":"community-epic-0f8fad5bd9cb469fa16570867728950e-fast","revision":")" + registry_revision +
+        R"(","values":[]})", 0600);
+  const auto requests = config.state_root / "requests";
+  Write(requests / "settings-request-op-epic.v1", "later-build", 0600);
+  Write(requests / "settings-request-op-gone.v1", "nobody's", 0600);
+  CHECK(chmod(requests.c_str(), 0700) == 0);
+  // Its title folder, as a leftover would look, and its bottle.
+  const auto title = fixture.root / "data/homebrew/FAKE78007";
+  Write(title / "sce_sys/param.json", R"({"localizedParameters":{"en-US":{"titleName":"Later Game"}}})", 0644);
+  Write(title / "eboot.bin", "title-files", 0755);
+  Write(title / "game-launch.json",
+        R"({"schema_version":1,"app_id":4026531845,"title_id":"FAKE78007","install_id":")" + id +
+        R"(","data_root":"/data/playden/games/)" + id + "\"}", 0644);
+  CHECK(chmod(title.c_str(), 0755) == 0);
+  const auto bottle = fixture.root / "data/playden/games" / id;
+  Write(bottle / "save.dat", "saved-game", 0600);
+  const auto installs_before = Read(config.state_root / "installs.json");
+
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  const auto started = WaitFor(host, Started);
+  CHECK(started.status == RuntimeHostStatus::kReady && started.kit_available);
+  CHECK(started.reason.find("Runtime install records are unavailable") == std::string::npos);
+  CHECK(started.installs.empty() && started.leftover_titles.empty());
+  CHECK(!started.runtime_games.count(0xF0000005u));
+  CHECK((started.community_references == std::vector<std::string>{std::string(32, 'a'), registry_revision}));
+  CHECK(!lists.empty() && lists.back() == "FAKE78007\n");
+  CHECK(fs::exists(title / "eboot.bin") && Read(bottle / "save.dat") == "saved-game");
+  CHECK(fs::exists(requests / "settings-request-op-epic.v1") && !fs::exists(requests / "settings-request-op-gone.v1"));
+  CHECK(!host.DeleteLeftoverTitle("FAKE78007"));
+  host.Shutdown();
+  CHECK(Read(config.state_root / "installs.json") == installs_before);
+
+  // A removal journal for its title (an older scan's) is not resumed over it.
+  Write(config.state_root / "leftover-FAKE78007.json",
+        R"({"schema":1,"title":"FAKE78007","operation_id":")" + std::string(kLeftoverOperation) +
+        R"(","step":"retire","device":1,"inode":1,"name":"Later Game","bytes":11})", 0600);
+  RuntimeHost restarted(config);
+  CHECK(restarted.Start());
+  const auto resumed = WaitFor(restarted, [](const RuntimeSnapshot& s) { return Started(s) && s.leftover_deletes_handled == 1; });
+  CHECK(resumed.status == RuntimeHostStatus::kReady && resumed.leftover_titles.empty());
+  CHECK(resumed.leftover_delete_failures.count("FAKE78007") &&
+        resumed.leftover_delete_failures.at("FAKE78007") ==
+            "This PS5 title now belongs to an installed game; it was left as it is.");
+  CHECK(fs::exists(title / "eboot.bin") && fixture.registry_mutations == 0);
+  restarted.Shutdown();
+  CHECK(Read(config.state_root / "installs.json") == installs_before);
 }
 
 void LeftoverScanRequiresLoadedRecordsAndRepeatsAfterUninstall() {
@@ -7530,7 +8412,7 @@ void CommunityRecipeSwitches() {
     { std::lock_guard<std::mutex> lock(lines_mutex); lines.push_back(line); }
     if (loosen_next && line.rfind("settings update request", 0) == 0 && line.find(" state=0 ") != std::string::npos) {
       loosen_next = false;
-      CHECK(chmod(staged.c_str(), 0777) == 0);
+      CHECK(chmod(staged.c_str(), 0775) == 0);  // a mode Playden never gives a title: the capture refuses it
     }
     if (break_after_commit && line.rfind("settings update resume app=220", 0) == 0 && line.find(" state=0 ") != std::string::npos) {
       break_after_commit = false;
@@ -7923,6 +8805,91 @@ void CommunityRecipeOverGeneratedAndKitFallback() {
   restarted.Shutdown();
 }
 
+// Steam names a working folder as Windows sees it: Unreal Tournament (13240) starts system\UnrealTournament.exe in
+// "system", which is System/ on disk. The console's disk tells the two apart, so Prepare stopped at "Before DXVK
+// snapshot cannot be verified." (#844). The record, the profile and the folder dxvk.conf goes in use the disk's
+// spelling; so does a community recipe that names the folder in another case. This host's disk may ignore case, so
+// the spelling is what is checked.
+void WorkingFolderTakesTheDiskSpelling() {
+  Fixture fixture;
+  auto kit = SyntheticKit(fixture.root / "kit", "native", "kit-1", 'a', "runtime", "f729534-kit-0.12");
+  unsigned uuids = 0;
+  std::int64_t now = 1760000000;
+  auto config = CommunityConfig(fixture, kit, &uuids, &now);
+  config.steamworks_dir = (fs::path(g_runtime_dir) / "steamworks").string();
+  config.removal_confirm_polls = 3;
+  config.removal_poll_interval = std::chrono::milliseconds(1);
+  config.unregister_title = [&fixture](const std::string&, const std::string&) {
+    fixture.registered = false;
+    fixture.submitted = false;
+    return TitleRemoverResult{true, 0, "answered"};
+  };
+  RecipeCache cache;
+  cache.Wire(config);
+  const auto game = fixture.root / "data/homebrew/FAKE77031/games/13240";
+  std::string pe(0x80 + 26, '\0');
+  pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+  pe[0x44] = 0x64; pe[0x45] = static_cast<char>(0x86); pe[0x40 + 24] = 0x0b; pe[0x40 + 25] = 0x02;
+  Write(game / "System/UnrealTournament.exe", pe, 0644);
+  Write(game / "Bin/Fast.exe", pe, 0644);
+  CHECK(chmod(game.c_str(), 0755) == 0);
+  GameRecipe recipe;
+  recipe.id = "community-steam-13240-fast";
+  recipe.version = 1;
+  recipe.name = "Unreal Tournament";
+  recipe.launch_entries = {{"game", "Fast", "Bin/Fast.exe", "bin"}};
+  recipe.architecture = "pe64";
+  recipe.graphics = "dxvk";
+  recipe.defaults["steam_features"] = "emulate";
+  CommunityRecipe shared;
+  shared.recipe = recipe;
+  shared.game = playden::GameRef::Steam(13240);
+  shared.game_name = "Unreal Tournament";
+  shared.executable = "Bin/Fast.exe";
+  shared.title = "Fast";
+  shared.status = "works";
+  shared.tested_kit = "0.12";
+  shared.author = "Ana";
+  const auto revision = cache.Add(SerializeCommunityRecipe(shared));
+  GameSettingsRecord saved;
+  config.settings_record = [&saved](const playden::GameId&) -> std::optional<GameSettingsRecord> { return saved; };
+  RuntimePrepareRequest request{13240, "/data/homebrew/FAKE77031/games/13240", "internal", "Unreal Tournament"};
+  request.launches = {{"", "", "system\\UnrealTournament.exe", "system", ""}};
+  const auto profile = fixture.root / "data/playden/games/steam-13240/library/profiles/playden-steam-13240.profile";
+  const auto has = [](const std::string& text, const std::string& needle) { return text.find(needle) != std::string::npos; };
+  RuntimeHost host(config);
+  host.SetSteamAccount("player", 76561198000000001ull);
+  CHECK(host.Start());
+  CHECK(WaitFor(host, Started).kit_available);
+  const auto prepare = [&] {
+    host.Prepare(request);
+    const auto done = WaitFor(host, [](const RuntimeSnapshot& s) {
+      return !s.preparing_app && (s.refusals.count(13240) || (!s.installs.empty() && s.installs[0].state == PreparationState::kReady));
+    }, 60);
+    if (done.refusals.count(13240)) std::fprintf(stderr, "Prepare refused: %s\n", done.refusals.at(13240).c_str());
+    CHECK(!done.refusals.count(13240) && done.installs.size() == 1);
+    return done;
+  };
+  // Steam's folder: the generated recipe, the record and the profile say System.
+  auto done = prepare();
+  CHECK(done.installs[0].recipe_id == "steam-13240-auto" && done.installs[0].launch_path == "System/UnrealTournament.exe");
+  CHECK(done.installs[0].launch_working_directory == "System");
+  CHECK(done.generated_recipes.size() == 1 && done.generated_recipes[0].launch_entries[0].working_directory == "System");
+  CHECK(has(Read(profile), "\\games\\13240\\System\n"));
+  fixture.activity->store(static_cast<int>(NativeActivity::kStopped));
+  const auto before = host.Snapshot().removals_handled;
+  host.Remove(13240, true);
+  const auto removed = WaitFor(host, [before](const RuntimeSnapshot& s) { return s.removals_handled > before; }, 60);
+  CHECK(removed.installs.empty());
+  // A community recipe that names Bin/ as "bin": the same.
+  ChooseCommunityRecipe(&saved, "community-steam-13240-fast", revision);
+  done = prepare();
+  CHECK(done.installs[0].recipe_id == "community-steam-13240-fast" && done.installs[0].launch_path == "Bin/Fast.exe");
+  CHECK(done.installs[0].launch_working_directory == "Bin");
+  CHECK(has(Read(profile), "\\games\\13240\\Bin\n") && !has(Read(profile), "\\bin\n"));
+  host.Shutdown();
+}
+
 // A settings-only recipe (community.format_version 2) starts the program Playden finds: the generated recipe is made
 // first and lends its program, the recipe's settings apply on top. A "program" default the copy has starts instead,
 // one it hasn't is dropped.
@@ -8285,9 +9252,469 @@ void LinkedRecipeAppliesUnderItsAlias() {
   restarted.Shutdown();
 }
 
+// A GOG game prepares to Ready from the programs its install record names (what the controller sends), and before each
+// start its goggame-<id>.script's setIni steps run again with `{app}` as the folder's console path, as Wine sees it:
+// moved to a USB drive, the value follows. The script's supportData copy ran at install and is never run again.
+void GogScriptSetsIniAtEachStart() {
+  using playden::GameId;
+  const auto gog = GameId::Gog(1900000001);
+  Fixture fixture;
+  GamesMove move;
+  const auto kit = SyntheticKit(fixture.root / "kit");
+  unsigned uuids = 0;
+  const auto config = MoveConfig(fixture, kit, &uuids, move);
+  const std::string console_root = "/data/playden-games/gog-1900000001";
+  const auto root = fixture.root / fs::path(console_root).relative_path();
+  std::string pe(0x80 + 26, '\0');
+  pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+  pe[0x44] = 0x64; pe[0x45] = static_cast<char>(0x86); pe[0x40 + 24] = 0x0b; pe[0x40 + 25] = 0x02;
+  Write(root / "SYNTHETIC.EXE", pe, 0644);
+  playden::installs::GogRecord record;
+  record.build_id = "1000000000000000101";
+  record.products = {1900000001};
+  record.language = "en-US";
+  record.meta_id = std::string(32, 'a');
+  Write(root / playden::installs::kInstallRecordName,
+        playden::installs::FormatGogInstallRecord(gog, 4096, 2, "english", record,
+                                                  {{"synthetic.exe", "-windowed", "", "Synthetic"}}),
+        0644);
+  // The script as GOG writes it (Beneath a Steel Sky's ScummVM path, Arena's save copy), spelled in capitals on disk.
+  Write(root / "GOGGAME-1900000001.SCRIPT", R"({"actions":[
+ {"install":{"action":"setIni","arguments":{"filename":"{app}\\synthetic.cfg","keyName":"path","keyType":"string","keyValue":"{app}\\data","section":"system","utf8":false}},"languages":["*"],"name":"ini"},
+ {"install":{"action":"supportData","arguments":{"overwrite":true,"source":"{supportDir}/save","target":"{app}/save","type":"folder"}},"languages":["*"],"name":"copySave"}
+],"productId":"1900000001"})", 0644);
+  // What the install's copy left in the support folder; the player has since deleted the game's own copy.
+  Write(root / ".playden-gog/support/1900000001/save/slot.sav", "install-time-save", 0644);
+  Write(root / "synthetic.cfg", "[system]\r\npath=C:\\GOG Games\\Synthetic\\data\r\nvolume=7\r\n", 0644);
+  CHECK(chmod(root.c_str(), 0777) == 0);
+
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  CHECK(WaitFor(host, Started).kit_available);
+  const auto number = *host.RuntimeNumberFor(gog);
+  RuntimePrepareRequest request{number, console_root, "internal", "Synthetic GOG game (GOG)"};
+  request.game = gog;
+  request.launches = {{"", "Synthetic", "synthetic.exe", "", "-windowed"}};
+  host.Prepare(request);
+  const auto ready = WaitFor(host, [number](const RuntimeSnapshot& s) {
+    return !s.preparing_app && (s.refusals.count(number) || (!s.installs.empty() && s.installs[0].state == PreparationState::kReady));
+  }, 60);
+  if (ready.refusals.count(number)) std::fprintf(stderr, "Prepare refused: %s\n", ready.refusals.at(number).c_str());
+  CHECK(!ready.refusals.count(number) && ready.installs.size() == 1);
+  CHECK(ready.installs[0].recipe_id == "gog-1900000001-auto" && ready.installs[0].launch_path == "SYNTHETIC.EXE");
+  const auto ini = [&](const fs::path& folder) { return Read(folder / "synthetic.cfg"); };
+  // Only the key changes; the other lines and the CRLF line ends stay.
+  CHECK(ini(root) == "[system]\r\npath=Z:\\data\\playden-games\\gog-1900000001\\data\r\nvolume=7\r\n");
+  CHECK(!fs::exists(root / "save"));
+  CHECK(move.Logged("gog script app=" + std::to_string(number) + " ini=1 changed=1 skipped=0"));
+
+  // Moved to a USB drive: the next start names the new folder.
+  const std::string usb_root = "/mnt/usb0/playden/games/gog-1900000001";
+  const auto usb = fixture.root / fs::path(usb_root).relative_path();
+  for (const auto& folder : {fixture.root / "mnt", fixture.root / "mnt/usb0", fixture.root / "mnt/usb0/playden",
+                             fixture.root / "mnt/usb0/playden/games"}) {
+    fs::create_directories(folder);
+    CHECK(chmod(folder.c_str(), 0755) == 0);
+  }
+  RuntimeRelocation relocation;
+  relocation.runtime_number = number;
+  relocation.to = usb_root;
+  relocation.volume_id = "usb0";
+  relocation.move_files = [&]() -> std::string {
+    std::error_code error;
+    if (!fs::exists(usb)) fs::rename(root, usb, error);
+    return error ? error.message() : std::string();
+  };
+  const auto moved = host.Relocate(std::move(relocation), std::chrono::seconds(60));
+  if (!moved.message.empty()) std::fprintf(stderr, "Relocate: %s\n", moved.message.c_str());
+  CHECK(moved.outcome == RuntimeRelocationResult::Outcome::kDone);
+  WaitFor(host, [](const RuntimeSnapshot& s) { return !s.installs.empty() && !s.installs[0].republish_pending; }, 30);
+  CHECK(host.Snapshot().installs[0].install_path == usb_root);
+  // Play sets it before the title starts, whatever the file says by then.
+  Write(usb / "synthetic.cfg", "[system]\r\npath=C:\\elsewhere\r\nvolume=7\r\n", 0644);
+  host.Play(number);
+  const auto played = WaitFor(host, [number](const RuntimeSnapshot& s) { return s.handoff_ready || s.play_refusals.count(number); }, 30);
+  if (played.play_refusals.count(number)) std::fprintf(stderr, "Play refused: %s\n", played.play_refusals.at(number).c_str());
+  CHECK(played.handoff_ready && host.Handoff());
+  CHECK(ini(usb) == "[system]\r\npath=Z:\\mnt\\usb0\\playden\\games\\gog-1900000001\\data\r\nvolume=7\r\n");
+  CHECK(!fs::exists(usb / "save") && Read(usb / ".playden-gog/support/1900000001/save/slot.sav") == "install-time-save");
+  host.Shutdown();
+}
+
+// Pause all in Queue (#880) holds a GOG game too: a finished GOG install asked to prepare while paused waits in the
+// queue without running a GOG step (its goggame-<id>.script's setIni) or writing a record, and Resume all prepares it
+// to Ready from its install record's programs.
+void PausedQueueHoldsGogPreparation() {
+  using playden::GameId;
+  const auto gog = GameId::Gog(1900000003);
+  Fixture fixture;
+  GamesMove move;
+  const auto kit = SyntheticKit(fixture.root / "kit");
+  unsigned uuids = 0;
+  const auto config = MoveConfig(fixture, kit, &uuids, move);
+  const std::string console_root = "/data/playden-games/gog-1900000003";
+  const auto root = fixture.root / fs::path(console_root).relative_path();
+  std::string pe(0x80 + 26, '\0');
+  pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+  pe[0x44] = 0x64; pe[0x45] = static_cast<char>(0x86); pe[0x40 + 24] = 0x0b; pe[0x40 + 25] = 0x02;
+  Write(root / "game.exe", pe, 0644);
+  playden::installs::GogRecord record;
+  record.build_id = "1000000000000000301";
+  record.products = {1900000003};
+  record.language = "en-US";
+  record.meta_id = std::string(32, 'c');
+  Write(root / playden::installs::kInstallRecordName,
+        playden::installs::FormatGogInstallRecord(gog, 4096, 2, "english", record, {{"game.exe", "", "", "Game"}}), 0644);
+  Write(root / "goggame-1900000003.script", R"({"actions":[
+ {"install":{"action":"setIni","arguments":{"filename":"{app}\\game.cfg","keyName":"path","keyType":"string","keyValue":"{app}","section":"system","utf8":false}},"languages":["*"],"name":"ini"}
+],"productId":"1900000003"})", 0644);
+  Write(root / "game.cfg", "[system]\r\npath=C:\\GOG Games\\Game\r\n", 0644);
+  CHECK(chmod(root.c_str(), 0777) == 0);
+
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  CHECK(WaitFor(host, Started).kit_available);
+  const auto number = *host.RuntimeNumberFor(gog);
+  host.PausePreparations(true);
+  RuntimePrepareRequest request{number, console_root, "internal", "Paused GOG game (GOG)"};
+  request.game = gog;
+  request.launches = {{"", "Game", "game.exe", "", ""}};
+  host.Prepare(request);
+  usleep(300000);
+  const auto paused = host.Snapshot();
+  CHECK(paused.prepares_handled == 0 && !paused.preparing_app && paused.installs.empty());
+  CHECK((paused.queued_prepares == std::vector<std::uint32_t>{number}));
+  CHECK(!move.Logged("gog script app="));
+  CHECK(Read(root / "game.cfg") == "[system]\r\npath=C:\\GOG Games\\Game\r\n");
+
+  host.PausePreparations(false);
+  const auto ready = WaitFor(host, [number](const RuntimeSnapshot& s) {
+    return !s.preparing_app && (s.refusals.count(number) || (!s.installs.empty() && s.installs[0].state == PreparationState::kReady));
+  }, 60);
+  if (ready.refusals.count(number)) std::fprintf(stderr, "Prepare refused: %s\n", ready.refusals.at(number).c_str());
+  CHECK(!ready.refusals.count(number) && ready.installs.size() == 1 && ready.queued_prepares.empty());
+  CHECK(ready.installs[0].recipe_id == "gog-1900000003-auto" && ready.installs[0].launch_path == "game.exe");
+  CHECK(move.Logged("gog script app=" + std::to_string(number) + " ini=1 changed=1"));
+  CHECK(Read(root / "game.cfg") == "[system]\r\npath=Z:\\data\\playden-games\\gog-1900000003\r\n");
+  host.Shutdown();
+}
+
+// A GOG game's setRegistry values go into its bottle as it prepares, with no installscript.vdf: HKLM in system.reg in
+// both registry views with `{app}` as the folder's console path, HKCU in user.reg. A recipe's value for the same key
+// and name wins; a later action's value replaces an earlier one's; a key with no value and a name Wine's file can't
+// hold are skipped and never refuse the start. An unchanged hive is not written again. Back on Playden's own recipe, the
+// script's value replaces the one the community recipe wrote on that same start. After a move to a USB drive the next
+// start names the new folder.
+void GogScriptSetsRegistryAtEachStart() {
+  using playden::GameId;
+  const auto gog = GameId::Gog(1900000001);
+  Fixture fixture;
+  GamesMove move;
+  const auto kit = SyntheticKit(fixture.root / "kit");
+  unsigned uuids = 0;
+  auto config = MoveConfig(fixture, kit, &uuids, move);
+  RecipeCache cache;
+  cache.Wire(config);
+  const playden::GameRef game_ref{"gog", "1900000001"};
+  CommunityRecipe community;
+  community.recipe.id = CommunityRecipeIdFor(game_ref, "reg");
+  community.recipe.version = 1;
+  community.recipe.name = "Synthetic";
+  community.recipe.launch_entries = {{"game", "Synthetic", "SYNTHETIC.EXE", ""}};
+  community.recipe.architecture = "pe64";
+  community.recipe.graphics = "dxvk";
+  community.recipe.registry = {{"Software\\Synthetic Games\\Synthetic", "Language", "\"Recipe\""}};
+  community.game = game_ref;
+  community.game_name = "Synthetic";
+  community.executable = "SYNTHETIC.EXE";
+  community.title = "Registry";
+  community.status = "works";
+  community.tested_kit = "0.12";
+  community.author = "Ana";
+  const auto revision = cache.Add(SerializeCommunityRecipe(community));
+  GameSettingsRecord saved;
+  saved.revision = 1;
+  ChooseCommunityRecipe(&saved, community.recipe.id, revision, game_ref);
+  config.settings_record = [&saved](const playden::GameId&) -> std::optional<GameSettingsRecord> { return saved; };
+  const std::string console_root = "/data/playden-games/gog-1900000001";
+  const auto root = fixture.root / fs::path(console_root).relative_path();
+  std::string pe(0x80 + 26, '\0');
+  pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+  pe[0x44] = 0x64; pe[0x45] = static_cast<char>(0x86); pe[0x40 + 24] = 0x0b; pe[0x40 + 25] = 0x02;
+  Write(root / "SYNTHETIC.EXE", pe, 0644);
+  playden::installs::GogRecord record;
+  record.build_id = "1000000000000000103";
+  record.products = {1900000001};
+  record.language = "en-US";
+  record.meta_id = std::string(32, 'c');
+  Write(root / playden::installs::kInstallRecordName,
+        playden::installs::FormatGogInstallRecord(gog, 4096, 2, "english", record, {{"synthetic.exe", "", "", "Synthetic"}}),
+        0644);
+  // As the DOSBox games' scripts write them, with the HKCU values made up.
+  Write(root / "goggame-1900000001.script", R"({"actions":[
+ {"install":{"action":"setRegistry","arguments":{"root":"HKEY_LOCAL_MACHINE","subkey":"Software\\GOG.com\\Games\\{productID}","valueData":"{app}\\DOSBox","valueName":"DOSBOXFOLDER","valueType":"String"}},"languages":["*"],"name":"DOSBoxConfigLegacy1"},
+ {"install":{"action":"setRegistry","arguments":{"root":"HKEY_LOCAL_MACHINE","subkey":"Software\\GOG.com\\Games\\{productID}","valueData":"first","valueName":"DOSBOXCONF","valueType":"String"}},"languages":["*"],"name":"DOSBoxConfigLegacy2"},
+ {"install":{"action":"setRegistry","arguments":{"root":"HKEY_LOCAL_MACHINE","subkey":"SOFTWARE\\GOG.com\\Games\\1900000001","valueData":"dosboxsynthetic","valueName":"dosboxconf","valueType":"string"}},"languages":["*"],"name":"again"},
+ {"install":{"action":"setRegistry","arguments":{"root":"HKEY_CURRENT_USER","subkey":"Software\\Synthetic Games\\Synthetic","valueData":"0x10","valueName":"Volume","valueType":"dword"}},"languages":["*"],"name":"volume"},
+ {"install":{"action":"setRegistry","arguments":{"root":"HKEY_CURRENT_USER","subkey":"Software\\Synthetic Games\\Synthetic","valueData":"English","valueName":"Language","valueType":"string"}},"languages":["*"],"name":"language"},
+ {"install":{"action":"setRegistry","arguments":{"root":"HKEY_CURRENT_USER","subkey":"Software\\Synthetic Games\\Synthetic","valueData":"v","valueName":"a\"b","valueType":"string"}},"languages":["*"],"name":"quote"},
+ {"install":{"action":"setRegistry","arguments":{"root":"HKEY_LOCAL_MACHINE","subkey":"Software\\Synthetic Games\\Synthetic Editor"}},"languages":["*"],"name":"keyOnly"}
+],"productId":"1900000001"})", 0644);
+  CHECK(chmod(root.c_str(), 0777) == 0);
+
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  CHECK(WaitFor(host, Started).kit_available);
+  const auto number = *host.RuntimeNumberFor(gog);
+  const auto app = std::to_string(number);
+  RuntimePrepareRequest request{number, console_root, "internal", "Synthetic GOG game (GOG)"};
+  request.game = gog;
+  request.launches = {{"", "Synthetic", "synthetic.exe", "", ""}};
+  host.Prepare(request);
+  const auto ready = WaitFor(host, [number](const RuntimeSnapshot& s) {
+    return !s.preparing_app && (s.refusals.count(number) || (!s.installs.empty() && s.installs[0].state == PreparationState::kReady));
+  }, 60);
+  if (ready.refusals.count(number)) std::fprintf(stderr, "Prepare refused: %s\n", ready.refusals.at(number).c_str());
+  CHECK(!ready.refusals.count(number) && ready.installs.size() == 1);
+  CHECK(ready.installs[0].recipe_id == community.recipe.id);
+  fs::path prefix;
+  for (const auto& entry : fs::directory_iterator(fixture.root / "data/playden/games"))
+    if (fs::is_regular_file(entry.path() / "library/prefixes/game/system.reg")) prefix = entry.path() / "library/prefixes/game";
+  CHECK(!prefix.empty());
+  const auto count = [](const std::string& text, const std::string& part) {
+    std::size_t found = 0;
+    for (auto at = text.find(part); at != std::string::npos; at = text.find(part, at + 1)) ++found;
+    return found;
+  };
+  // The value under its key's header, in Wine's text form.
+  const auto holds = [](const std::string& text, const std::string& key, const std::string& line) {
+    const auto header = text.find("\n[" + key + "] ");
+    if (header == std::string::npos) return false;
+    const auto end = text.find("\n[", header + 1);
+    const auto at = text.find("\n" + line + "\n", header);
+    return at != std::string::npos && (end == std::string::npos || at < end);
+  };
+  const auto lines = [&](const std::string& part) {
+    std::lock_guard<std::mutex> lock(move.mutex);
+    return static_cast<std::size_t>(std::count_if(move.lines.begin(), move.lines.end(), [&](const std::string& line) {
+      return line.find(part) != std::string::npos;
+    }));
+  };
+  auto system = Read(prefix / "system.reg");
+  auto user = Read(prefix / "user.reg");
+  for (const auto* key : {"Software\\\\GOG.com\\\\Games\\\\1900000001", "Software\\\\Wow6432Node\\\\GOG.com\\\\Games\\\\1900000001"}) {
+    CHECK(holds(system, key, R"("DOSBOXFOLDER"="Z:\\data\\playden-games\\gog-1900000001\\DOSBox")"));
+    CHECK(holds(system, key, R"("dosboxconf"="dosboxsynthetic")"));
+  }
+  CHECK(count(system, "DOSBOXFOLDER") == 2 && count(system, "first") == 0 && count(system, "Synthetic Editor") == 0);
+  CHECK(count(user, "Wow6432Node\\\\Synthetic") == 0);
+  CHECK(holds(user, "Software\\\\Synthetic Games\\\\Synthetic", R"("Volume"=dword:00000010)"));
+  CHECK(holds(user, "Software\\\\Synthetic Games\\\\Synthetic", R"("Language"="Recipe")"));
+  CHECK(count(user, "English") == 0 && count(user, "a\"b") == 0);
+  CHECK(move.Logged("gog registry app=" + app + " values=4 skipped=2 recipe=1"));
+  // The script step counts no setRegistry.
+  CHECK(move.Logged("gog script app=" + app + " ini=0 changed=0 skipped=0"));
+
+  // Prepared again with nothing changed: the hives are left alone.
+  struct stat before {};
+  CHECK(::stat((prefix / "system.reg").c_str(), &before) == 0);
+  struct stat user_before {};
+  CHECK(::stat((prefix / "user.reg").c_str(), &user_before) == 0);
+  const auto runs = lines("gog registry app=" + app + " ");
+  fixture.activity->store(static_cast<int>(NativeActivity::kStopped));
+  const auto handled = host.Snapshot().maintenance_handled;
+  host.Maintain(number, RuntimeMaintenance::kApplySettings);
+  const auto applied = WaitFor(host, [handled](const RuntimeSnapshot& s) { return s.maintenance_handled > handled; }, 60);
+  if (!applied.maintenance.at(number).ok) std::fprintf(stderr, "apply: %s\n", applied.maintenance.at(number).message.c_str());
+  CHECK(applied.maintenance.at(number).ok);
+  CHECK(lines("gog registry app=" + app + " ") > runs);
+  struct stat after {};
+  CHECK(::stat((prefix / "system.reg").c_str(), &after) == 0);
+  CHECK(after.st_ino == before.st_ino && after.st_mtime == before.st_mtime);
+  // The recipe's value is left to the recipe: user.reg isn't written back and forth either.
+  struct stat user_after {};
+  CHECK(::stat((prefix / "user.reg").c_str(), &user_after) == 0);
+  CHECK(user_after.st_ino == user_before.st_ino && user_after.st_mtime == user_before.st_mtime);
+  CHECK(Read(prefix / "system.reg") == system && Read(prefix / "user.reg") == user);
+
+  // Back to Playden's own recipe, which sets no registry value: the recipe step removes the value the community recipe
+  // wrote, and the script's value is in its place on that same start, not only on the next one.
+  ChoosePreset(&saved, "");
+  ++saved.revision;
+  const auto switched_handled = host.Snapshot().maintenance_handled;
+  host.Maintain(number, RuntimeMaintenance::kApplySettings);
+  const auto switched =
+      WaitFor(host, [switched_handled](const RuntimeSnapshot& s) { return s.maintenance_handled > switched_handled; }, 60);
+  if (!switched.maintenance.at(number).ok) std::fprintf(stderr, "apply: %s\n", switched.maintenance.at(number).message.c_str());
+  CHECK(switched.maintenance.at(number).ok && switched.installs[0].recipe_id == "gog-1900000001-auto");
+  CHECK(lines("recipe registry app=" + app + " recipe=gog-1900000001-auto values=0 removed=1") == 1);
+  user = Read(prefix / "user.reg");
+  CHECK(holds(user, "Software\\\\Synthetic Games\\\\Synthetic", R"("Language"="English")"));
+  CHECK(count(user, "Recipe") == 0 && holds(user, "Software\\\\Synthetic Games\\\\Synthetic", R"("Volume"=dword:00000010)"));
+  CHECK(move.Logged("gog registry app=" + app + " values=5 skipped=2"));
+
+  // Moved to a USB drive: the next start names the new folder.
+  const std::string usb_root = "/mnt/usb0/playden/games/gog-1900000001";
+  const auto usb = fixture.root / fs::path(usb_root).relative_path();
+  for (const auto& folder : {fixture.root / "mnt", fixture.root / "mnt/usb0", fixture.root / "mnt/usb0/playden",
+                             fixture.root / "mnt/usb0/playden/games"}) {
+    fs::create_directories(folder);
+    CHECK(chmod(folder.c_str(), 0755) == 0);
+  }
+  RuntimeRelocation relocation;
+  relocation.runtime_number = number;
+  relocation.to = usb_root;
+  relocation.volume_id = "usb0";
+  relocation.move_files = [&]() -> std::string {
+    std::error_code error;
+    if (!fs::exists(usb)) fs::rename(root, usb, error);
+    return error ? error.message() : std::string();
+  };
+  const auto moved = host.Relocate(std::move(relocation), std::chrono::seconds(60));
+  if (!moved.message.empty()) std::fprintf(stderr, "Relocate: %s\n", moved.message.c_str());
+  CHECK(moved.outcome == RuntimeRelocationResult::Outcome::kDone);
+  WaitFor(host, [](const RuntimeSnapshot& s) { return !s.installs.empty() && !s.installs[0].republish_pending; }, 30);
+  host.Play(number);
+  const auto played = WaitFor(host, [number](const RuntimeSnapshot& s) { return s.handoff_ready || s.play_refusals.count(number); }, 30);
+  if (played.play_refusals.count(number)) std::fprintf(stderr, "Play refused: %s\n", played.play_refusals.at(number).c_str());
+  CHECK(played.handoff_ready && host.Handoff());
+  system = Read(prefix / "system.reg");
+  for (const auto* key : {"Software\\\\GOG.com\\\\Games\\\\1900000001", "Software\\\\Wow6432Node\\\\GOG.com\\\\Games\\\\1900000001"})
+    CHECK(holds(system, key, R"("DOSBOXFOLDER"="Z:\\mnt\\usb0\\playden\\games\\gog-1900000001\\DOSBox")"));
+  CHECK(count(system, "playden-games") == 0);
+  CHECK(holds(Read(prefix / "user.reg"), "Software\\\\Synthetic Games\\\\Synthetic", R"("Language"="English")"));
+
+  // No redist.list (no redistributables): the redist step says nothing.
+  CHECK(lines("gog redist app=") == 0);
+  host.Shutdown();
+}
+
+// A GOG game's redistributables install into its bottle as it prepares, from its redist.list and the packages
+// downloaded into .playden-gog/redist/, with no installscript.vdf, no GOG session and no network: a Windows Installer
+// package and a Burn bundle's package install once; DirectX's setup, which Wine provides, is skipped without a log line
+// (Steam's filter); a dependency the list says Play can't run gets one not-run line. Its script's setRegistry values
+// go in on the same start, after the packages, so a package's own value for the same name doesn't stay.
+void GogRedistInstallsAtPlay() {
+  using playden::GameId;
+  namespace msi = playden::test::msi;
+  const auto gog = GameId::Gog(1900000002);
+  Fixture fixture;
+  GamesMove move;
+  const auto kit = SyntheticKit(fixture.root / "kit");
+  unsigned uuids = 0;
+  const auto config = MoveConfig(fixture, kit, &uuids, move);
+  const std::string console_root = "/data/playden-games/gog-1900000002";
+  const auto root = fixture.root / fs::path(console_root).relative_path();
+  std::string pe(0x80 + 26, '\0');
+  pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+  pe[0x44] = 0x64; pe[0x45] = static_cast<char>(0x86); pe[0x40 + 24] = 0x0b; pe[0x40 + 25] = 0x02;
+  Write(root / "Game.exe", pe, 0644);
+  playden::installs::GogRecord record;
+  record.build_id = "1000000000000000102";
+  record.products = {1900000002};
+  record.language = "en-US";
+  record.meta_id = std::string(32, 'b');
+  Write(root / playden::installs::kInstallRecordName,
+        playden::installs::FormatGogInstallRecord(gog, 4096, 2, "english", record, {{"game.exe", "", "", "Game"}}), 0644);
+  Write(root / ".playden-gog/redist/XNA/xnafx40_redist.msi", msi::RuntimePackage("XNA Runtime", {{"xna.dll", "XNA-DLL"}}), 0644);
+  // Compressed as real bundles are: only the Burn path finds its package.
+  const auto bundle = msi::RuntimeBundle({{"DesktopRuntime", msi::RuntimePackage("dotnet", {{"hostfxr.dll", "FXR"}})}}, true);
+  Write(root / ".playden-gog/redist/DOTNET8/windowsdesktop-runtime-8.0-win-x64.exe", bundle, 0644);
+  Write(root / ".playden-gog/redist/DirectX/DXSETUP.exe", "MZ-not-a-real-setup", 0644);
+  Write(root / "goggame-1900000002.script", R"({"actions":[
+ {"install":{"action":"setRegistry","arguments":{"root":"HKEY_LOCAL_MACHINE","subkey":"Software\\GOG.com\\Games\\{productID}","valueData":"{app}","valueName":"PATH","valueType":"string"}},"languages":["*"],"name":"path"},
+ {"install":{"action":"setRegistry","arguments":{"root":"HKEY_CURRENT_USER","subkey":"Software\\Redist Games\\Game","valueData":"3","valueName":"Runs","valueType":"dword"}},"languages":["*"],"name":"runs"}
+],"productId":"1900000002"})", 0644);
+  const auto package = [](const char* id, const char* program, const char* arguments) {
+    playden::gog::RedistEntry entry;
+    entry.id = id;
+    entry.package = true;
+    entry.program = program;
+    entry.arguments = arguments;
+    return entry;
+  };
+  playden::gog::RedistEntry physx;
+  physx.id = "PhysX";
+  physx.skip = playden::gog::RedistSkip::kNoProgram;
+  CHECK(playden::gog::WriteRedistList(root.string(),
+                                      {package("XNA40", ".playden-gog/redist/XNA/xnafx40_redist.msi", "/quiet"),
+                                       package("DOTNET8", ".playden-gog/redist/DOTNET8/windowsdesktop-runtime-8.0-win-x64.exe",
+                                               "/install /quiet /norestart"),
+                                       package("DirectX", ".playden-gog/redist/DirectX/DXSETUP.exe", "/silent"), physx}) == 0);
+  CHECK(chmod(root.c_str(), 0777) == 0);
+
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  CHECK(WaitFor(host, Started).kit_available);
+  const auto number = *host.RuntimeNumberFor(gog);
+  const auto app = std::to_string(number);
+  RuntimePrepareRequest request{number, console_root, "internal", "Redist GOG game (GOG)"};
+  request.game = gog;
+  request.launches = {{"", "Game", "game.exe", "", ""}};
+  host.Prepare(request);
+  const auto ready = WaitFor(host, [number](const RuntimeSnapshot& s) {
+    return !s.preparing_app && (s.refusals.count(number) || (!s.installs.empty() && s.installs[0].state == PreparationState::kReady));
+  }, 60);
+  if (ready.refusals.count(number)) std::fprintf(stderr, "Prepare refused: %s\n", ready.refusals.at(number).c_str());
+  CHECK(!ready.refusals.count(number) && ready.installs.size() == 1);
+  fs::path prefix;
+  for (const auto& entry : fs::directory_iterator(fixture.root / "data/playden/games"))
+    if (fs::is_regular_file(entry.path() / "library/prefixes/game/system.reg")) prefix = entry.path() / "library/prefixes/game";
+  CHECK(!prefix.empty());
+  CHECK(Read(prefix / "drive_c/Program Files (x86)/XNA Runtime/xna.dll") == "XNA-DLL");
+  CHECK(Read(prefix / "drive_c/Program Files (x86)/dotnet/hostfxr.dll") == "FXR");
+  const auto recorded = Read(prefix / ".playden-redist");
+  CHECK(recorded.find(" .playden-gog/redist/XNA/xnafx40_redist.msi\n") != std::string::npos);
+  CHECK(recorded.find(" .playden-gog/redist/DOTNET8/windowsdesktop-runtime-8.0-win-x64.exe\n") != std::string::npos);
+  const auto lines = [&](const std::string& part) {
+    std::lock_guard<std::mutex> lock(move.mutex);
+    return static_cast<std::size_t>(std::count_if(move.lines.begin(), move.lines.end(), [&](const std::string& line) {
+      return line.find(part) != std::string::npos;
+    }));
+  };
+  CHECK(move.Logged("redist app=" + app + " script=gog name=XNA40 result=installed detail=.playden-gog/redist/XNA/xnafx40_redist.msi files=1"));
+  CHECK(move.Logged("redist app=" + app + " script=gog name=DOTNET8 result=installed detail=.playden-gog/redist/DOTNET8/"
+                    "windowsdesktop-runtime-8.0-win-x64.exe (DesktopRuntime) files=1"));
+  CHECK(move.Logged("redist app=" + app + " script=gog name=PhysX result=not-run detail=no_program"));
+  CHECK(lines("name=DirectX") == 0 && lines("DXSETUP") == 0 && lines("result=failed") == 0);
+  CHECK(lines("gog redist app=") == 0);
+  CHECK(lines("result=installed") == 2);
+  const auto skipped = lines("name=PhysX result=not-run");
+  // The script's values, in the same start: both registry views for HKLM, `{app}` as Wine sees the folder.
+  const auto system = Read(prefix / "system.reg");
+  for (const auto* key : {"[Software\\\\GOG.com\\\\Games\\\\1900000002]", "[Software\\\\Wow6432Node\\\\GOG.com\\\\Games\\\\1900000002]"}) {
+    const auto header = system.find(key);
+    CHECK(header != std::string::npos &&
+          system.find(R"("PATH"="Z:\\data\\playden-games\\gog-1900000002")", header) != std::string::npos);
+  }
+  CHECK(Read(prefix / "user.reg").find(R"("Runs"=dword:00000003)") != std::string::npos);
+  CHECK(move.Logged("gog registry app=" + app + " values=2 skipped=0"));
+  {
+    // The packages first, then the script's values.
+    std::lock_guard<std::mutex> lock(move.mutex);
+    const auto at = [&](const std::string& prefix) {
+      return std::find_if(move.lines.begin(), move.lines.end(), [&](const std::string& line) { return line.rfind(prefix, 0) == 0; });
+    };
+    const auto registry = at("gog registry app=" + app + " ");
+    CHECK(registry != move.lines.end() && at("redist app=" + app + " script=gog name=DOTNET8 result=installed") < registry);
+  }
+
+  // The next start installs nothing again.
+  host.Play(number);
+  const auto played = WaitFor(host, [number](const RuntimeSnapshot& s) { return s.handoff_ready || s.play_refusals.count(number); }, 30);
+  if (played.play_refusals.count(number)) std::fprintf(stderr, "Play refused: %s\n", played.play_refusals.at(number).c_str());
+  CHECK(played.handoff_ready && host.Handoff());
+  // The step ran again (the list's not-run line once more), and found both packages installed.
+  CHECK(lines("name=PhysX result=not-run") > skipped);
+  CHECK(lines("result=installed") == 2 && Read(prefix / ".playden-redist") == recorded && lines("result=failed") == 0);
+  host.Shutdown();
+}
+
 int main(int argc, char** argv) {
   CHECK(argc == 2);
   g_runtime_dir = argv[1];
+  // The Online cases run with the experimental feature on; one case turns it off.
+  SetOnlineSteamEnabled(true);
   PlayerPresetsResolveRecords(false);
   PlayerPresetsResolveRecords(true);
   LeftoverDeletionSharesThePreparationAndUninstallQueue();
@@ -8296,6 +9723,7 @@ int main(int argc, char** argv) {
   LeftoverRemovalRevalidatesBeforeEffects();
   for (int scenario = 0; scenario < 3; ++scenario) LeftoverRemovalRecoversRetireWriteGap(scenario);
   LeftoverScanRequiresLoadedRecordsAndRepeatsAfterUninstall();
+  ForeignRecordKeepsItsTitleAtStartup();
   KeepsUnrecordedBottlesAsKeptSaves();
   WorkerMovesGamesUnderPublicationLease();
   NoKitRefusesPreparationWithoutDurableEffects();
@@ -8303,6 +9731,7 @@ int main(int argc, char** argv) {
   QueuedPreparationIsPublishedUntilTaken();
   PrepareNextReordersWaitingPreparations();
   HeldPreparationsWait();
+  PausedPreparationsWaitInOrder();
   HoldsEffectiveUidWhileWorking();
   StartupReportsJournalsWithoutResuming();
   LocalGameGetsRuntimeNumber();
@@ -8315,6 +9744,10 @@ int main(int argc, char** argv) {
   DriveUpdateSkipsABusyGame();
   UsbGameNamesNoMount();
   MoveAfterUsbSwap();
+  GogScriptSetsIniAtEachStart();
+  PausedQueueHoldsGogPreparation();
+  GogScriptSetsRegistryAtEachStart();
+  GogRedistInstallsAtPlay();
   OlderTitleKeepsItsMount();
   PreparesGameOnUnownedDrive();
   PrepareFixesRootOwnedHomebrewFolder();
@@ -8323,8 +9756,10 @@ int main(int argc, char** argv) {
   AnyTitleKitMakesTheGameItsOwnTitle();
   DisplayVrrKitDeclaresTheTitleVrrSupported();
   PreparationEndsAwaitingRegistration();
+  FinishSetupHandsOverForHome();
   PreparesGameWithoutShippedRecipe();
   for (int scenario = 0; scenario <= 3; ++scenario) OlderEngineDefaultsArePublishedOnPlay(scenario);
+  SteamGameShownInSteamLibrary();
   UpdatedFilesSetUpTheLaunchAgain();
   PreparesProgramChosenInSettings();
   SettingsChangeMakesNoFolderThroughLinkAboveGame();
@@ -8390,6 +9825,7 @@ int main(int argc, char** argv) {
   CommunityRecipeSwitches();
   AppliedCommunityRecipeSurvivesKitSwap();
   CommunityRecipeOverGeneratedAndKitFallback();
+  WorkingFolderTakesTheDiskSpelling();
   SettingsOnlyRecipeStartsPlaydensProgram();
   ImportedGameTakesItsSteamAppIdsRecipe();
   LinkedRecipeAppliesUnderItsAlias();

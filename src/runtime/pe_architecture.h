@@ -7,18 +7,24 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <string>
+#include <sys/stat.h>
 #include <string_view>
 #include <sys/types.h>
 #include <unistd.h>
 
 namespace playden::runtime {
 
-// Return the architecture from the executable itself, or empty when it is not
-// a supported PE image. Keep launch profile generation and game settings in
-// agreement about the actual program on disk.
+// "pe32" or "pe64" from a Windows executable's PE header; empty when it is neither, or when the path is not a
+// regular file (a symbolic link, a folder, a FIFO) or can't be read. Reads only the DOS and PE headers.
 inline std::string ExecutableArchitecture(const std::string& path) {
-  const int file = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  // O_NONBLOCK: opening a FIFO must not wait for a writer; it is then refused as not a regular file.
+  const int file = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
   if (file < 0) return {};
+  struct stat info {};
+  if (::fstat(file, &info) != 0 || !S_ISREG(info.st_mode)) {
+    ::close(file);
+    return {};
+  }
   const auto read_at = [file](off_t offset, unsigned char* buffer, std::size_t size) {
     std::size_t done = 0;
     while (done < size) {
@@ -47,6 +53,9 @@ inline std::string ExecutableArchitecture(const std::string& path) {
   return architecture;
 }
 
+// The architecture to launch with: the installed program's own PE header when it can be read, otherwise Steam's
+// os_arch hint for the launch entry. Keeps launch profile generation and game settings agreeing about the program
+// actually on disk. (PS4: ps4/platform_ps4/steam_auth.cpp; not upstream.)
 inline std::string LaunchArchitecture(const std::string& installed_executable,
                                       std::string_view steam_os_arch) {
   const auto detected = installed_executable.empty() ? std::string()

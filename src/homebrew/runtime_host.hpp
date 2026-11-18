@@ -338,6 +338,15 @@ struct PreparedGame {
 inline constexpr std::int64_t kPreparedDays = 7;
 inline constexpr std::size_t kMaxPrepared = 20;
 
+// Uninstall Playden (#868): how RuntimeHost::RemovePlayden went.
+struct PlaydenRemovalOutcome {
+  bool complete = false;                 // every PS5 title and every file of Playden's is gone
+  std::string message;                   // why it stopped, when it did
+  std::vector<std::string> kept;         // kept on purpose: kept saves, an import folder that holds files
+  std::vector<std::string> failed;       // files that could not be removed
+  std::vector<std::string> disconnected; // drives with games that weren't connected: their playden folder stays
+};
+
 struct RuntimeSnapshot {
   std::uint64_t revision = 0;
   RuntimeHostStatus status = RuntimeHostStatus::kStarting;
@@ -395,6 +404,10 @@ struct RuntimeSnapshot {
   std::optional<std::uint32_t> removing_app;
   std::map<std::uint32_t, std::string> removal_failures;
   std::uint64_t removals_handled = 0;
+  // Uninstall Playden: running, and how the last one went (RemovePlayden).
+  bool removing_playden = false;
+  std::optional<PlaydenRemovalOutcome> playden_removal;
+  std::uint64_t playden_removals_handled = 0;  // one more for each outcome, so none is missed between looks
   // Game data kept when a game was uninstalled (bottles with no install record).
   std::vector<KeptBottleView> kept_bottles;
   // Unrecorded PS5 titles, and their queued/running deletion or latest failure (keyed by title ID).
@@ -539,6 +552,10 @@ class RuntimeHost {
   bool WithdrawPrepare(std::uint32_t runtime_number);
   // While held, no queued preparation starts (a quit to Home waits for the running one only).
   void HoldPreparations(bool hold);
+  // The player's Pause all in Queue: like a hold, no queued preparation starts (nor a drive update's next game), and
+  // the one running finishes. Kept apart from the quit's hold so either can end without ending the other. Not saved:
+  // a restart starts unpaused.
+  void PausePreparations(bool pause);
   // Takes a finished preparation off RuntimeSnapshot::prepared; ClearPrepared takes every one off,
   // including those past the kMaxPrepared the snapshot lists.
   void DismissPrepared(std::uint32_t runtime_number, std::int64_t finished_at);
@@ -570,7 +587,7 @@ class RuntimeHost {
   // until it is written again: at the game's next Play, a change of its settings or the account's next sign-in (each
   // Playden start). Safe from any thread.
   void SetSteamInvisible(bool invisible);
-  // Settings › Online play › Steam sign-in notice: whether each handoff from now on asks the Steam host to show the
+  // Settings › Accounts › Steam sign-in notice: whether each handoff from now on asks the Steam host to show the
   // account it signed in as (notice=1). On until the saved choice says otherwise; kept handoffs as above. Any thread.
   void SetSteamOnlineNotice(bool notice);
   // Queues removal of a game's PS5 title. Its bottle (saves and settings) is kept
@@ -578,6 +595,11 @@ class RuntimeHost {
   void Remove(std::uint32_t runtime_number, bool delete_saves);
   // Queues deletion of a game's kept bottle.
   void DeleteKeptBottle(std::uint32_t runtime_number);
+  // Uninstall Playden (#868): removes every game's PS5 title (keeping each bottle as <id>.kept with
+  // keep_saves), every leftover title of Playden's, then every file Playden made on the console
+  // (runtime/playden_removal.h). Refused while a game runs. The outcome is RuntimeSnapshot::playden_removal;
+  // Playden then quits. A removal stopped part way is finished by the next start (uninstall.json).
+  void RemovePlayden(bool keep_saves);
   // Deletes only a scanned leftover's PS5 title and registration; its game files and saves stay.
   bool DeleteLeftoverTitle(const std::string& title_id, std::string* error = nullptr);
   // Queues a scan of a game folder for the Program picker (RuntimeSnapshot::game_setups).
@@ -799,21 +821,22 @@ class RuntimeHost {
   std::string Direct3D12Step(Composition& composition, const GameFiles& files);
   void KitMonoStep(Composition& composition, const runtime::RuntimeInstall& record, const char* when);  // never stops the start
   void VcRuntimeStep(const GameFiles& files);  // never stops the start
-  void SaveFoldersStep(Composition& composition, const GameFiles& files);  // never stops the start
+  void SaveFoldersStep(Composition& c, const GameFiles& files);  // never stops the start
   std::string BottleEnvironmentStep(const GameFiles& files);
   // The recipe's registry values, tracked per install (runtime::RecipeRegistryState) so a switch
   // removes what the earlier recipe wrote and left; idempotent.
   std::string RecipeRegistryStep(Composition& composition, const GameFiles& files);
   std::string RecipeIniStep(const GameFiles& files);
+  void GogScriptStep(const GameFiles& files);  // never stops the start
   std::string RecipeFilesStep(const GameFiles& files);
   std::string DotnetHeapStep(const GameFiles& files);
   void MfcStep(const GameFiles& files);  // an upgrade: never stops the start
   // Steam features = Online with the Steam host: Valve's client files in place (downloaded at Play), and no saved
   // sign-in of the client's unless the game keeps its sign-in for the Home screen. Never stops the start.
   void SteamClientStep(const GameFiles& files);
-  // Steam features = Online on a title that shows the game in steamapps\common ([steam]): the client lists the bottle's
-  // Steam library and finds the game's appmanifest there, so it says the game is installed (runtime/steam_library.h).
-  // Never stops the start.
+  // Steam features = Online on a title that shows the game in steamapps\common ([steam], Steam library folder = Steam's
+  // folder): the client lists the bottle's Steam library and finds the game's appmanifest there, so it says the game is
+  // installed (runtime/steam_library.h). Never stops the start.
   void SteamLibraryStep(Composition& composition, const GameFiles& files);
   std::filesystem::path SteamClientFolder() const;  // shared by every Online game, on internal storage
   // Playden's own record of the client it installed (version, steamclient64.dll's SHA-256), while that version is the
@@ -824,6 +847,9 @@ class RuntimeHost {
   // Steam-file steps.
   std::string SteamStubStep(const GameFiles& files);
   std::string SteamworksStep(const GameFiles& files, bool steam_account_known);  // and the legacy steam.dll
+  // At Play: one runtime log line with the settings the game starts with (the performance overlay and the rows the
+  // player or a preset set), so a report's logs show what a failed start ran with.
+  void LogPlaySettings(Composition& composition, const runtime::RuntimeInstall& record);
   // How a game gets the Steam session: not at all (not set to Online), at Play only, or kept for the Home screen.
   enum class OnlineHandoff { kNone, kAtPlay, kKept };
   // invites (optional): Game invites as the game's title runs it (ask, join, show or off), when there is a handoff.
@@ -838,6 +864,7 @@ class RuntimeHost {
   // with no account every one goes. A Steam sign-in goes with its handoff: the token Valve's client saved in the bottle,
   // and its account list in the client folder once no game keeps its sign-in.
   void SyncOnlineSessions(Composition& composition, bool startup);
+  void CopyTitleLogs(const Composition& composition);
   void DropOnlineSession(const std::filesystem::path& bottle);  // before a bottle is kept without its game
   // At Play, after OnlineSessionStep: no earlier Play's one-launch file, and this Play's when the session was handed
   // over (handed) and it asks something.
@@ -850,6 +877,11 @@ class RuntimeHost {
   // HandOverForHome's work, on the worker: only for a game waiting for console registration whose title has its saved settings.
   void HomeHandoff(Composition& composition, std::uint32_t runtime_number);
   std::string InstallScriptsStep(const GameFiles& files);                        // and redistributables
+  // A GOG game's setRegistry values (its products' goggame-<id>.script), after RecipeRegistryStep.
+  std::string GogRegistryStep(const GameFiles& files);
+  // A GOG game's redistributables (its .playden-gog/redist.list), at InstallScriptsStep's end; the outcomes go to log.
+  void GogRedistStep(const GameFiles& files, const std::string& install_dir, const runtime::RedistProgress& progress,
+                     const std::function<void(const runtime::RedistInstallResult&)>& log);
   // The Steam app ID the game's emulator uses.
   SteamworksAppView SteamworksAppFor(const GameFiles& files) const;
   // Whether the install's title runs the installed kit's runtime: its owner markers name this kit
@@ -903,6 +935,12 @@ class RuntimeHost {
   // Keeps bottles no install record and no unrecorded PS5 title names (their title was deleted
   // as a leftover, or its record was lost) as kept saves, so Storage lists them.
   void KeepUnrecordedBottles(Composition& composition);
+  PlaydenRemovalOutcome RunRemovePlayden(Composition& composition, bool keep_saves);
+  // Opens a bottle no title uses (kept, set aside, or a saves backup) to FTP: folders 0777, files 0666,
+  // launcher sign-ins (runtime::PrivateProfilePaths under `profile`, relative to folder) 0700/0600.
+  // Logs what it couldn't open.
+  void OpenKeptBottle(const std::filesystem::path& folder,
+                      const std::filesystem::path& profile = "library/prefixes/game/drive_c/users/prospero");
   struct LeftoverDelete {
     runtime::LeftoverTitle title;
     std::string operation_id;
@@ -1004,6 +1042,7 @@ class RuntimeHost {
   std::uint64_t next_work_order_ = 0;
   std::map<std::uint32_t, std::uint64_t> prepare_order_;
   std::vector<std::uint32_t> kept_delete_requests_;
+  std::optional<bool> playden_removal_request_;  // keep_saves; guarded by mutex_
   std::vector<std::pair<std::uint32_t, std::string>> scan_requests_;
   std::vector<std::pair<std::uint32_t, RuntimeMaintenance>> maintenance_requests_;
   std::vector<std::uint32_t> home_handoff_requests_;
@@ -1018,7 +1057,10 @@ class RuntimeHost {
   bool cleanup_requested_ = false;
   bool measure_requested_ = false;
   bool kit_reload_requested_ = false;  // guarded by mutex_
-  bool prepares_held_ = false;
+  bool prepares_held_ = false;    // guarded by mutex_
+  bool prepares_paused_ = false;  // guarded by mutex_
+  // Whether queued preparations wait (a quit's hold or the player's pause). Called with mutex_ held.
+  bool PreparesHeldLocked() const { return prepares_held_ || prepares_paused_; }
   std::vector<PreparedGame> prepared_dismissals_;  // guarded by mutex_
   bool prepared_clear_requested_ = false;          // guarded by mutex_
   std::vector<PreparedGame> prepared_history_;     // worker thread only, oldest first

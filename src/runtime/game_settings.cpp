@@ -1,4 +1,5 @@
 #include "runtime/game_settings.h"
+
 #include "runtime/game_probe.h"
 #include "runtime/steam_host.h"
 #include "runtime/artifact_hash.h"
@@ -27,6 +28,7 @@
 #include <limits>
 #include <optional>
 #include <set>
+#include <type_traits>
 #include <sys/stat.h>
 #include <type_traits>
 #include <unistd.h>
@@ -72,32 +74,63 @@ std::vector<SettingDefinition> BuildCatalogue() {
   // title's program (RuntimeHost::RepublishSettings). The picker also lists the game folder's
   // programs, which set "program".
   list.push_back(Choice("launch_option", "Program", "Which program starts when you press Play.",
-                        "Steam launch option · [application] executable", G::kGame, {}, "", 1));
+                        "Steam launch option", G::kGame, {}, "", 1));
   {
     // Not a row of its own: the Program picker sets it to a program from the game folder.
     auto program = Text("program", "Program file", "A program from the game folder instead of a launch option.",
-                        "[application] executable", G::kGame);
+                        "", G::kGame);
     list.push_back(std::move(program));
   }
   list.push_back(Choice("start_through_launcher", "Start through a launcher",
-                        "Turn on if this program opens a launcher that starts the game.", "[launcher]", G::kGame,
+                        "Turn on if this program opens a launcher that starts the game.", "", G::kGame,
                         {{"off", "Off", ""}, {"on", "On", "Starts in launcher mode. Hold the touchpad in game to switch presets."}},
                         "off"));
   list.push_back(Choice("launcher_controller_preset", "Launcher controller preset",
-                        "Used until the game starts. Then the Controller preset takes over.", "[launcher] preset", G::kGame,
+                        "Used until the game starts. Then the Controller preset takes over.", "", G::kGame,
                         {{"mouse", "Mouse", "Left stick moves the pointer; Cross clicks, Circle right-clicks, Options Enter."},
                          {"gamepad", "Gamepad", "Xbox controller layout; no stick moves the pointer."},
                          {"arrows", "Arrow keys", "D-pad sends the arrows; Cross Z, Circle X, Triangle C, Options Enter."}},
                         "mouse"));
   list.push_back(Text("extra_arguments", "Extra arguments", "Added after the arguments the game needs.",
-                      "[application] arguments", G::kGame));
+                      "", G::kGame));
+  // Online play: its own section after Game, so a player finds it.
+  list.push_back(Choice("steam_features", "Steam features", "What answers the game when it calls Steam.",
+                        "steam_api.dll · steam_api64.dll", G::kOnline,
+                        {{"emulate", "Offline emulation", "Playden's Steam emulator answers the game."},
+                         {"online", "Online (experimental)",
+                          "Runs Steam's own client beside the game, signed in as you. Only for games you trust."},
+                         {"game", "Game's own files", "The game's Steam library, unchanged."},
+                         // runtime/steamworks.h kSteamClientFeature: for a game that checks its own Steam library file.
+                         {"steamclient", "Offline emulation, game's library",
+                          "The game's own Steam library, answered by Playden's Steam emulator."}},
+                        "game", 1, ApplyMode::kGameClosed));
+  // Online's handoff (runtime/online_session.h): read once and deleted by default, or kept so that a start from the
+  // PS5 Home screen, without Playden, signs in too.
+  list.push_back(Choice("steam_sign_in", "Steam sign-in",
+                        "When the game gets your Steam sign-in. Kept, it stays on the console while this is on: any "
+                        "program that can read the console's storage can use your Steam account.",
+                        "", G::kOnline,
+                        {{"play", "At each Play", "From Playden only. Started from the Home screen, it is offline."},
+                         {"kept", "Kept for the Home screen", "Online from the Home screen too. Signing out removes it."}},
+                        "play", 1, ApplyMode::kGameClosed));
+  // What the Steam host does with a friend's invite while the game runs, as online-session.txt's invites= says. Ask and
+  // Only show need a title that shows notifications (title-notify); without it both are Off.
+  list.push_back(Choice("game_invites", "Game invites", "What happens when a friend invites you while you play.",
+                        "", G::kOnline,
+                        {{"ask", "Ask with L3 + R3",
+                          "The " PLAYDEN_CONSOLE_NAME " shows the invite. Press both sticks in within 15 seconds to join. The game does not "
+                          "see that press."},
+                         {"join", "Join at once", "Every invite is accepted. It can pull you out of a match."},
+                         {"show", "Only show",
+                          "The " PLAYDEN_CONSOLE_NAME " shows the invite and the game is not told. Join later from the game page."},
+                         {"off", "Off",
+                          "Invites are ignored: no notification, and the game is not told. Friends can still join a "
+                          "lobby you open."}},
+                        "ask", 1, ApplyMode::kGameClosed));
   // Display.
   list.push_back(Choice("resolution", "Resolution", "Size of the game's screen. Higher is sharper and slower.",
-                        "[display] desktop", G::kDisplay,
-                        {{"1024x768", "1024×768", "4:3, for older games that expect it."},
-                         {"1152x864", "1152×864", "4:3, for older games that expect it."},
-                         {"1280x960", "1280×960", "4:3, for older games that expect it."},
-                         {"1280x720", "1280×720", "Smoother frame rate in heavy scenes. Softer on a 4K TV."},
+                        "", G::kDisplay,
+                        {{"1280x720", "1280×720", "Smoother frame rate in heavy scenes. Softer on a 4K TV."},
                          {"1920x1080", "1920×1080", "Full HD."},
                          {"2560x1440", "2560×1440", "Sharper image. May drop below 60 fps."},
                          {"3840x2160", "3840×2160", "The TV's own size. For light games; heavy ones run slowly."}},
@@ -105,13 +138,13 @@ std::vector<SettingDefinition> BuildCatalogue() {
   list.push_back(Choice("refresh", "Refresh rate",
                         "How often the TV shows a new frame. Some older games run too fast at 120 Hz: if so, set it "
                         "back to 60 Hz.",
-                        "[display] refresh", G::kDisplay,
+                        "", G::kDisplay,
                         {{"60", "60 Hz", "The TV refreshes 60 times a second."},
                          {"120", "120 Hz", "Needs a TV with 120 Hz and the " PLAYDEN_CONSOLE_NAME "'s 120 Hz output on."}},
                         "60"));
   // With a display-120hz runtime the display paces the cap ([display] frame_rate); otherwise DXVK does.
   list.push_back(Choice("frame_limit", "Frame limit", "Caps the frame rate for steadier motion and less heat.",
-                        "[display] frame_rate · dxgi.maxFrameRate · d3d9.maxFrameRate", G::kDisplay,
+                        "dxgi.maxFrameRate · d3d9.maxFrameRate", G::kDisplay,
                         {{"off", "Off", "No cap."}, {"120", "120", ""}, {"60", "60", ""}, {"40", "40", ""},
                          {"30", "30", ""}},
                         "off", 2));
@@ -166,7 +199,7 @@ std::vector<SettingDefinition> BuildCatalogue() {
                          {"mouselook", "Mouse look",
                           "Left stick W A S D, right stick looks; R2 clicks, L2 right-clicks, Options Escape."}},
                         "none"));
-  // A second preset for menus the controller can't use, a hold away; [launcher] chain = off.
+  // A second preset for menus the controller can't use, a hold away; the [launcher] lines with chain = off.
   list.push_back(Choice("touchpad_hold", "Touchpad hold",
                         "Hold the touchpad for 2 seconds to swap to another preset, for menus.", "", G::kControls,
                         {{"off", "Off", "The touchpad works as the game's own button."},
@@ -183,58 +216,53 @@ std::vector<SettingDefinition> BuildCatalogue() {
       {"touchpad", "Touchpad"}};
   for (const auto& button : ProsperoButtons()) {
     auto definition = Text("button." + button, button_names.at(button), "Key or mouse button this button sends.",
-                           "[input] " + button, G::kButtonMapping);
+                           "", G::kButtonMapping);
     list.push_back(std::move(definition));
   }
   // Controls › Controller tuning.
   list.push_back(Choice("pointer_stick", "Pointer stick", "Move the mouse pointer with a stick, for menus.",
-                        "[input] mouse", G::kControllerTuning,
-                        {{"none", "None", ""}, {"left_stick", "Left stick", ""}, {"right_stick", "Right stick", ""},
-                         {"touchpad", "Touchpad", "Slide a finger on the touchpad to move the pointer."}},
-                        "none"));
-  list.push_back(Choice("movement_stick", "Movement stick", "A stick sends W A S D, for games that walk with the keys.",
-                        "[input] keyboard_stick", G::kControllerTuning,
+                        "", G::kControllerTuning,
                         {{"none", "None", ""}, {"left_stick", "Left stick", ""}, {"right_stick", "Right stick", ""}},
                         "none"));
   list.push_back(Choice("pointer_speed", "Pointer speed", "How fast the pointer moves, in pixels per second.",
-                        "[input] mouse_speed", G::kControllerTuning,
+                        "", G::kControllerTuning,
                         {{"600", "600", ""}, {"900", "900", ""}, {"1200", "1200", ""}, {"1800", "1800", ""},
                          {"2400", "2400", ""}},
                         "1200"));
   list.push_back(Choice("stick_deadzone", "Stick dead zone",
                         "How far a stick moves before the game sees it. Raise it if the camera drifts.",
-                        "[input] stick_deadzone", G::kControllerTuning,
+                        "", G::kControllerTuning,
                         {{"0", "Off", "The game's own dead zone only."}, {"5", "5%", ""}, {"10", "10%", ""},
                          {"15", "15%", ""}, {"20", "20%", ""}, {"30", "30%", "For a badly drifting stick."}},
                         "0", 4));
-  list.push_back(Choice("rumble", "Rumble", "How strongly the controller vibrates.", "[input] rumble",
+  list.push_back(Choice("rumble", "Rumble", "How strongly the controller vibrates.", "",
                         G::kControllerTuning,
                         {{"100", "Full", ""}, {"75", "75%", ""}, {"50", "50%", ""}, {"25", "25%", ""},
                          {"0", "Off", ""}},
                         "100", 4));
   list.push_back(Choice("invert_stick", "Invert stick", "Flip a stick's up and down for this game.",
-                        "[input] invert", G::kControllerTuning,
+                        "", G::kControllerTuning,
                         {{"none", "None", ""}, {"left_y", "Left stick up/down", ""}, {"right_y", "Right stick up/down", ""}},
                         "none", 4));
   list.push_back(Choice("trigger_deadzone", "Trigger dead zone",
                         "How far L2 and R2 travel before the game sees them. Raise it for worn triggers.",
-                        "[input] trigger_deadzone", G::kControllerTuning,
+                        "", G::kControllerTuning,
                         {{"0", "Off", ""}, {"5", "5%", ""}, {"10", "10%", ""}, {"20", "20%", ""}, {"30", "30%", ""}},
                         "0", 4));
   list.push_back(Choice("wheel_stick", "Mouse wheel stick", "Scroll the mouse wheel by pushing a stick up or down.",
-                        "[input] wheel", G::kControllerTuning,
+                        "", G::kControllerTuning,
                         {{"none", "None", ""}, {"left_stick", "Left stick", ""}, {"right_stick", "Right stick", ""}},
                         "none", 4));
   // Sound.
   list.push_back(Choice("volume", "Volume", "How loud this game plays, without changing the console's volume.",
-                        "[audio] volume", G::kSound,
+                        "", G::kSound,
                         {{"100", "100%", ""}, {"75", "75%", ""}, {"50", "50%", ""}, {"25", "25%", ""},
                          {"0", "Muted", ""}},
                         "100", 4));
   // Compatibility.
   // Shown only for a game whose program Playden refuses for a reason a run could get past.
   list.push_back(Choice("start_check", "Known problems", "What Playden does with a problem it found in the game's program.",
-                        ".NET · shared section", G::kCompatibility,
+                        "", G::kCompatibility,
                         {{"stop", "Don't start", "Playden stops before a program it expects to fail."},
                          {"try", "Try anyway", "Prepares the game anyway. It may not start."}},
                         "stop", 1));
@@ -274,7 +302,9 @@ std::vector<SettingDefinition> BuildCatalogue() {
                         "dxgi.maxDeviceMemory · d3d9.maxAvailableMemory", G::kGraphics,
                         {{"game", "DXVK default", ""}, {"2048", "2 GB", ""}, {"4096", "4 GB", ""}}, "game", 2));
   // Compatibility › Steam.
-  // Steam's folder is opt-in for games already installed, but is the per-game default for new installs.
+  // Where Wine shows a Steam game ([steam] install_dir, kit capability steam-library-path). Moving a game that already
+  // ran can break it, so a game keeps its own folder unless this Playden installed it: that install's record holds
+  // "default.steam_library_path" = steam (kGameDefaultPrefix), which is the game's default, not a change.
   list.push_back(Choice("steam_library_path", "Steam library folder", "Where the game sees itself installed.",
                         "steamapps\\common", G::kSteam,
                         {{"steam", "Steam's folder",
@@ -282,36 +312,6 @@ std::vector<SettingDefinition> BuildCatalogue() {
                           "installs it. Some games need this to find Steam."},
                          {"playden", "Playden's folder", "The game runs from its own folder on Z:, as before."}},
                         "playden", 1, ApplyMode::kGameClosed));
-  list.push_back(Choice("steam_features", "Steam features", "What answers the game when it calls Steam.",
-                        "steam_api.dll · steam_api64.dll", G::kOnline,
-                        {{"emulate", "Offline emulation", "Playden's Steam emulator answers the game."},
-                         {"online", "Online (experimental)",
-                          "Runs Steam's own client beside the game, signed in as you. Only for games you trust."},
-                         {"game", "Game's own files", "The game's Steam library, unchanged."}},
-                        "game", 1, ApplyMode::kGameClosed));
-  // Online's handoff (runtime/online_session.h): read once and deleted by default, or kept so that a start from the
-  // PS5 Home screen, without Playden, signs in too.
-  list.push_back(Choice("steam_sign_in", "Steam sign-in",
-                        "When the game gets your Steam sign-in. Kept, it stays on the console while this is on: any "
-                        "program that can read the console's storage can use your Steam account.",
-                        "", G::kOnline,
-                        {{"play", "At each Play", "From Playden only. Started from the Home screen, it is offline."},
-                         {"kept", "Kept for the Home screen", "Online from the Home screen too. Signing out removes it."}},
-                        "play", 1, ApplyMode::kGameClosed));
-  // What the Steam host does with a friend's invite while the game runs, as online-session.txt's invites= says. Ask and
-  // Only show need a title that shows notifications (title-notify); without it both are Off.
-  list.push_back(Choice("game_invites", "Game invites", "What happens when a friend invites you while you play.",
-                        "", G::kOnline,
-                        {{"ask", "Ask with L3 + R3",
-                          "The " PLAYDEN_CONSOLE_NAME " shows the invite. Press both sticks in within 15 seconds to join. The game does not "
-                          "see that press."},
-                         {"join", "Join at once", "Every invite is accepted. It can pull you out of a match."},
-                         {"show", "Only show",
-                          "The " PLAYDEN_CONSOLE_NAME " shows the invite and the game is not told. Join later from the game page."},
-                         {"off", "Off",
-                          "Invites are ignored: no notification, and the game is not told. Friends can still join a "
-                          "lobby you open."}},
-                        "ask", 1, ApplyMode::kGameClosed));
   // Online by default, as GameNative ships gbe_fork: games that check BLoggedOn() ("Steam is offline") get to their
   // online menus. Offline is for a game that waits on the network when it is told Steam is online.
   list.push_back(Choice("steam_network", "Steam network", "Whether the game is told Steam is online.",
@@ -632,7 +632,8 @@ std::string Unavailable(const SettingDefinition& definition, const std::string& 
   }
   if (id == "steam_input") {
     const auto steam = values.find("steam_features");
-    if (steam == values.end() || steam->second.value != "emulate") return "Only with Offline emulation.";
+    if (steam == values.end() || (steam->second.value != "emulate" && steam->second.value != "steamclient"))
+      return "Only with Offline emulation.";
   }
   if (id == "steam_library_path" && !kit.steam_library_path)
     return kit.steam_library_path_needs_update ? kAppliesAfterKitUpdate
@@ -734,10 +735,16 @@ std::string Unavailable(const SettingDefinition& definition, const std::string& 
     const auto steam = values.find("steam_features");
     if (steam == values.end() || steam->second.value != "online") return "Only with Steam features = Online.";
   }
+  // Another store's game has no Steam folder: the sheet says so for it (Simulation), and the runtime shows only Steam
+  // games there whatever the row says.
+  if (id == "steam_library_path" && !kit.steam_library_path)
+    return kit.steam_library_path_needs_update ? kAppliesAfterKitUpdate
+                                               : "Needs a newer runtime kit that shows the game in Steam's folder.";
   if (id == "steam_network") {
     if (!OnlineSteamEnabled()) return "Needs online-steam in features.txt.";
     const auto steam = values.find("steam_features");
-    if (steam == values.end() || steam->second.value != "emulate") return "Only with Steam features = Offline emulation.";
+    if (steam == values.end() || (steam->second.value != "emulate" && steam->second.value != "steamclient"))
+      return "Only with Steam features = Offline emulation.";
   }
   return {};
 }
@@ -776,8 +783,8 @@ const std::map<std::string, std::map<std::string, std::string>>& ControllerPrese
 const std::map<std::string, std::string>& TouchpadMenuButtons() {
   static const std::map<std::string, std::string> buttons = {
       {"cross", "mouse_left"}, {"circle", "mouse_right"}, {"square", "mouse_middle"}, {"r2", "mouse_left"},
-      {"l2", "mouse_right"}, {"options", "enter"},      {"triangle", "escape"},     {"up", "up"},
-      {"down", "down"},       {"left", "left"},          {"right", "right"}};
+      {"l2", "mouse_right"},   {"options", "enter"},      {"triangle", "escape"},     {"up", "up"},
+      {"down", "down"},        {"left", "left"},          {"right", "right"}};
   return buttons;
 }
 
@@ -1037,9 +1044,9 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
   for (const auto& definition : SettingsCatalogue()) {
     EffectiveValue value;
     value.value = definition.id == "launch_option" ? DefaultLaunchEntry(recipe) : definition.playden_default;
+    // The game's own default (kGameDefaultPrefix) is still Playden's: a recipe, a preset and the player win over it.
     if (const auto own = overrides.find(kGameDefaultPrefix + definition.id);
-        own != overrides.end() && IsGameDefaultKey(own->first) &&
-        ValidateSettingValue(recipe, definition.id, own->second, nullptr))
+        own != overrides.end() && IsGameDefaultKey(own->first) && ValidateSettingValue(recipe, definition.id, own->second, nullptr))
       value.value = own->second;
     const auto layer = [&](const std::map<std::string, std::string>& source, ValueSource kind) {
       const auto found = source.find(definition.id);
@@ -1079,6 +1086,7 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
   out.graphics = out.values["graphics"].value;
   out.environment_as_debug_env = !kit.environment && kit.opengl_zink;
   out.debug_env_lines = kit.opengl_zink;
+  out.environment_section = kit.environment;
   out.profile_version = kit.profile_version_2 ? 2 : 1;
   out.long_profile = kit.launch_arguments_4096;
   out.display_120hz = kit.display_120hz;
@@ -1537,7 +1545,6 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
     for (const auto& button : ProsperoButtons())
       if (buttons.count(button)) text += button + " = " + buttons.at(button) + "\n";
   }
-
   // Touchpad hold: the same section without a launcher. The game starts on [input]; holding the touchpad swaps to the
   // menu preset written out here, and back. Start through a launcher has its own switch, so it wins.
   const auto& touchpad_hold = OptionalValue(settings, "touchpad_hold");
@@ -1660,6 +1667,20 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
       ++environment_count;
     }
   }
+  // DXVK reads dxvk.conf by a relative name when it loads, from whatever folder the game is in by then; a game that
+  // changes folder first (Dota 2 moves to game\bin\win64) never sees Playden's file. Naming it in full makes the
+  // folder not matter. After the player's variables, so it never takes one's place; left to the player's own
+  // DXVK_CONFIG_FILE (the runtime refuses a name given twice). A path the runtime could not hold once it puts a USB
+  // drive's number in it is left out: the file then still works for a game that stays in its folder.
+  if (settings.environment_section && !RenderDxvkConfig(settings).empty() &&
+      (!environment.available || !EnvironmentSetsName(environment.value, "DXVK_CONFIG_FILE")) &&
+      environment_count < kProsperoMaxEnvironmentEntries) {
+    const auto config = (working.empty() ? *root : *root + "\\" + Backslashes(working)) + "\\dxvk.conf";
+    if (config.size() < kProsperoMaxEnvironmentValueBytes - 1 && IsProsperoEnvironmentEntry("DXVK_CONFIG_FILE", config)) {
+      environment_lines += "DXVK_CONFIG_FILE = " + config + "\n";
+      ++environment_count;
+    }
+  }
   const bool environment_section = !environment_lines.empty();
   if (environment_section) text += "\n[environment]\n" + environment_lines;
 
@@ -1672,8 +1693,9 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
             "\nwait = " + std::to_string(kSteamHostWaitSeconds) + "\n";
 
   // A Steam game is shown to Wine in steamapps\common, where some games look for themselves before they use Steam
-  // (The Talos Principle). The profile keeps the real paths; the title links the folder. Left out when a path there
-  // would be too long for the runtime, which then starts the game from its real folder anyway.
+  // (The Talos Principle), when its Steam library folder row says Steam's folder. The profile keeps the real paths;
+  // the title links the folder. Left out when a path there would be too long for the runtime, which then starts the
+  // game from its real folder anyway.
   bool steam_section = false;
   const auto& library_folder = OptionalValue(settings, "steam_library_path");
   if (library_folder.available && library_folder.value == "steam" && !target.steam_install_dir.empty() &&
@@ -1742,6 +1764,27 @@ std::string RenderDxvkConfig(const EffectiveSettings& settings) {
     text += "dxgi.maxDeviceMemory = " + vram.value + "\nd3d9.maxAvailableMemory = " + vram.value + "\n";
   if (text.empty()) return text;
   return std::string(kDxvkHeader) + " Changes here are replaced on the next launch.\n" + text;
+}
+
+std::string SettingsLogSummary(const EffectiveSettings& settings) {
+  const auto find = [&](const char* id) -> const EffectiveValue* {
+    const auto found = settings.values.find(id);
+    return found == settings.values.end() ? nullptr : &found->second;
+  };
+  const auto* overlay = find("performance_overlay");
+  const bool overlay_on = overlay && overlay->available && overlay->value == "on";
+  std::string text = std::string("overlay=") + (overlay_on ? "on" : "off");
+  if (const auto* detail = find("overlay_detail"); overlay_on && detail && detail->available)
+    text += " detail=" + detail->value;
+  std::string chosen;
+  for (const auto& [id, value] : settings.values) {
+    if (value.source != ValueSource::kUser && value.source != ValueSource::kPreset) continue;
+    const auto* definition = FindSetting(id);
+    const bool typed = !definition || definition->kind == SettingKind::kText || definition->choices.empty();
+    chosen += (chosen.empty() ? "" : ",") + id + "=" + (typed ? "set" : value.value.empty() ? "-" : value.value);
+    if (!value.available) chosen += "(unavailable)";
+  }
+  return text + " chosen=" + (chosen.empty() ? "-" : chosen);
 }
 
 namespace {
@@ -2137,7 +2180,8 @@ bool ParseRecipeFile(std::string_view text, GameRecipe* recipe, std::string* rea
       if (value.empty() || HasControl(value)) return fail("default launch_option: not a launch option id");
       continue;
     }
-    // Whether this choice is offered (online-steam) is decided when the recipe is offered and applied.
+    // Online is one of the choices; whether this Playden offers it (online-steam) is decided where the recipe is
+    // offered and applied, so a recipe downloaded with it off is still kept.
     if (!SettingChoiceOffered(id, value)) continue;
     if (!ValidateSettingValue(out, id, value, &why)) return fail("default " + id + ": " + why);
   }
@@ -2159,7 +2203,7 @@ bool RetiredSetting(std::string_view id) { return id == "opengl_thread"; }
 
 bool ValidatePresetSetting(std::string_view id, std::string_view value, std::string* reason) {
   // Presets bundle choices and button bindings; launch entries, graphics and free text belong to the recipe or the
-  // player.
+  // player. So does where a game is installed (Steam library folder): moving a game that already ran can break it.
   const auto* definition = FindSetting(id);
   const bool button = id.compare(0, 7, "button.") == 0;
   if (!definition || id == "launch_option" || id == "graphics" || id == "architecture" || id == "start_check" ||
@@ -2257,8 +2301,10 @@ bool RecordFromValue(const storage_json::Value& root, GameSettingsRecord* out) {
         if (const auto ref = ParseGameRefText(game->text())) out->shared_recipe.game = *ref;
   }
   // Settings this build does not know are dropped so an older record still loads.
+  // So is a game default this build does not take, or one whose value isn't one of the row's.
   for (auto it = out->overrides.begin(); it != out->overrides.end();) {
-    const bool game_default = IsGameDefaultKey(it->first) &&
+    const bool game_default =
+        IsGameDefaultKey(it->first) &&
         ValidateSettingValue(GameRecipe{}, std::string_view(it->first).substr(std::string_view(kGameDefaultPrefix).size()),
                              it->second, nullptr);
     it = FindSetting(it->first) || IsUnlockKey(it->first) || game_default ? std::next(it) : out->overrides.erase(it);
@@ -2405,11 +2451,17 @@ std::string SerializeGameRecipe(const GameRecipe& recipe) {
 namespace {
 
 // Finds a game-relative path the way Windows would, ignoring case, and returns the
-// spelling on disk. Symbolic links are not followed.
-std::optional<std::string> ResolveGameFile(const std::string& root, const std::string& relative) {
-  // POSIX directory and status calls rather than std::filesystem: on PS4 the toolchain's
+// spelling on disk: a file, or with `folder` a folder. Symbolic links are not followed.
+std::optional<std::string> ResolveGamePath(const std::string& root, const std::string& relative, bool folder) {
+  namespace fs = std::filesystem;
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+  // PS4 only: POSIX directory and status calls rather than std::filesystem. The PS4 toolchain's
   // std::filesystem found no program that opendir/readdir/lstat find (Mafia's Game.exe, 01.90).
+  (void)0;
   std::string cursor = root;
+#else
+  fs::path cursor(root);
+#endif
   std::string resolved;
   std::size_t start = 0;
   while (start <= relative.size()) {
@@ -2417,10 +2469,11 @@ std::optional<std::string> ResolveGameFile(const std::string& root, const std::s
     const auto part = relative.substr(start, end - start);
     start = end + 1;
     if (part.empty()) return std::nullopt;
-    // The spelling as asked when it exists (a filesystem may ignore case: the console's does, and
-    // its directory listing found no name there), else the spelling stored in the directory.
+    std::error_code error;
+    // The spelling as asked when it exists (a filesystem may ignore case), else the spelling stored in the directory.
     std::string match;
     const auto wanted = LowerAscii(part);
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
     struct stat exact {};
     if (::lstat((cursor + "/" + part).c_str(), &exact) == 0) match = part;
     else if (DIR* directory = ::opendir(cursor.c_str())) {
@@ -2436,13 +2489,49 @@ std::optional<std::string> ResolveGameFile(const std::string& root, const std::s
     resolved += (resolved.empty() ? "" : "/") + match;
     struct stat info {};
     if (::lstat(cursor.c_str(), &info) != 0 || S_ISLNK(info.st_mode)) return std::nullopt;
-    if (end == relative.size()) return S_ISREG(info.st_mode) ? std::optional<std::string>(resolved) : std::nullopt;
+    if (end == relative.size())
+      return (folder ? S_ISDIR(info.st_mode) : S_ISREG(info.st_mode)) ? std::optional<std::string>(resolved)
+                                                                      : std::nullopt;
     if (!S_ISDIR(info.st_mode)) return std::nullopt;
+#else
+    for (fs::directory_iterator it(cursor, error), last; !error && it != last; it.increment(error)) {
+      const auto name = it->path().filename().string();
+      if (name == part) { match = name; break; }
+      if (match.empty() && LowerAscii(name) == wanted) match = name;
+    }
+    if (match.empty()) return std::nullopt;
+    cursor /= match;
+    resolved += (resolved.empty() ? "" : "/") + match;
+    const auto status = fs::symlink_status(cursor, error);
+    if (error || fs::is_symlink(status)) return std::nullopt;
+    if (end == relative.size())
+      return (folder ? fs::is_directory(status) : fs::is_regular_file(status)) ? std::optional<std::string>(resolved)
+                                                                               : std::nullopt;
+    if (!fs::is_directory(status)) return std::nullopt;
+#endif
   }
   return std::nullopt;
 }
 
+std::optional<std::string> ResolveGameFile(const std::string& root, const std::string& relative) {
+  return ResolveGamePath(root, relative, false);
+}
+
 }  // namespace
+
+bool MatchWorkingFoldersToDisk(const std::string& install_root, GameRecipe* recipe) {
+  bool changed = false;
+  for (auto& entry : recipe->launch_entries) {
+    if (entry.working_directory.empty()) continue;
+    const auto relative = steam::RelativeGamePath(entry.working_directory, true);
+    if (!relative || *relative == ".") continue;
+    const auto on_disk = ResolveGamePath(install_root, *relative, true);
+    if (!on_disk || *on_disk == entry.working_directory) continue;
+    entry.working_directory = *on_disk;
+    changed = true;
+  }
+  return changed;
+}
 
 std::string GeneratedRecipeId(std::uint32_t app_id) { return playden::GeneratedRecipeId(GameId::Steam(app_id)); }
 
@@ -2450,9 +2539,10 @@ bool IsGeneratedRecipeId(std::string_view id) {
   constexpr std::string_view kSuffix = "-auto";
   if (id.size() <= kSuffix.size() || id.substr(id.size() - kSuffix.size()) != kSuffix) return false;
   const auto install_id = id.substr(0, id.size() - kSuffix.size());
-  // Steam's has always been any "steam-…-auto"; a Local one names a valid game.
+  // Steam's has always been any "steam-…-auto"; another store's (Local, GOG) names a valid game.
   if (install_id.size() > 6 && install_id.substr(0, 6) == "steam-") return true;
-  return install_id.substr(0, 6) == "local-" && ParseInstallId(install_id).has_value();
+  const auto game = ParseInstallId(install_id);
+  return game && game->store != Store::kSteam && game->valid();
 }
 
 GameId RecipeGame(const GameRecipe& recipe) {
@@ -2714,7 +2804,10 @@ bool GenerateGameRecipe(const GameId& game, std::uint32_t runtime_number, const 
     if (!launch.working_directory.empty()) {
       const auto directory = steam::RelativeGamePath(launch.working_directory, true);
       if (!directory) continue;
-      working = *directory == "." ? std::string() : *directory;
+      // Steam names the folder as Windows sees it, in any case ("system" for System/, #844): the
+      // title and Playden's own checks open it by its name on disk. A missing one stays as Steam names it.
+      const auto folder = *directory == "." ? std::nullopt : ResolveGamePath(install_root, *directory, true);
+      working = *directory == "." ? std::string() : folder.value_or(*directory);
     }
     auto on_disk = ResolveGameFile(install_root, *relative);
     if (!on_disk) {
@@ -2722,8 +2815,9 @@ bool GenerateGameRecipe(const GameId& game, std::uint32_t runtime_number, const 
       continue;
     }
     auto probe = ProbeGame(install_root, *on_disk);
-    // A Unity bootstrap starts the player as a child process, which the console cannot do. Start the player directly;
-    // a program explicitly chosen in Game settings remains the player's choice.
+    // A Unity bootstrap beside the player only starts the player as a child process, which the console cannot do: the
+    // player starts instead, and its own files decide the defaults and any refusal. A program the player chose starts
+    // as chosen.
     if (!probe.unity_program.empty() && !chosen) {
       on_disk = probe.unity_program;
       const auto folder = on_disk->rfind('/');
@@ -2793,7 +2887,11 @@ bool GenerateGameRecipe(const GameId& game, std::uint32_t runtime_number, const 
   if (out.launch_entries.empty()) {
     if (!first_refusal.empty()) return fail(first_refusal, first_refusal_soft);
     // Choosing a program in Game settings gets past both of these.
-    return fail(first_missing.empty() ? "Steam lists no Windows program this console can start for this game."
+    // A game from another store names that store: its programs come from its own install files, not from Steam. An
+    // imported game keeps Steam's sentence, as before.
+    const std::string lister =
+        game.store == Store::kSteam || game.store == Store::kLocal ? "Steam" : std::string(Traits(game.store).name);
+    return fail(first_missing.empty() ? lister + " lists no Windows program this console can start for this game."
                                       : "The game's program " + first_missing + " is missing; verify the download.",
                 true);
   }
@@ -2847,30 +2945,31 @@ bool RefreshRecipeDefaults(const std::string& install_root, const KitCapabilitie
   const auto relative = steam::RelativeGamePath(recipe->launch_entries.front().executable);
   auto on_disk = relative ? ResolveGameFile(install_root, *relative) : std::nullopt;
   if (!on_disk) return false;
-  // Move generated recipes past an old Unity bootstrap too. A player-selected program is kept as chosen.
+  // A recipe generated before Unity bootstraps were skipped starts one, which stops at once (SUPERHOT, #755): it
+  // starts the Unity player now. A generated recipe's programs are Steam's; the player's own pick is kept apart.
+  // Its architecture follows the player; one that can't be read now stays as it is until the next Play.
   bool moved = false;
-  if (recipe->launch_entries.front().id != kProgramEntryId) {
-    const auto player = UnityGameProgram(install_root, *on_disk);
-    if (!player.empty()) {
-      const auto architecture = ExecutableArchitecture(install_root + "/" + player);
-      if (!architecture.empty()) {
-        auto& entry = recipe->launch_entries.front();
-        entry.executable = player;
-        const auto folder = player.rfind('/');
-        entry.working_directory = folder == std::string::npos ? std::string() : player.substr(0, folder);
-        entry.in_install_root = false;
-        recipe->architecture = architecture;
-        on_disk = player;
-        moved = true;
-      }
+  if (const auto player = recipe->launch_entries.front().id == kProgramEntryId ? std::string()
+                                                                                : UnityGameProgram(install_root, *on_disk);
+      !player.empty()) {
+    if (const auto architecture = ExecutableArchitecture(install_root + "/" + player); !architecture.empty()) {
+      auto& entry = recipe->launch_entries.front();
+      const auto folder = player.rfind('/');
+      entry.executable = player;
+      entry.working_directory = folder == std::string::npos ? std::string() : player.substr(0, folder);
+      entry.in_install_root = false;
+      recipe->architecture = architecture;
+      on_disk = player;
+      moved = true;
     }
   }
   const bool current = recipe->defaults_revision >= DefaultsRevision(recipe->detected);
   if (current && !MayNeedWatcomTranslator(*recipe)) return moved;
   if (current) return AddWatcomTranslator(install_root, *on_disk, recipe) || moved;
   const auto probe = ProbeGame(install_root, *on_disk);
-  // Steam's program now only starts the game (a .NET launcher once taken for an XNA game): add the game's program
-  // before Steam's entries. Keep those entries' ids and folders because saved choices may refer to them.
+  // Steam's program now only starts the game (a .NET launcher once taken for an XNA game: Borderlands 2's 2K launcher):
+  // the game's own program goes first, found and set up as a new setup finds it. Steam's entries stay as they were,
+  // after it: their ids may be the player's saved choice, and their folders are as the setup made them.
   if (recipe->launch_entries.front().id.rfind("launch-", 0) == 0 && !WhyStartsTheGameOnly(*on_disk, probe).empty()) {
     std::vector<LaunchEntry> steam;
     for (const auto& entry : recipe->launch_entries)
@@ -2916,7 +3015,8 @@ bool RefreshRecipeDefaults(const std::string& install_root, const KitCapabilitie
   else refreshed.defaults["cpu"] = defaults.cpu;
   // The files no longer show this engine (an update changed it): that's for the files-changed path, not this one.
   if (refreshed.defaults_revision < DefaultsRevision(recipe->detected)) {
-    // XNA's marks narrowed. Keep a chosen .NET launcher as it was set up, then stop re-reading it at each Play.
+    // XNA's marks narrowed (DefaultsRevision 1): a program that no longer counts as XNA and has no game to start in
+    // its place (one the player chose) keeps what it was set up with, and isn't read again at each Play.
     const auto engine = std::string_view(recipe->detected).substr(0, recipe->detected.find_first_of(", "));
     if (engine != "xna") return moved;
     recipe->defaults_revision = DefaultsRevision(recipe->detected);
@@ -3082,14 +3182,9 @@ RelativeRead ReadRegularAt(const ManagedDirectory& directory, const char* name,
   const int file = directory.OpenRegularFile(name, private_file);
   if (file < 0) return errno == ENOENT ? RelativeRead::kMissing : failed("open", errno);
   struct stat status {}, after {};
-  if (::fstat(file, &status) != 0) { const int error = errno; ::close(file); return failed("fstat", error); }
-  if (!S_ISREG(status.st_mode)) { ::close(file); return failed("file type", EINVAL); }
-  if (private_file && (status.st_mode & 07777) != 0600 && (status.st_mode & 07777) != 0644) {
-    const int actual_mode = status.st_mode & 07777;
-    ::close(file);
-    if (failure) *failure = "mode=" + std::to_string(actual_mode);
-    errno = EACCES;
-    return RelativeRead::kError;
+  if (::fstat(file, &status) != 0 || !S_ISREG(status.st_mode) ||
+      (private_file && status.st_uid != ::geteuid())) {
+    ::close(file); return RelativeRead::kError;
   }
   if (mode) *mode = status.st_mode & 0777;
   text->clear();
@@ -3125,8 +3220,7 @@ bool WriteAtomicAt(const ManagedDirectory& directory, const char* name,
   struct stat status {};
   if (directory.InspectChild(name, &status)) {
     if (!S_ISREG(status.st_mode)) return false;
-    if (private_file && (status.st_uid != ::geteuid() ||
-        ((status.st_mode & 07777) != 0600 && (status.st_mode & 07777) != 0644))) {
+    if (private_file && status.st_uid != ::geteuid()) {
       errno = EACCES;
       return false;
     }
@@ -3283,7 +3377,7 @@ bool ApplyGameSettings(const GameRecipe& recipe, const EffectiveSettings& settin
 PrivateSettingsRead ReadPrivateSettingsFile(const std::string& path, std::string* text) {
   text->clear();
   std::string name;
-  auto directory = OpenSafeParent(path, DirectoryPolicy::kPrivate, &name);
+  auto directory = OpenSafeParent(path, DirectoryPolicy::kOpenTree, &name);
   if (!directory) return errno == ENOENT ? PrivateSettingsRead::kMissing : PrivateSettingsRead::kError;
   switch (ReadRegularAt(*directory, name.c_str(), storage_json::Limits{}.max_bytes, text, nullptr, true)) {
     case RelativeRead::kMissing: return PrivateSettingsRead::kMissing;
@@ -3295,20 +3389,18 @@ PrivateSettingsRead ReadPrivateSettingsFile(const std::string& path, std::string
 
 bool WritePrivateSettingsFile(const std::string& path, const std::string& text) {
   std::string name;
-  auto directory = OpenSafeParent(path, DirectoryPolicy::kPrivate, &name);
+  auto directory = OpenSafeParent(path, DirectoryPolicy::kOpenTree, &name);
   if (!directory) return false;
   struct stat status {};
   const bool inspected = directory->InspectChild(name, &status);
-  if (inspected && (!S_ISREG(status.st_mode) || status.st_uid != ::geteuid() ||
-                    ((status.st_mode & 07777) != 0600 && (status.st_mode & 07777) != 0644)))
-    return false;
+  if (inspected && (!S_ISREG(status.st_mode) || status.st_uid != ::geteuid())) return false;
   if (!inspected && errno != ENOENT) return false;
-  return WriteAtomicAt(*directory, name.c_str(), text, 0600, false, true);
+  return WriteAtomicAt(*directory, name.c_str(), text, 0666, false, true);
 }
 
 bool SetPrivateSettingsFileAside(const std::string& path, const std::string& aside_name) {
   std::string name;
-  auto directory = OpenSafeParent(path, DirectoryPolicy::kPrivate, &name);
+  auto directory = OpenSafeParent(path, DirectoryPolicy::kOpenTree, &name);
   if (!directory || aside_name.empty() || aside_name == name) return false;
   struct stat status {};
   if (!directory->InspectChild(name, &status) || !S_ISREG(status.st_mode) || status.st_uid != ::geteuid()) return false;
@@ -3377,7 +3469,7 @@ bool MigrateLegacyGameSettingsFile(const std::string& legacy_path,
   };
   std::string destination_name;
   auto destination = OpenSafeParent(
-      private_path, DirectoryPolicy::kPrivate, &destination_name);
+      private_path, DirectoryPolicy::kOpenTree, &destination_name);
   if (!destination) return fail("private game settings folder is unavailable");
   struct stat destination_status {};
   if (destination->InspectChild(destination_name, &destination_status))
@@ -3402,7 +3494,7 @@ bool MigrateLegacyGameSettingsFile(const std::string& legacy_path,
   if (!ParseSettingsFile(text, &records))
     return fail("legacy game settings file is malformed");
   if (!WriteAtomicAt(*destination, destination_name.c_str(),
-                     SerializeSettingsFile(records), 0600, false, true, false))
+                     SerializeSettingsFile(records), 0666, false, true, false))
     return fail("cannot publish migrated game settings");
   return true;
 }
@@ -4073,8 +4165,8 @@ const std::vector<std::string>& SettingsKitCapabilityNames() {
   static const std::vector<std::string> names = {kKitDisplay120Hz, kKitDisplayFpsCounter, kKitDisplayFramegen,
                                                  kKitHelperProcess, kKitInputPlaystation, kKitInputRumble,
                                                  kKitLauncherMode, kKitAudioVolume, kKitDxvkConfig, kKitDxvkPresent,
-                                                 kKitInputTuning, kKitInputWheel, kKitEnvironment, kKitTitleNotify,
-                                                 kKitTouchpadSwitch};
+                                                 kKitInputTuning, kKitInputWheel, kKitEnvironment,
+                                                 kKitTitleNotify, kKitTouchpadSwitch};
   return names;
 }
 
@@ -4095,6 +4187,7 @@ KitCapabilities KitCapabilitiesFromManifest(const std::vector<std::string>& capa
   kit.title_any_id = has(kKitTitleAnyId);
   kit.game_root_unowned = has(kKitGameRootUnowned);
   kit.bottle_profile_shared = has(kKitBottleProfileShared);
+  kit.publication_open_modes = has(kKitPublicationOpenModes);
   kit.opengl_zink = has(kKitOpenGLZink);
   kit.wine_mono = has(kKitWineMono);
   kit.vkd3d_proton = has(kKitVkd3dProton);
@@ -4323,14 +4416,17 @@ CommunityRecipe BuildCommunityRecipe(const GameRecipe& recipe, const EffectiveSe
   shared.graphics = settings.graphics;
   // What the files showed, without the graphics value: that has its own field.
   shared.detected = recipe.detected.substr(0, recipe.detected.find(" graphics="));
-  // The recipe fields above carry the program, arguments and overrides; the rest are defaults, but not the player's own
-  // rows. Steam features = Online is shared: some games only work with it.
+  // The recipe fields above carry the program, arguments and overrides; the rest are defaults, but not the player's
+  // own rows. Steam features = Online is shared: some games only work with it.
   static const std::set<std::string> fields = {"launch_option", "program", "program_folder", "program_arguments",
                                                "arguments", "architecture", "dll_overrides", "library_overrides",
                                                "graphics"};
   for (const auto& definition : SettingsCatalogue()) {
     const auto& row = settings.values.at(definition.id);
-    if (fields.count(definition.id) || IsPersonalSettingRow(definition.id) || !row.available || row.source == ValueSource::kPlayden ||
+    // Steam library folder's own default differs by install (a new install starts on Steam's folder), so a chosen
+    // Playden's folder is carried like any other choice.
+    if (fields.count(definition.id) || IsPersonalSettingRow(definition.id) || !row.available ||
+        row.source == ValueSource::kPlayden ||
         (row.value == definition.playden_default && definition.id != "steam_library_path"))
       continue;
     shared.defaults[definition.id] = row.value;
@@ -4373,16 +4469,18 @@ CommunityRecipe BuildSettingsOnlyRecipe(const CommunityRecipe& base, const Effec
   // Graphics is a field of its own: the base's, or the player's when they changed it.
   shared.graphics = after.graphics != before.graphics ? after.graphics : base.recipe.graphics;
   shared.defaults = base.recipe.defaults;
-  // A base shared before a row became the player's own may still carry it.
+  // Not even from the base: a recipe shared before a row became the player's own may still carry it.
   for (auto it = shared.defaults.begin(); it != shared.defaults.end();)
     it = IsPersonalSettingRow(it->first) ? shared.defaults.erase(it) : std::next(it);
   shared.requirements = base.recipe.requirements;
-  // Program rows stay the base's, graphics has its field, and the player's own rows aren't shared.
+  // Rows written elsewhere or not at all: the program rows stay the base's, graphics has its field, and the player's
+  // own rows are not shared. Steam features = Online is: some games only work with it.
   for (const auto& definition : SettingsCatalogue()) {
     if (IsProgramRow(definition.id) || definition.id == "graphics" || IsPersonalSettingRow(definition.id)) continue;
     const auto found_after = after.values.find(definition.id);
     const auto found_before = before.values.find(definition.id);
     if (found_after == after.values.end() || !found_after->second.available) continue;
+    // A row that only has Playden's default, the game's own included (kGameDefaultPrefix), is nobody's change.
     if (found_after->second.source == ValueSource::kPlayden) continue;
     if (found_before != before.values.end() && ChosenValue(found_before->second) == ChosenValue(found_after->second))
       continue;

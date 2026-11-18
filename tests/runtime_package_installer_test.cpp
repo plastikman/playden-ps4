@@ -706,6 +706,13 @@ void SharedProfileBottleModes() {
   std::filesystem::remove_all(bottle / "drive_c/ProgramData");
   CHECK(installer.RepairBottle(record).state == PackageActionState::kComplete);
   CHECK(ModeOf(profile / "AppData/Local/Temp") == 0777 && ModeOf(bottle / "drive_c/ProgramData") == 0700);
+  // A game's Cloud save folders (#714) are open to FTP like the rest of a shared profile.
+  std::vector<std::string> added, failed;
+  installer.AddProfileFolders(record, {"AppData/LocalLow/Eternity/Leaf it Alone/Saves"}, &added, &failed);
+  CHECK(added.size() == 1 && failed.empty());
+  for (const char* folder : {"AppData/LocalLow/Eternity", "AppData/LocalLow/Eternity/Leaf it Alone",
+                             "AppData/LocalLow/Eternity/Leaf it Alone/Saves"})
+    CHECK(ModeOf(profile / folder) == 0777);
 
   // Wine (umask 077) saves 0600 in 0700 folders; settling opens them again. Links are never
   // followed, a file with another link (a private one linked in) is left alone, and the
@@ -769,11 +776,16 @@ void SharedTreeWalksByPath() {
   Write(root / "Documents/notes.txt", "notes", 0600);
   Write(temporary.path / "private/secret", "secret", 0600);
   CHECK(::link((temporary.path / "private/secret").c_str(), (root / "Documents/secret").c_str()) == 0);
+  // Valve's Steam client saves its sign-in (a token) in AppData/Local/Steam: that stays the owner's.
+  Write(root / "AppData/Local/Steam/local.vdf", "token", 0644);
+  CHECK(::chmod((root / "AppData/Local/Steam").c_str(), 0755) == 0);
   SharedTreeOptions options;
 
   auto opened = OpenTreeToEveryone(root, options);
   CHECK(opened.ok && !opened.changed_under && opened.linked == 1);
   CHECK(ModeOf(root / "AppData/Roaming/Game") == 0777 && ModeOf(root / "AppData/Roaming/Game/save.dat") == 0666);
+  CHECK(ModeOf(root / "AppData/Local") == 0777 && ModeOf(root / "AppData/Local/Steam") == 0700 &&
+        ModeOf(root / "AppData/Local/Steam/local.vdf") == 0600);
   CHECK(ModeOf(root / "Documents/notes.txt") == 0666 && ModeOf(temporary.path / "private/secret") == 0600);
 
   // Documents is moved away (and an outside folder put in its place) while the walk is in it.
@@ -896,6 +908,63 @@ void UnsharedBottleStaysPrivate() {
   CHECK(installer.RepairBottle(record).state == PackageActionState::kComplete);
   for (const char* folder : {"", "AppData/LocalLow", "AppData/Local/Temp", "Documents", "Saved Games"})
     CHECK(ModeOf(bottle / "drive_c/users/prospero" / folder) == 0700);
+}
+
+// #714: Leaf It Alone watches its Saves folder at start-up and stops when it isn't there. The folders of a game's Cloud
+// saves are made in the bottle's Windows user folder, and nowhere else.
+void CloudSaveFoldersAreMadeInTheProfile() {
+  Fixture fixture;
+  auto installer = fixture.Installer();
+  const auto record = Record();
+  const auto bottle = fixture.host_data / "playden/games/install-hl2/library/prefixes/game";
+  const auto profile = bottle / "drive_c/users/prospero";
+  const std::string saves = "AppData/LocalLow/Eternity/Leaf it Alone/Saves";
+  std::vector<std::string> added, failed;
+  // No bottle yet: nothing is made, nothing fails (the next preparation step makes them).
+  installer.AddProfileFolders(record, {saves}, &added, &failed);
+  CHECK(added.empty() && failed.empty() && !std::filesystem::exists(bottle));
+  CHECK(installer.CopyTemplate(record).state == PackageActionState::kComplete);
+  CHECK(!std::filesystem::exists(profile / saves));
+  installer.AddProfileFolders(record, {saves}, &added, &failed);
+  CHECK((added == std::vector<std::string>{saves}) && failed.empty());
+  for (const char* folder : {"AppData/LocalLow/Eternity", "AppData/LocalLow/Eternity/Leaf it Alone",
+                             "AppData/LocalLow/Eternity/Leaf it Alone/Saves"})
+    CHECK(std::filesystem::is_directory(profile / folder) && ModeOf(profile / folder) == 0700);
+  // Made once: a second pass adds nothing and leaves what the game wrote there.
+  Write(profile / saves / "slot1.sav", "save", 0600);
+  added.clear();
+  installer.AddProfileFolders(record, {saves}, &added, &failed);
+  CHECK(added.empty() && failed.empty() && Read(profile / saves / "slot1.sav") == "save");
+  // A folder the game made in another case is the one used: Wine would see two otherwise.
+  CHECK(std::filesystem::create_directories(profile / "Documents/MY GAMES"));
+  installer.AddProfileFolders(record, {"Documents/My Games/Game/Saves"}, &added, &failed);
+  CHECK((added == std::vector<std::string>{"Documents/My Games/Game/Saves"}) && failed.empty());
+  CHECK(std::filesystem::is_directory(profile / "Documents/MY GAMES/Game/Saves"));
+  std::vector<std::string> documents;
+  for (const auto& entry : std::filesystem::directory_iterator(profile / "Documents"))
+    documents.push_back(entry.path().filename().string());
+  CHECK((documents == std::vector<std::string>{"MY GAMES"}));
+  // Never outside the profile: a path that climbs out or is absolute, a link (to a folder outside, or to the profile's
+  // own Documents), and a file in the way all fail, and nothing is made.
+  const auto outside = fixture.temporary.path / "outside";
+  CHECK(std::filesystem::create_directories(outside));
+  std::filesystem::create_directory_symlink(outside, profile / "AppData/Roaming/Link");
+  std::filesystem::create_directory_symlink(profile / "Documents", profile / "AppData/Roaming/Docs");
+  Write(profile / "Desktop/file", "file", 0600);
+  added.clear();
+  failed.clear();
+  const std::vector<std::string> refused = {"../../../../../escape",  "AppData/../../escape", "/escape",
+                                            "AppData/Roaming/Link/Saves", "AppData/Roaming/Docs/Saves",
+                                            "Desktop/file/Saves",     "AppData\\Escape",     ""};
+  installer.AddProfileFolders(record, refused, &added, &failed);
+  CHECK(added.empty() && failed == refused);
+  CHECK(std::filesystem::is_empty(outside) && !std::filesystem::exists(profile / "Documents/Saves"));
+  CHECK(!std::filesystem::exists(fixture.temporary.path / "escape") && !std::filesystem::exists(bottle / "escape") &&
+        !std::filesystem::exists(fixture.host_data / "escape") && !std::filesystem::exists("/escape"));
+  CHECK(!std::filesystem::exists(profile / "AppData/Escape"));
+  // The other folders of the same call are still made.
+  installer.AddProfileFolders(record, {"../escape", "Saved Games/Game"}, &added, &failed);
+  CHECK((added == std::vector<std::string>{"Saved Games/Game"}) && std::filesystem::is_directory(profile / "Saved Games/Game"));
 }
 
 void CancelAndSpaceFailuresAreBounded() {
@@ -1079,7 +1148,7 @@ void FixedTitleRefreshesToAnyTitleShell() {
   CHECK(Read(fixture.host_data / "homebrew/FAKE78001/win/mesa-zink/i386-windows/opengl32.dll") == "MZ zink");
   struct stat folder{};
   CHECK(::stat((fixture.host_data / "homebrew/FAKE78001/win/mesa-zink").c_str(), &folder) == 0 &&
-        (folder.st_mode & 07777) == 0755);
+        (folder.st_mode & 07777) == 0777);
 }
 
 // A kit renamed since a game was prepared (hl2-fw1360-dev1 became playden-kit with kit 0.13): Update refreshes
@@ -1127,12 +1196,24 @@ void PrivateTitleFoldersAreRepublished() {
   CHECK(!installer.Inspect(Record()).manifest_matches);
   CHECK(installer.StageTitle(Record()).state == PackageActionState::kComplete);
   struct stat info{};
-  CHECK(::stat(title.c_str(), &info) == 0 && (info.st_mode & 07777) == 0755);
+  CHECK(::stat(title.c_str(), &info) == 0 && (info.st_mode & 07777) == 0777);
   CHECK(installer.Inspect(Record()).manifest_matches);
+  // A title Playden 0.11 published (0755) still matches; the next stage opens it.
+  CHECK(::chmod(title.c_str(), 0755) == 0);
+  CHECK(installer.Inspect(Record()).manifest_matches);
+  CHECK(installer.StageTitle(Record()).state == PackageActionState::kComplete);
+  CHECK(::stat(title.c_str(), &info) == 0 && (info.st_mode & 07777) == 0777);
+  // Its files opened to FTP (a recursive chmod) keep it current; a file missing a bit of its kit mode doesn't.
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(title))
+    if (entry.is_regular_file() && entry.path().filename() != "game-launch.json")
+      CHECK(::chmod(entry.path().c_str(), 0777) == 0);
+  CHECK(installer.Inspect(Record()).manifest_matches);
+  CHECK(::chmod((title / "eboot.bin").c_str(), 0666) == 0);
+  CHECK(!installer.Inspect(Record()).manifest_matches);
 }
 
 // Folders the installer creates get an explicit mode whatever the umask: the
-// shared staging parents are 01777, the title stays 0755.
+// shared staging parents are 01777, the title 0777 (FTP can delete it, #868).
 void CreatedFoldersIgnoreUmask() {
   for (const mode_t mask : {mode_t{0}, mode_t{077}}) {
     const auto previous = ::umask(mask);
@@ -1143,7 +1224,10 @@ void CreatedFoldersIgnoreUmask() {
     struct stat info{};
     for (const auto* shared : {"playden", "playden/staging"})
       CHECK(::stat((fixture.host_data / shared).c_str(), &info) == 0 && (info.st_mode & 07777) == 01777);
-    CHECK(::stat((fixture.host_data / "homebrew/FAKE78001").c_str(), &info) == 0 && (info.st_mode & 07777) == 0755);
+    CHECK(::stat((fixture.host_data / "homebrew/FAKE78001").c_str(), &info) == 0 && (info.st_mode & 07777) == 0777);
+    for (const auto* marker : {".playden-title-owner", ".playden-stage-owner"})
+      CHECK(::stat((fixture.host_data / "homebrew/FAKE78001" / marker).c_str(), &info) == 0 &&
+            (info.st_mode & 07777) == 0666);
   }
 }
 
@@ -1471,6 +1555,26 @@ void ShippedRecipeResolvesWithAnyKit() {
   auto generated = Record();
   generated.recipe_id = "steam-220-auto";
   CHECK(!installer.Inspect(generated).title_source_path.empty());
+  // Read back from a journal without its game: another store's generated recipe, for a number from the allocator's range.
+  auto gog = Record();
+  gog.runtime_number = 0xF0000001u;
+  gog.recipe_id = "gog-1207658924-auto";
+  CHECK(gog.game == playden::GameId{});
+  CHECK(!installer.Inspect(gog).title_source_path.empty());
+  auto local = gog;
+  local.recipe_id = "local-0f8fad5b-d9cb-469f-a165-70867728950e-auto";
+  CHECK(!installer.Inspect(local).title_source_path.empty());
+  auto invalid_gog = gog;
+  invalid_gog.recipe_id = "gog-0-auto";
+  CHECK(installer.StageTitle(invalid_gog).code == "kit-invalid");
+  auto out_of_range = gog;
+  out_of_range.runtime_number = 220;
+  CHECK(installer.StageTitle(out_of_range).code == "kit-invalid");
+  auto unknown_store = gog;
+  unknown_store.recipe_id = "epic-1-auto";
+  CHECK(installer.StageTitle(unknown_store).code == "kit-invalid");
+  Fixture fresh;
+  CHECK(fresh.Installer().StageTitle(gog).state == PackageActionState::kComplete);
 }
 
 // A shipped recipe's requirements against what the kit's template provides.
@@ -1487,7 +1591,48 @@ void RecipeRequirementsNameWhatTheKitLacks() {
 
 }  // namespace
 
+// Every start asks each installed title's status (TitleCurrent, QuickAdmission, the icon's source) several times. A real kit
+// lists thousands of files: checking that list again for each question made a start with 93 games take 18 s on a PS5.
+// The list is checked once, when the installer is made; each question still checks the kit folder on disk.
+void StatusQueriesDoNotRecheckTheKitList() {
+  Fixture fixture;
+  for (int i = 0; i < 4000; ++i)
+    fixture.view.files.push_back({"extras/file-" + std::to_string(i), 1, std::string(64, 'b'), 0644});
+  auto installer = fixture.Installer();
+  CHECK(installer.KitListPasses() == 1);
+  auto staged = Record();
+  staged.artifacts = {{"runtime", "rev", fixture.view.artifacts[0].sha256},
+                      {"recipe", "steam-220-hl2-v1-1", fixture.view.artifacts[1].sha256}};
+  CHECK(installer.StageTitle(staged).state == PackageActionState::kComplete);
+  CHECK(installer.CopyTemplate(staged).state == PackageActionState::kComplete);
+  Write(fixture.host_data / "playden/games/install-hl2/library/prefixes/game/user.reg", "WINE REGISTRY Version 2\n", 0600);
+  const auto passes = installer.KitListPasses();
+  std::vector<RuntimeInstall> records{staged};
+  for (int i = 0; i < 100; ++i) {
+    auto record = Record();
+    record.install_id = "install-" + std::to_string(i);
+    record.data_root = "/data/playden/games/" + record.install_id;
+    records.push_back(record);
+  }
+  for (int round = 0; round < 3; ++round)
+    for (const auto& record : records) {
+      CHECK(installer.TitleCurrent(record) == (record.install_id == staged.install_id));
+      CHECK(installer.QuickAdmission(record) == (record.install_id == staged.install_id ? "ok" : "stage 7: user.reg is missing"));
+      CHECK(!installer.TitleIconSource(record));
+      CHECK(!installer.SetupFromOtherKit(record));
+    }
+  CHECK(installer.KitListPasses() == passes);
+  // The kit folder itself is still checked on every question: a kit folder replaced by a link resolves nothing.
+  const auto moved = fixture.temporary.path / "kit-moved";
+  std::filesystem::rename(fixture.kit, moved);
+  std::filesystem::create_directory_symlink(moved, fixture.kit);
+  CHECK(!installer.TitleCurrent(staged));
+  CHECK(installer.QuickAdmission(staged) == "kit or record is invalid");
+}
+
 int main() {
+  StatusQueriesDoNotRecheckTheKitList();
+  CloudSaveFoldersAreMadeInTheProfile();
   TemplateCopyReportsProgress();
   ShippedRecipeResolvesWithAnyKit();
   RecipeRequirementsNameWhatTheKitLacks();
@@ -1560,6 +1705,17 @@ int main() {
     CHECK(installer.PublishProfile(record).state == PackageActionState::kComplete);
     CHECK(::chmod(profiles.c_str(), 0755) == 0);
     CHECK(!installer.Inspect(record).profile_published);
+    // A title made from a kit with publication-open-modes admits the opened folder and an opened user.reg (#868);
+    // Playden checks the older shell's modes for every other title.
+    const auto user_reg = fixture.host_data / "playden/games/install-hl2/library/prefixes/game/user.reg";
+    CHECK(::chmod(user_reg.c_str(), 0666) == 0);
+    CHECK(installer.QuickAdmission(record).rfind("stage 7", 0) == 0);
+    installer.AdmitOpenModes(true);
+    CHECK(installer.Inspect(record).profile_published);
+    CHECK(installer.QuickAdmission(record) == "ok");
+    CHECK(installer.AdmissionDiagnostic(record) == "ok");
+    installer.AdmitOpenModes(false);
+    CHECK(::chmod(user_reg.c_str(), 0600) == 0);
     CHECK(installer.PublishProfile(record).code == "private-directory");
   }
 #ifdef PLAYDEN_TEST_SETTINGS_OWNER_INTEGRATION

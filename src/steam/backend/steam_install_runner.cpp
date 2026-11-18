@@ -8,7 +8,6 @@
 #include <set>
 #include <charconv>
 #include <string_view>
-#include <thread>
 
 namespace playden::steam {
 
@@ -207,7 +206,10 @@ bool UpdateNeedsUnfetchedDlc(const installs::InstalledRecord& record, std::uint3
 
 std::set<std::uint32_t> ExcludedDlcFor(const InstallOptions& options, bool update,
                                        const std::optional<installs::InstalledRecord>& record) {
-  std::set<std::uint32_t> excluded(options.excluded_dlc.begin(), options.excluded_dlc.end());
+  std::set<std::uint32_t> excluded;
+  // Steam DLC only: the install service keeps a job's to its game's store.
+  for (const auto& dlc : options.excluded_dlc)
+    if (const auto app = dlc.steam_app()) excluded.insert(*app);
   if (update && !options.dlc_choice && record) excluded.insert(record->excluded_dlc.begin(), record->excluded_dlc.end());
   return excluded;
 }
@@ -281,7 +283,7 @@ std::set<std::uint32_t> LoadFreeDlcMemory(const Storage& storage, std::uint64_t 
 
 bool SaveFreeDlcMemory(const Storage& storage, std::uint64_t steam_id, const std::set<std::uint32_t>& refused) {
   const auto text = FormatFreeDlcMemory(refused);
-  return storage.WriteAtomicPrivate(FreeDlcMemoryName(steam_id), Bytes(text.begin(), text.end())).ok();
+  return storage.WriteAtomicOpen(FreeDlcMemoryName(steam_id), Bytes(text.begin(), text.end())).ok();
 }
 
 InstallRunner::Result SteamInstallRunner::InstallApp(const StoredSession& session, std::uint32_t id, const std::string& root,
@@ -332,22 +334,20 @@ InstallRunner::Result SteamInstallRunner::Run(const StoredSession& session, std:
     result.failure = "Steam has no install details for this game.";
     return result;
   }
-  // The appinfo of the game's DLC, for the depots a DLC app lists itself. Steam leaves out the ones it
-  // doesn't describe; a batch that fails only leaves its DLC's own depots out of an install. An update
-  // that has such depots installed waits for Steam instead: without them it would delete them.
+  // The appinfo of the game's DLC, for the depots a DLC app lists itself, and of the apps it borrows depots from, which
+  // hold their manifests. Steam leaves out the ones it doesn't describe; a batch that fails only leaves its DLC's own
+  // depots out of an install. An update that has such depots installed waits for Steam instead: without them it would
+  // delete them.
   std::vector<AppInfo> dlc_apps;
   std::set<std::uint32_t> unfetched;
-  std::set<std::uint32_t> borrowed_sources;
   CmError dlc_error = CmError::kNone;
+  const auto sources = BorrowedDepotSources(*app);
+  const auto borrowed_from = [&sources](std::uint32_t other) {
+    return std::find(sources.begin(), sources.end(), other) != sources.end();
+  };
   {
-    std::vector<std::uint32_t> dlc_ids;
-    for (const auto dlc : app->dlc_app_ids)
-      if (dlc != id && std::find(dlc_ids.begin(), dlc_ids.end(), dlc) == dlc_ids.end()) dlc_ids.push_back(dlc);
-    for (const auto& depot : app->depots)
-      if (depot.depot_from_app && *depot.depot_from_app != id) borrowed_sources.insert(*depot.depot_from_app);
-    if (app->demo_of_app_id != 0) borrowed_sources.insert(app->demo_of_app_id);
-    for (const auto source : borrowed_sources)
-      if (source != id && std::find(dlc_ids.begin(), dlc_ids.end(), source) == dlc_ids.end()) dlc_ids.push_back(source);
+    const std::vector<std::uint32_t> dlc_ids = RelatedApps(*app);
+    if (!sources.empty()) log("borrowed_app_info", "fetch", ("apps=" + IdText(sources)).c_str());
     for (std::size_t start = 0; start < dlc_ids.size(); start += kMaxAppInfoBatch) {
       const std::vector<std::uint32_t> batch(
           dlc_ids.begin() + static_cast<std::ptrdiff_t>(start),
@@ -367,37 +367,18 @@ InstallRunner::Result SteamInstallRunner::Run(const StoredSession& session, std:
         const auto found = dlc_info.buffers.find(dlc);
         auto parsed = found == dlc_info.buffers.end() ? std::nullopt : ParseAppInfo(dlc, found->second);
         if (!parsed) {
-          if (borrowed_sources.count(dlc)) unfetched.insert(dlc);
+          // Without the appinfo of the app it borrows from, an update would select only the game's own depots and
+          // delete the borrowed ones.
+          if (borrowed_from(dlc)) {
+            unfetched.insert(dlc);
+            log("borrowed_app_info", "missing", ("app=" + std::to_string(dlc)).c_str());
+          }
           continue;
         }
-        if (borrowed_sources.count(dlc)) {
-          if (std::find(app->dlc_app_ids.begin(), app->dlc_app_ids.end(), dlc) != app->dlc_app_ids.end())
-            dlc_apps.push_back(*parsed);
-          KeepDepotsBorrowedBy(*app, &*parsed);
-          const bool missing_depot = std::any_of(app->depots.begin(), app->depots.end(), [&](const DepotInfo& listed) {
-            return listed.depot_from_app == dlc && !listed.manifest_gid && listed.branches.empty() &&
-                   std::none_of(parsed->depots.begin(), parsed->depots.end(), [&](const DepotInfo& resolved) {
-                     return resolved.id == listed.id;
-                   });
-          });
-          if (missing_depot) unfetched.insert(dlc);
-        }
+        PrepareRelatedApp(*app, &*parsed);
         dlc_apps.push_back(std::move(*parsed));
       }
     }
-  }
-  for (const auto source : borrowed_sources)
-    if (!std::any_of(dlc_apps.begin(), dlc_apps.end(), [source](const AppInfo& related) {
-          return related.app_id == source;
-        })) unfetched.insert(source);
-  std::set<std::uint32_t> missing_sources;
-  std::set_intersection(unfetched.begin(), unfetched.end(), borrowed_sources.begin(), borrowed_sources.end(),
-                        std::inserter(missing_sources, missing_sources.end()));
-  if (!missing_sources.empty()) {
-    log("source_app_info", "missing", "required borrowed depot metadata unavailable");
-    result.failure = "Steam could not provide required shared game content. Resume to retry.";
-    result.retry_later = dlc_error == CmError::kNetwork || dlc_error == CmError::kTimeout;
-    return result;
   }
   if (update && !unfetched.empty())
     if (const auto record = installs::ReadInstallRecord(root + "/" + DepotInstaller::kInstallRecord);
@@ -414,7 +395,7 @@ InstallRunner::Result SteamInstallRunner::Run(const StoredSession& session, std:
                                               : std::nullopt);
   // A DLC change that turns on a DLC whose appinfo Steam didn't send would leave its depots out: it waits for Steam.
   if (update && options.dlc_choice && std::any_of(unfetched.begin(), unfetched.end(), [&](std::uint32_t dlc) {
-        return dlc != app->demo_of_app_id && !excluded.count(dlc);
+        return !borrowed_from(dlc) && !excluded.count(dlc);
       })) {
     log("dlc_app_info", "dlc-change-blocked", "");
     result.failure = "Could not reach Steam. Resume to try again.";
@@ -514,6 +495,9 @@ InstallRunner::Result SteamInstallRunner::Run(const StoredSession& session, std:
     for (const auto& depot : selected.rejected) rejected.push_back(std::to_string(depot.id) + ":" + depot.reason);
     for (const auto& line : FamilyLines("", rejected)) log("depots", "rejected", line.c_str());
   }
+  // Each depot the game takes from another app: where its manifest came from and what became of it.
+  for (const auto& report : DescribeBorrowedDepots(*app, dlc_apps, selected, entitlements.owned_depots, selection.branch))
+    log("borrowed", report.outcome.c_str(), report.detail.c_str());
   if (!any) {
     log("depots", "none", selected.reason.c_str());
     // Only DLC selected: when the licenses leave the game's content out, that is what the player is told.
@@ -589,6 +573,7 @@ InstallRunner::Result SteamInstallRunner::Run(const StoredSession& session, std:
     std::vector<std::uint32_t> sdk_apps;
     for (const auto app_id : runtime::kSourceSdkBaseApps)
       if (app_id != id && entitlements.owned_apps.count(app_id)) sdk_apps.push_back(app_id);
+    // The game's Cloud save folders in the Windows user folder, which the bottle gets before the game starts.
     const auto saves = cloud::ProfileSaveFolders(app->cloud, id);
     const bool written = runtime::WriteSteamworksFacts(folder, depots, dlc, effective_language, target.excluded_dlc,
                                                        sdk_apps, sdk_apps.empty() ? 0 : account, saves);
@@ -596,7 +581,7 @@ InstallRunner::Result SteamInstallRunner::Run(const StoredSession& session, std:
     else
       log("steamworks_facts", "written",
           ("depots=" + std::to_string(depots.size()) + " dlc=" + std::to_string(dlc.size()) + " listed=" +
-           std::to_string(app->dlc_app_ids.size()))
+           std::to_string(app->dlc_app_ids.size()) + " saves=" + std::to_string(saves.size()))
               .c_str());
     return written;
   };
@@ -606,36 +591,24 @@ InstallRunner::Result SteamInstallRunner::Run(const StoredSession& session, std:
   if (update) target.may_apply = may_apply;
   if (step) step(InstallStep::kDownloading);
   InstallPhase phase = InstallPhase::kDownloading;
-  InstallOutcome outcome;
-  // A chunk can exhaust its per-server retry budget while Steam's CDN is having a short outage.
-  // Run() keeps its journal, so repeating it resumes only missing chunks instead of restarting the
-  // game's download. Keep this bounded: persistent outages still return a resumable network error.
-  constexpr int kAutomaticNetworkRetries = 4;
-  for (int attempt = 0; ; ++attempt) {
-    outcome = installer_.Run(session, target, cancel, [&](const InstallProgress& state) {
-      server_name_ = state.server_name;
-      if (state.phase != phase) {
-        phase = state.phase;
-        if (step) step(phase == InstallPhase::kCheckingFiles ? InstallStep::kCheckingFiles
-                       : phase == InstallPhase::kApplying  ? InstallStep::kApplying
-                                                           : InstallStep::kDownloading);
-      }
-      if (phase == InstallPhase::kDownloading && progress)
-        progress(state.download_done, state.download_total, state.held_bytes);
-    });
-    if (outcome.error != InstallError::kNetwork || attempt >= kAutomaticNetworkRetries || cancel.load()) break;
-
-    const int delay_seconds = 1 << attempt;
-    log("install_retry", "network", ("attempt=" + std::to_string(attempt + 1) + "/" +
-        std::to_string(kAutomaticNetworkRetries) + " delay=" + std::to_string(delay_seconds) +
-        "s cause=" + outcome.detail).c_str());
-    for (int waited = 0; waited < delay_seconds * 1000 && !cancel.load(); waited += 100)
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (cancel.load()) {
-      outcome.error = InstallError::kCanceled;
-      outcome.detail = "canceled during automatic retry wait";
-      break;
+  const auto outcome = installer_.Run(session, target, cancel, [&](const InstallProgress& state) {
+    server_name_ = state.server_name;
+    if (state.phase != phase) {
+      phase = state.phase;
+      if (step) step(phase == InstallPhase::kCheckingFiles ? InstallStep::kCheckingFiles
+                     : phase == InstallPhase::kApplying  ? InstallStep::kApplying
+                                                         : InstallStep::kDownloading);
     }
+    if (phase == InstallPhase::kDownloading && progress) progress(state.download_done, state.download_total, state.held_bytes);
+  });
+  // What Steam answered for each borrowed depot's key and manifest request code.
+  for (const auto& depot : target.depots) {
+    if (!depot.depot_from_app || *depot.depot_from_app == id) continue;
+    const auto answer = std::find_if(outcome.depot_answers.begin(), outcome.depot_answers.end(),
+                                     [&depot](const auto& entry) { return entry.first == depot.id; });
+    log("borrowed", "access",
+        ("depot=" + std::to_string(depot.id) + " " + (answer == outcome.depot_answers.end() ? "not-asked" : answer->second))
+            .c_str());
   }
   if (!outcome.skipped_depots.empty()) {
     std::string skipped;

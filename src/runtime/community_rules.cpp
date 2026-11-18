@@ -278,8 +278,8 @@ std::vector<std::string> CommunityRecipeRefusals(const CommunityRecipe& communit
     }
   }
 
-  // The sign-in and invites hand the player's Steam account to the game: never from someone else's recipe.
-  // Online itself is shareable: some games only work with it.
+  // The sign-in and the invites hand the player's Steam account to the game: never from someone else's recipe.
+  // Online itself can be shared, since some games only work with it.
   if (Default(recipe, "steam_sign_in"))
     refuse("defaults sets steam_sign_in: each player chooses when a game gets their Steam sign-in.");
   if (Default(recipe, "game_invites"))

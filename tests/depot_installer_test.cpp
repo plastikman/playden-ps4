@@ -223,7 +223,8 @@ void OverlapsFourFetches(const std::filesystem::path& root) {
     ++active; ++entered;
     peak = std::max(peak, active);
     changed.notify_all();
-    changed.wait_for(lock, std::chrono::milliseconds(250), [&] { return entered >= 4; });
+    // Ends as soon as four downloads are in at once; the limit only has to hold on a busy machine.
+    changed.wait_for(lock, std::chrono::seconds(30), [&] { return entered >= 4; });
     lock.unlock();
     *out = world.served.at(sha);
     lock.lock();
@@ -254,7 +255,7 @@ struct ParallelFixture {
   }
   bool Wait(const std::function<bool()>& predicate) {
     std::unique_lock<std::mutex> lock(mutex);
-    return changed.wait_for(lock, std::chrono::seconds(3), predicate);
+    return changed.wait_for(lock, std::chrono::seconds(30), predicate);
   }
   void Release() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -529,9 +530,11 @@ void BorrowedDepotRefusedIsSkipped(const std::filesystem::path& root) {
       if (depot.optional) {
         asked_optional = true;
         result.skipped.push_back(depot.depot_id);
+        result.answers.emplace_back(depot.depot_id, "app=877620 key=refused eresult=15 skipped");
         continue;
       }
       result.grants.push_back({depot.depot_id, depot.manifest_gid, kKey, 77});
+      result.answers.emplace_back(depot.depot_id, "app=440 key=ok code=ok");
     }
     return result;
   };
@@ -542,7 +545,22 @@ void BorrowedDepotRefusedIsSkipped(const std::filesystem::path& root) {
   const auto outcome = installer.Run({}, target, cancel);
   CHECK(outcome.error == InstallError::kNone && asked_optional);
   CHECK(outcome.skipped_depots == std::vector<std::uint32_t>{442});
+  CHECK(outcome.depot_answers.size() == 2 && outcome.depot_answers[1].first == 442 &&
+        outcome.depot_answers[1].second == "app=877620 key=refused eresult=15 skipped");
   CHECK(Read(root / "data/level.dat") == "level-one");
+  // A refusal that stops the install still says what Steam answered, for install.log.
+  auto stopped_hooks = world.Hooks();
+  stopped_hooks.access = [](const StoredSession&, std::uint32_t, const std::vector<DepotRequest>&,
+                            const std::atomic<bool>&) {
+    DepotAccessResult result;
+    result.error = CmError::kRejected;
+    result.answers.emplace_back(441, "app=440 key=refused eresult=2");
+    return result;
+  };
+  DepotInstaller stopped(stopped_hooks);
+  const auto refused = stopped.Run({}, Target(root.string() + "-stopped"), cancel);
+  CHECK(refused.error != InstallError::kNone && refused.depot_answers.size() == 1 &&
+        refused.depot_answers[0].second == "app=440 key=refused eresult=2");
 }
 
 // An install whose only granted depot is a DLC's (the game's borrowed depot refused) fails instead of finishing
@@ -632,6 +650,82 @@ void UpdateWaitsForUnfetchedDlc() {
   CHECK(!UpdateNeedsUnfetchedDlc(record, 440, {}));
   // A record from before sources (0) is the game's own listing.
   CHECK(!UpdateNeedsUnfetchedDlc(record, 440, {0}));
+  // A depot taken from another app is the game's content, listed by that app: without its appinfo the update waits.
+  playden::installs::InstalledRecord borrowed;
+  borrowed.depots = {{393081, 81, 393080, 393080}, {393103, 3, 393080, 393100}};
+  CHECK(UpdateNeedsUnfetchedDlc(borrowed, 393080, {393100}));
+}
+
+// The DLC a run leaves out. An update adds what its install left out, so DLC turned off stays off; a DLC change
+// (Manage DLC) is the whole choice, so the record's DLC can be turned on again, all of them too.
+void ExcludedDlcForARun() {
+  using U32s = std::set<std::uint32_t>;
+  playden::installs::InstalledRecord record;
+  record.excluded_dlc = {900, 901};
+  InstallOptions options;
+  // Only Steam's DLC reach a Steam run.
+  options.excluded_dlc = {playden::GameId::Steam(902), playden::GameId::Gog(903)};
+  CHECK(ExcludedDlcFor(options, false, record) == (U32s{902}));
+  CHECK(ExcludedDlcFor(options, true, record) == (U32s{900, 901, 902}));
+  CHECK(ExcludedDlcFor(options, true, std::nullopt) == (U32s{902}));
+  options.dlc_choice = true;
+  CHECK(ExcludedDlcFor(options, true, record) == (U32s{902}));
+  options.excluded_dlc.clear();
+  CHECK(ExcludedDlcFor(options, true, record).empty());
+}
+
+InstallTarget UpdateTarget(const std::filesystem::path& root);
+
+// A DLC change runs as an update of the depots selected without, then with, the DLC's depot. Turned off, nothing
+// downloads and only the files no other depot has go, while one the DLC replaced goes back to the game's copy; the
+// record and facts say so. Turned on again, only the DLC's files download.
+void DlcTurnedOffAndOnAgain(const std::filesystem::path& root) {
+  auto world = MakeWorld();
+  DepotManifest dlc;
+  dlc.depot_id = 443;
+  dlc.gid = 13;
+  dlc.files.push_back(world.AddFile("dlc/pack.dat", {"pack-", "data"}));
+  dlc.files.push_back(world.AddFile("game.exe", {"MZ-executable-", "second-chunk"}));  // the same as the game's
+  dlc.files.push_back(world.AddFile("empty.txt", {"dlc-text"}));
+  world.manifests[443] = dlc;
+  DepotInfo dlc_depot;
+  dlc_depot.id = 443;
+  dlc_depot.manifest_gid = 13;
+  dlc_depot.owner_app = 900;
+  auto with = Target(root);
+  with.depots.push_back(dlc_depot);
+  std::filesystem::remove_all(root);
+  DepotInstaller installer(world.Hooks());
+  installer.SetTuning({1, 256});
+  std::atomic<bool> cancel{false};
+  CHECK(installer.Run({}, with, cancel).error == InstallError::kNone);
+  CHECK(Read(root / "dlc/pack.dat") == "pack-data" && Read(root / "empty.txt") == "dlc-text");
+
+  auto without = UpdateTarget(root);
+  without.excluded_dlc = {900};
+  without.before_apply = [&](const std::string& folder, const std::vector<std::uint32_t>&) {
+    std::ofstream(std::filesystem::path(folder) / ".playden-steam") << "depots=441,442\nnodlc=900\n";
+    return true;
+  };
+  world.chunk_calls = 0;
+  CHECK(installer.Run({}, without, cancel).error == InstallError::kNone);
+  CHECK(world.chunk_calls == 0);  // empty.txt has no chunks: the game's copy is empty
+  CHECK(!std::filesystem::exists(root / "dlc/pack.dat") && !std::filesystem::exists(root / "dlc"));
+  CHECK(Read(root / "game.exe") == "MZ-executable-second-chunk" && std::filesystem::exists(root / "empty.txt") &&
+        Read(root / "empty.txt").empty());
+  CHECK(Read(root / ".playden-steam") == "depots=441,442\nnodlc=900\n");
+  CHECK(std::filesystem::exists(root / playden::installs::kFilesChangedName));
+  auto record = playden::installs::ReadInstallRecord((root / DepotInstaller::kInstallRecord).string());
+  CHECK(record && (record->excluded_dlc == std::vector<std::uint32_t>{900}) && !playden::installs::HoldsDlc(*record));
+
+  auto again = UpdateTarget(root);
+  again.depots.push_back(dlc_depot);
+  world.chunk_calls = 0;
+  CHECK(installer.Run({}, again, cancel).error == InstallError::kNone);
+  CHECK(world.chunk_calls == 3);  // pack.dat's two chunks and the DLC's empty.txt
+  CHECK(Read(root / "dlc/pack.dat") == "pack-data" && Read(root / "empty.txt") == "dlc-text");
+  record = playden::installs::ReadInstallRecord((root / DepotInstaller::kInstallRecord).string());
+  CHECK(record && record->excluded_dlc.empty() && playden::installs::HoldsDlc(*record));
 }
 
 void FreeDlcCandidatesAndMemory(const std::filesystem::path& root) {
@@ -1373,6 +1467,34 @@ void UnterminatedJournalGetsSeparator(const std::filesystem::path& root) {
   cancel.store(false); world.chunk_calls = 0; world.cancel_after = -1;
   CHECK(installer.Run({}, Target(root), cancel).error == InstallError::kNone);
   CHECK(world.chunk_calls == 1);
+}
+
+// Only a line exactly as JournalKey writes it counts a chunk as written: the depot that wrote it, decimal numbers
+// without signs or leading zeros, the file's own spelling and an offset the file has (#667 keeps them as pairs).
+void JournalLinesMatchExactly(const std::filesystem::path& root) {
+  auto world = MakeWorld();
+  std::filesystem::create_directories(root / DepotInstaller::kJournalDir);
+  std::ofstream(root / "game.exe") << "MZ-executable-second-chunk";
+  std::ofstream(root / DepotInstaller::kJournalDir / "journal")
+      << "#v2 441:11,442:12\n"
+      << "441\t0\tgame.exe\n"                        // counts
+      << "441\t0\tgame.exe\n"                        // the same line again
+      << "0441\t14\tgame.exe\n+441\t14\tgame.exe\n"   // a leading zero, a sign
+      << "441\t014\tgame.exe\n441\t-14\tgame.exe\n"   // the offset spelled otherwise
+      << "441\t18446744073709551630\tgame.exe\n"      // past 64 bits
+      << "442\t14\tgame.exe\n"                       // another depot
+      << "441\t14\tGAME.EXE\n"                       // another spelling
+      << "441\t7\tgame.exe\n"                        // no chunk there
+      << "441\t14\n441 14 game.exe\n";                // not a key
+  auto hooks = world.Hooks();
+  InstallStats last;
+  hooks.stats = [&](const char* phase, const InstallStats& stats) { if (std::string(phase) == "end") last = stats; };
+  DepotInstaller installer(hooks);
+  std::atomic<bool> cancel{false};
+  CHECK(installer.Run({}, Target(root), cancel).error == InstallError::kNone);
+  CHECK(last.chunks_skipped == 1);
+  CHECK(world.chunk_calls == 2);  // game.exe's second chunk and level.dat
+  CHECK(Read(root / "game.exe") == "MZ-executable-second-chunk");
 }
 
 void LongMatchingJournalHeader(const std::filesystem::path& root) {
@@ -2850,6 +2972,7 @@ int main(int argc, char** argv) {
   ChangedManifestRefetchesSameOffset(base / "manifest-update");
   JournalHeaderModes(base / "header-modes");
   HeaderWriteFailureCannotAppend(base / "header-write-failure");
+  JournalLinesMatchExactly(base / "journal-lines");
   LongMatchingJournalHeader(base / "long-header");
   UnterminatedJournalGetsSeparator(base / "unterminated-header");
   JournalTraceLogging();
@@ -2867,6 +2990,8 @@ int main(int argc, char** argv) {
   MeasureUpdateMatchesTheUpdate(base / "update-measure");
   MeasureUpdateWithoutTreeUsesTheInstalledManifests(base / "update-measure-no-tree");
   UpdateRestoresFilesOfARemovedDepot(base / "update-removed-depot");
+  ExcludedDlcForARun();
+  DlcTurnedOffAndOnAgain(base / "update-dlc-change");
   UpdateWithoutTreeHashesFiles(base / "update-no-tree");
   InterruptedUpdateResumes(base / "update-resume");
   DiscardAndUninstallDuringUpdate(base / "update-discard");

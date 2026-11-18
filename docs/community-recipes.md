@@ -1,7 +1,8 @@
 # Community recipes
 
-A community recipe tells Playden how to start one game on the PS5: a Steam game, or a game imported from a folder
-(GOG and Epic games once Playden has those stores). It is a
+A community recipe tells Playden how to start one game on the PS5: a Steam game, a GOG game installed from GOG (the
+`gog-store` experimental feature, see [docs/gog-store.md](gog-store.md)), or a game imported from a folder (Epic games
+once Playden has that store). It is a
 Playden recipe (the same JSON as `runtime/recipes/*.json`) with a few more fields
 that say who tested it, where and how well. Playden reads the recipe part with
 `ParseGameRecipe` and the whole file with `ParseCommunityRecipe`
@@ -16,17 +17,15 @@ sending one, you agree to that. The recipes Playden ships (`runtime/recipes/`) a
 
 ## Turn them on
 
-Community recipes, sharing, votes and account linking are available in every build. Game test reports are disabled
-unless their API endpoint is explicitly configured in `features.txt` as `game-test-reports=https://host`. The endpoint
-must provide `/v1/reports` and, when logs are attached, `/v1/attachments`; there is no default report API destination.
-The line
-`community-recipes` is still accepted in `features.txt` for older builds, but is no longer needed. Steam Online remains
-off unless `online-steam` is listed there; see [Steam network play](online-play.md). A bare `game-test-reports` line
-does not enable reports; the HTTPS endpoint is required.
+Community recipes are part of every build from Playden 0.11.0-beta.4: there is nothing to turn on. Earlier release
+builds need a line `community-recipes` in `features.txt` in Playden's data folder (`/data/playden/features.txt` on the
+console). Current builds ignore that line, so a file that still has it keeps working.
 
-On PS4, `features.txt` is `/data/PLDN10001/features.txt`; FTP or the file manager can write it. Playden reads it at
-startup. A game that already uses a community recipe keeps it: Playden reads it from
-the saved copy, and the game can still go back to a preset.
+On PS4, `features.txt` is `/data/PLDN10001/features.txt`; FTP or the file manager can write it, and Playden reads it at
+startup. Game test reports are off on PS4 unless the file names their endpoint, as
+`game-test-reports=https://host`: the endpoint must serve `/v1/reports` and, when logs are attached, `/v1/attachments`.
+There is no default report destination, and a bare `game-test-reports` line turns nothing on. A game already using a
+community recipe keeps it: Playden reads it from the saved copy, and the game can still go back to a preset.
 
 ## Share one from Playden
 
@@ -37,7 +36,7 @@ playden-ps5-recipes for review. No GitHub account is needed. Game test reports g
 configured with `game-test-reports=https://host` in `features.txt`.
 
 Who a recipe (or a test report) credits is the **Shared as** row on the Share and feedback sheets, and its default
-in Settings › Community › **Share as**:
+in Settings › Accounts › **Share as**:
 
 - **No name**: shown as "from the community".
 - **Your name**: a name you type, no account needed.
@@ -53,8 +52,13 @@ and a star by the name of an author the maintainers trust.
    overrides, other rows).
 2. Set the game's rating and note under **Compatibility and note**.
 3. In **Game settings > Advanced**, choose **Export as recipe**. Playden writes
-   `recipe-<game>.json` (`recipe-274520.json`, `recipe-local-<uuid>.json`) next to its logs (`/data/playden/logs` on the console, `logs/`
-   in the data folder on a Mac). `tools/collect_logs.py` puts it in the zip for a test report.
+   `recipe-<game name>-<game ID>.json` (`recipe-half-life-2-steam-220.json`, `recipe-night-sky-local-<uuid>.json`) into
+   its own folder: `/data/playden/exported-recipes` on the console, `exported-recipes/` in the data folder on a Mac. The
+   name is the game's name in lowercase ASCII letters, digits and `-` (at most 48 bytes), left out when nothing of it is
+   left; the ID keeps the names unique. A new export of the game replaces its earlier one. Get the file over FTP, or
+   from web access: the game's page in **Game files** has **Download exported recipe**. Exports are not logs: the Logs
+   tab, its report and `tools/collect_logs.py` leave them out. Older versions wrote `recipe-<game>.json` into the logs
+   folder; Playden moves those to the new folder when it starts.
 4. Fill in what the export leaves for you:
    - a slug, added to `recipe_id`: `community-<store>-<key>` becomes `community-<store>-<key>-<slug>`;
    - `community.title`, the name players see when they choose a recipe (optional);
@@ -65,6 +69,30 @@ and a star by the name of an author the maintainers trust.
 
 A game can have several recipes, for example "120 Hz, pointer on left stick" and "Mouse preset": each is
 its own file with its own slug.
+
+## Import one from web access
+
+A recipe file can go straight to a game from Playden's web page, without a pull request. This works with community
+recipes on or off.
+
+1. Open the web page (Settings › Web access) and pair the browser in the **Game files** tab.
+2. Choose **Import recipe** and pick the file: an Export as recipe file, a file from playden-ps5-recipes, or one
+   somebody sent you.
+   - Above the games list, the recipe goes to the game it names: a Steam game by its app ID, a GOG game by its GOG
+     product ID (`gog/<ID>`), an imported game by its Steam app ID or name. If no game on the console matches, or more
+     than one copy does, Playden says so.
+   - On a game's page, under **Recipe**, the recipe goes to that game.
+
+The game uses the recipe at once and keeps the changes you made that still apply. The TV shows a notification.
+
+- **What Playden checks:** the file must be a recipe for this game. It must pass the [rules](#rules-for-community-recipes)
+  and be one the recipe service would take: at most 16 KB, no [INI values](#ini-values), and no field the service refuses.
+  A recipe for another game is refused.
+- **The imported recipe is local:** Playden replaces its id with `community-<store>-<key>-imported-<16 hex>`, the
+  start of the file's SHA-256. It gives the recipe the title "Imported recipe" if the file has none, and drops any
+  `locked` rows. Playden keeps the recipe with the community recipes, like one from the catalog.
+- **Sharing and votes:** sharing the game's settings makes a new recipe, never an update of the one you imported. You
+  can't vote on an imported recipe.
 
 ## Format (format_version 1)
 
@@ -125,7 +153,7 @@ Recipe fields:
 | `ini` | Values the game's own INI files get when the game's files are prepared, written only when the key is missing or empty: `{"BmGame/Config/UserEngine.ini": {"Engine.Engine": {"Language": "int"}}}`. See [INI values](#ini-values). |
 | `steam_api_copies` | Shipped recipes only. Paths in the game folder that get a copy of the game's own Steam library while the emulator answers the game: `["Sandfall/Binaries/Win64/steam_api64.dll"]`. See [Steam library copies](#steam-library-copies). |
 | `game_files` | Shipped recipes only. Paths in the game folder that get a file Playden ships: `["zombie/DebugFileWatcher.class"]`. See [Game files](#game-files). |
-| `retired_game_files` | Shipped recipes only. Files an earlier recipe placed with `game_files`, each paired with the SHA-256 Playden shipped. Playden removes only its unchanged copy. See [Game files](#game-files). |
+| `retired_game_files` | Shipped recipes only. Files an earlier version of the recipe placed with `game_files`, each with the SHA-256 of the file Playden shipped: `{"zombie/DebugFileWatcher.class": "598b…5d44"}`. Playden removes its copy. See [Game files](#game-files). |
 
 Community fields:
 
@@ -233,9 +261,9 @@ Export as recipe always writes format 1.
 
 `community.format_version` says which Playden can read a file. Each Playden reads a set of versions and refuses a
 file of any other version alone, with a log line in `community.log`; the rest of the release still loads. This
-Playden reads 1 and 2. Earlier builds read only 1, so they skip settings-only files. Release builds read community
-recipes only when they are turned on (see [Turn them on](#turn-them-on)), so the builds that skip them are mostly
-older nightlies.
+Playden reads 1 and 2. Earlier builds read only 1, so they skip settings-only files. Release builds before 0.11.0-beta.4
+read community recipes only when they are turned on (see [Turn them on](#turn-them-on)), so the builds that skip them
+are mostly older nightlies.
 
 - The version goes up when an older Playden would read a file wrongly or can't apply it. A new optional field that
   older builds may ignore safely doesn't need a new version.
@@ -269,14 +297,17 @@ fine.
 Which recipes a game gets, matched only by ID:
 
 - A Steam game: those of `steam/<its app ID>`.
+- A GOG game installed from GOG: those of `gog/<its GOG product ID>`, also when Game settings give it a Steam app ID.
+  It doesn't get the `steam/` recipes of the same game; search for them by name.
 - An imported game with a Steam app ID (its `steam_appid.txt`, or the **Steam app ID** in Game settings): those of
   `steam/<that ID>`. Without one, none: an imported game is never matched by its name.
 
 Games are never mapped between stores. A player who wants another game's recipe (the same game from another store, or
 an imported copy under another name) searches for it by name, below.
 
-What a share or an export is for: the same `steam/<ID>`, with `"made_on": "imported"` for an imported copy, or for an
-imported game without a Steam app ID `imported/<name key of its title>`.
+What a share or an export is for: the same `steam/<ID>` or `gog/<ID>`, with `"made_on": "imported"` for an imported
+copy, or for an imported game without a Steam app ID `imported/<name key of its title>`. A GOG copy imported from a
+folder is an imported game, not a `gog/` one.
 
 A share saved before shares recorded their game (Playden builds before store and key) counts as made for
 `steam/<app ID>` on a Steam game, the only kind that could share then, so its next share updates it. On any other game
@@ -419,7 +450,7 @@ CI, with each file's `format_version` (0 when it doesn't parse):
 
 Applying community recipes from the preset chooser is planned.
 
-## Recipes for imported games on this console
+## Recipes for imported and GOG games on this console
 
 A recipe Playden makes for one console's imported game (not a community recipe) names it with two more fields:
 
@@ -428,9 +459,10 @@ A recipe Playden makes for one console's imported game (not a community recipe) 
 "game": "local-<uuid>"
 ```
 
-Give both or neither; a file with only one is refused, as is an unknown `store`. `local` is the only store so far.
-Without them, the recipe is for the Steam game `app_id`. An imported game is keyed by its local ID, which Playden makes
-when you add it, so such a recipe only fits that console. A community recipe has neither field nor `app_id`: its
+A GOG game's names `"store": "gog"` and its GOG product ID as `"game"`. Give both or neither; a file with only one is
+refused, as is an unknown `store`. `local` and `gog` are the stores so far. Without them, the recipe is for the Steam
+game `app_id`. An imported game is keyed by its local ID, which Playden makes when you add it, so such a recipe only
+fits that console. A community recipe has neither field nor `app_id`: its
 `game` object names its game on every console.
 
 ## Registry values
@@ -516,10 +548,8 @@ settings doesn't show, and a community recipe is only offered, so the game would
 ## Game files
 
 Use `game_files` only for a game that can't run on the console without a changed file, and only when nothing else in
-this file can do it. Project Zomboid watches its folders for changes by holding one handle on each of its 1704 media
-folders. A PS5 title can hold about 250 open files, so the game quits while it starts. The game looks for classes in
-its own folder first, so a watcher that watches nothing stands in for the game's. That only stops the game reloading
-files that change while it runs.
+this file can do it. Project Zomboid used it until the runtime kit could watch its 1704 media folders: Playden placed
+a `zombie/DebugFileWatcher.class` that watched nothing, which the game found before its own.
 
 Playden copies each file from `runtime/recipes/files/<recipe id>/<path>` to `<path>` in the game folder when it
 prepares the game or applies its settings:
@@ -533,15 +563,15 @@ prepares the game or applies its settings:
   the game later.
 - Uninstalling the game removes the file with the rest of the folder.
 
-When a later runtime makes one of these files unnecessary, a shipped recipe can move its path to
-`retired_game_files` with the SHA-256 of the exact file Playden shipped. During preparation Playden removes that file
-only when the bytes still match; a missing file is already retired, while a changed file or link is left alone and
-logged as kept. A path cannot appear in both fields. Community recipes cannot place or retire these files.
+When the game no longer needs a file, move it from `game_files` to `retired_game_files` with the SHA-256 of the file
+Playden shipped, and remove the file from `runtime/recipes/files/` and `tools/recipe-files/`. Each time Playden prepares
+the game or applies its settings, it removes a file at that path whose bytes have that SHA-256. A file with other bytes
+is the game's or the player's and stays, and Playden logs `recipe files ... kept=`. A link is never followed.
 
-Rules: the path is inside the game folder, with `/` between folders and no `.` or `..` part. At most 4 paths, each
-once. A community recipe with this field is refused, for the same reason as `steam_api_copies`. The source of a file
-that isn't plain text goes in `tools/recipe-files/<recipe id>`, with what builds it. Write it yourself: no part of
-the game goes in Playden's repository.
+Rules: the path is inside the game folder, with `/` between folders and no `.` or `..` part. At most 4 paths in each
+field, each once, and a path is not in both. A community recipe with either field is refused, for the same reason as
+`steam_api_copies`. The source of a file that isn't plain text goes in `tools/recipe-files/<recipe id>`, with what
+builds it. Write it yourself: no part of the game goes in Playden's repository.
 
 ## Shipped recipes
 

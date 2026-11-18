@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "web/files_api.h"
 
+#include "library/recipe_exports.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <optional>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -111,6 +115,21 @@ std::string GameJson(const FileGame& game) {
   return out + "}";
 }
 
+// A move's answer, whether it finished at once or on its own thread: the clash JSON, the summary, or the error.
+void SendMoveAnswer(Response& response, const FileError& error, const MoveSummary& summary) {
+  if (summary.clash)
+    return SendJson(response, 409, "{" + Field("clash", true) + "," + Field("name", summary.name) + "," + Field("folder", summary.clash_folder) + "," +
+                                       Field("message", error.message) + "}");
+  if (!error.ok()) return Fail(response, error);
+  SendJson(response, 200, "{" + Field("name", summary.name) + "," + Number("files", summary.files) + "," + Number("folders", summary.folders) + "," +
+                              Number("left", summary.left) + "}");
+}
+
+std::string ProgressJson(const MoveProgress& progress) {
+  return Number("bytes", progress.bytes) + "," + Number("total_bytes", progress.total_bytes) + "," + Number("files", progress.files) + "," +
+         Number("total_files", progress.total_files) + "," + Field("current", progress.name);
+}
+
 FileStore::Options StoreOptions(const FilesConfig& config) {
   auto options = config.store;
   if (config.try_hold) options.try_hold = config.try_hold;
@@ -132,8 +151,48 @@ class FilesApi::Transfer {
   bool held_ = false;
 };
 
+// A move across roots on its own thread. Its fields are under the API's jobs_mutex_.
+struct FilesApi::MoveJob {
+  std::thread thread;
+  std::unique_ptr<Transfer> transfer;  // counts as a transfer until it ends
+  MoveProgress progress;
+  bool done = false;
+  FileError error;
+  MoveSummary summary;
+  std::int64_t finished = 0;  // steady seconds
+};
+
 FilesApi::FilesApi(FilesConfig config)
     : config_(std::move(config)), pairing_(config_.pairing), store_(StoreOptions(config_)) {}
+
+FilesApi::~FilesApi() { StopMoves(); }
+
+void FilesApi::StopMoves() {
+  stopping_.store(true);
+  std::map<std::string, std::shared_ptr<MoveJob>> jobs;
+  {
+    std::lock_guard<std::mutex> lock(jobs_mutex_);
+    jobs.swap(jobs_);
+  }
+  for (auto& [id, job] : jobs)
+    if (job->thread.joinable()) job->thread.join();
+}
+
+void FilesApi::ReapMoves() {
+  const auto now = SteadySeconds();
+  std::vector<std::pair<std::int64_t, std::string>> finished;
+  for (const auto& [id, job] : jobs_)
+    if (job->done) finished.emplace_back(job->finished, id);
+  std::sort(finished.begin(), finished.end());
+  for (std::size_t i = 0; i < finished.size(); ++i) {
+    // The oldest go first when too many are kept; any past their time go anyway.
+    if (now - finished[i].first < kMoveAnswerSeconds && finished.size() - i <= kMaxKeptMoves) continue;
+    auto& job = jobs_[finished[i].second];
+    // Done is set as its last step: the join waits only for the thread to return.
+    if (job->thread.joinable()) job->thread.join();
+    jobs_.erase(finished[i].second);
+  }
+}
 
 void FilesApi::SetCatalog(FileCatalog catalog) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -145,16 +204,36 @@ std::string FilesApi::PairingCode() const { return pairing_.ActiveCode(); }
 void FilesApi::CancelPairing() { pairing_.Cancel(); }
 
 bool FilesApi::InUse() const {
+  if (running_moves_.load() > 0) return true;
   const auto used = last_used_.load();
   return used != 0 && SteadySeconds() - used < 30;
 }
 
-bool FilesApi::Paired(const Request& request) {
-  const auto token = CookieValue(request, kCookie);
-  if (token.empty() || !pairing_.Paired(token)) return false;
-  last_used_.store(SteadySeconds());
-  return true;
+Pairing::Browser FilesApi::Check(const std::string& token) {
+  if (token.empty()) return Pairing::Browser::kNone;
+  const auto browser = pairing_.Check(token);
+  if (browser != Pairing::Browser::kNone) last_used_.store(SteadySeconds());
+  return browser;
 }
+
+bool FilesApi::Paired(const Request& request) { return Check(CookieValue(request, kCookie)) != Pairing::Browser::kNone; }
+
+bool FilesApi::Remembers() const { return !config_.pairing.store_root.empty(); }
+
+// A remembered browser's cookie outlives the browser session for as long as Playden keeps the browser.
+std::string FilesApi::SessionCookie(const std::string& token, bool remembered) const {
+  auto cookie = std::string(kCookie) + "=" + token + "; HttpOnly; SameSite=Strict; Path=/";
+  if (remembered) cookie += "; Max-Age=" + std::to_string(config_.pairing.remember_seconds);
+  return cookie;
+}
+
+std::size_t FilesApi::PairedBrowsers() const { return pairing_.Count(); }
+
+void FilesApi::ForgetBrowsers() { pairing_.ForgetAll(); }
+
+void FilesApi::SetStoreChanged(std::function<void()> changed) { pairing_.SetStoreChanged(std::move(changed)); }
+
+Pairing::StoreWork FilesApi::DoStoreWork(std::string* log) { return pairing_.DoStoreWork(config_.try_hold, log); }
 
 bool FilesApi::RequirePaired(const Request& request, Response& response) {
   if (Paired(request)) return true;
@@ -207,6 +286,13 @@ std::vector<std::pair<std::string, FileRoot>> FilesApi::Roots(const FileGame& ga
   return roots;
 }
 
+std::optional<std::string> FilesApi::ExportedRecipe(const FileGame& game) const {
+  if (config_.exported_recipes.empty()) return std::nullopt;
+  const auto id = ParseInstallId(game.id);
+  if (!id) return std::nullopt;
+  return FindExportedRecipe(config_.exported_recipes, *id);
+}
+
 bool FilesApi::Find(const Request& request, Response& response, FileGame* game, FileRoot* root) {
   const auto id = QueryValue(request.query, "game");
   const auto named = QueryValue(request.query, "root");
@@ -247,11 +333,12 @@ void FilesApi::Register(Router& router) {
   router.Post("/api/pair/confirm", [this](const Request& request, const std::string&, Response& response) {
     if (!RequireAction(request, response)) return;
     std::string token;
-    switch (pairing_.Confirm(QueryValue(request.query, "code").value_or(std::string()), &token)) {
+    // Ticked on the page by default; a request without it pairs for this session only, as before.
+    const bool remember = QueryValue(request.query, "remember") == std::string("1");
+    switch (pairing_.Confirm(QueryValue(request.query, "code").value_or(std::string()), remember, &token)) {
       case Pairing::ConfirmResult::kPaired:
-        SendJson(response, 200, "{\"paired\":true}",
-                 {{"Set-Cookie", std::string(kCookie) + "=" + token + "; HttpOnly; SameSite=Strict; Path=/"},
-                  {"Cache-Control", "no-store"}});
+        SendJson(response, 200, "{" + Field("paired", true) + "," + Field("remembered", remember && Remembers()) + "}",
+                 {{"Set-Cookie", SessionCookie(token, remember && Remembers())}, {"Cache-Control", "no-store"}});
         return;
       case Pairing::ConfirmResult::kWrong: return SendError(response, 403, "That isn't the code on the TV.");
       case Pairing::ConfirmResult::kLocked: return SendError(response, 429, "Too many wrong codes. Try again in a moment.");
@@ -260,7 +347,14 @@ void FilesApi::Register(Router& router) {
     }
   });
   router.Exact("/api/pair/status", [this](const Request& request, const std::string&, Response& response) {
-    SendJson(response, 200, "{" + Field("paired", Paired(request)) + "}");
+    const auto token = CookieValue(request, kCookie);
+    const auto browser = Check(token);
+    const bool remembered = browser == Pairing::Browser::kRemembered;
+    // Each visit gives a remembered browser's cookie its 90 days again, as Playden does for the token.
+    auto headers = kNoStore;
+    if (remembered) headers.emplace_back("Set-Cookie", SessionCookie(token, true));
+    SendJson(response, 200,
+             "{" + Field("paired", browser != Pairing::Browser::kNone) + "," + Field("remembered", remembered) + "}", headers);
   });
 
   router.Exact("/api/files/games", [this](const Request& request, const std::string&, Response& response) {
@@ -307,7 +401,8 @@ void FilesApi::Register(Router& router) {
       for (std::size_t j = 0; j < folder.sample.size(); ++j) body += (j ? "," : "") + Quoted(folder.sample[j]);
       body += "]}";
     }
-    SendJson(response, 200, body + "]," + Field("redist_busy", redist_busy) + "," + Field("all_setting_up", setting_up) + "}");
+    SendJson(response, 200, body + "]," + Field("redist_busy", redist_busy) + "," + Field("all_setting_up", setting_up) + "," +
+                                Field("exported_recipe", ExportedRecipe(*game).value_or(std::string())) + "}");
   });
   router.Exact("/api/files/list", [this](const Request& request, const std::string&, Response& response) {
     if (!RequirePaired(request, response)) return;
@@ -400,6 +495,49 @@ void FilesApi::Register(Router& router) {
     if (!error.ok()) return Fail(response, error);
     SendJson(response, 200, "{" + Field("replaced", replaced) + "}");
   });
+  // A recipe file for the game named, or for the game the recipe is for: it uses it at once, and the TV says so.
+  router.Post("/api/files/recipe", [this](const Request& request, const std::string&, Response& response) {
+    if (!RequirePaired(request, response) || !RequireAction(request, response)) return;
+    if (!request.content_length) return SendError(response, 411, "Send the file's length.");
+    if (*request.content_length > kMaxRecipeUploadBytes) return SendError(response, 413, "The recipe is larger than 16 KB.");
+    if (!request.read_body) return SendError(response, 400, "No body.");
+    // No game named: Playden finds the one the recipe is for.
+    const auto id = QueryValue(request.query, "game");
+    std::optional<FileGame> game;
+    if (id && !id->empty()) {
+      game = Game(*id);
+      if (!game) return SendError(response, 404, "No such game.");
+      if (game->setting_up) return SendError(response, 409, "Playden is setting up this game. Try again when it finishes.");
+    }
+    std::string file;
+    file.resize(static_cast<std::size_t>(*request.content_length));
+    std::size_t done = 0;
+    while (done < file.size()) {
+      const auto count = request.read_body(file.data() + done, file.size() - done);
+      if (count <= 0) return SendError(response, 400, "The file didn't arrive whole.");
+      done += static_cast<std::size_t>(count);
+    }
+    if (!config_.import_recipe) return Fail(response, {503, "Playden can't take recipes now."});
+    const auto answer = config_.import_recipe(game ? game->id : std::string(), std::move(file));
+    if (answer.status != 200) return SendError(response, answer.status, answer.message);
+    SendJson(response, 200, "{" + Field("message", answer.message) + "," + Field("game", answer.game) + "}");
+  });
+  // The game's exported recipe, from Export as file in its Game settings. The request names the game only.
+  router.Exact("/api/files/recipe/export", [this](const Request& request, const std::string&, Response& response) {
+    if (!RequirePaired(request, response)) return;
+    const auto id = QueryValue(request.query, "game");
+    const auto game = id ? Game(*id) : std::nullopt;
+    if (!game) return SendError(response, 404, "No such game.");
+    auto name = ExportedRecipe(*game);
+    auto text = name ? ReadExportedRecipe(config_.exported_recipes, *name) : std::nullopt;
+    // An export on the PS5 between finding and reading it replaces the file, under a new name after a rename: once more.
+    if (name && !text) {
+      name = ExportedRecipe(*game);
+      text = name ? ReadExportedRecipe(config_.exported_recipes, *name) : std::nullopt;
+    }
+    if (!text) return SendError(response, 404, "This game has no exported recipe. Export it from Game settings on the PS5.");
+    response.Send(200, "application/json", *text, DownloadHeaders(*name));
+  });
   const auto action = [this](FileError (FileStore::*work)(const FileRoot&, const std::string&)) {
     return [this, work](const Request& request, const std::string&, Response& response) {
       if (!RequirePaired(request, response) || !RequireAction(request, response)) return;
@@ -453,6 +591,103 @@ void FilesApi::Register(Router& router) {
     SendJson(response, 200, tree_json(tree));
   });
   router.Post("/api/files/restore", action(&FileStore::Restore));
+  // Moves or renames one file or folder: to a folder of any root of the same game, under its own name or a new one.
+  // A name already there answers 409 with clash set, and the page asks; clash=replace or clash=keep answers that.
+  router.Post("/api/files/move", [this](const Request& request, const std::string&, Response& response) {
+    if (!RequirePaired(request, response) || !RequireAction(request, response)) return;
+    FileGame game;
+    FileRoot root;
+    if (!Find(request, response, &game, &root)) return;
+    const auto root_id = QueryValue(request.query, "root").value_or(std::string());
+    const auto to_id = QueryValue(request.query, "to_root").value_or(root_id);
+    std::optional<FileRoot> to;
+    for (auto& [id, value] : Roots(game))
+      if (id == to_id) to = std::move(value);
+    if (!to) return SendError(response, 404, "This game has no such folder.");
+    const auto path = QueryValue(request.query, "path").value_or(std::string());
+    const auto slash = path.rfind('/');
+    const auto name = QueryValue(request.query, "name").value_or(path.substr(slash == std::string::npos ? 0 : slash + 1));
+    const auto answer = QueryValue(request.query, "clash");
+    const auto clash = answer == std::string("replace") ? MoveClash::kReplace : answer == std::string("keep") ? MoveClash::kKeepBoth : MoveClash::kAsk;
+    // No folder named: the one it is in (a rename).
+    const auto folder = QueryValue(request.query, "to").value_or(slash == std::string::npos ? std::string() : path.substr(0, slash));
+    if (to_id == root_id) {
+      // Renames: over at once.
+      MoveSummary summary;
+      const auto error = store_.Move(root, path, *to, folder, name, clash, &summary);
+      return SendMoveAnswer(response, error, summary);
+    }
+    // Across roots every file is copied: a transfer, as a download is. It runs on its own thread, so a long copy
+    // answers 202 and the page asks how far it is; one over within move_wait_ms answers as a rename does.
+    auto transfer = std::make_unique<Transfer>(transfers_);
+    if (!transfer->held()) return Fail(response, {503, "Other transfers are running. Try again in a moment."});
+    auto job = std::make_shared<MoveJob>();
+    job->transfer = std::move(transfer);
+    std::string id;
+    {
+      std::lock_guard<std::mutex> lock(jobs_mutex_);
+      if (stopping_.load()) return Fail(response, {503, "Playden is closing."});
+      ReapMoves();
+      // The time keeps an id from a page that outlived a restart from naming a new move.
+      id = std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + "-" + std::to_string(++next_job_);
+      jobs_[id] = job;
+      ++running_moves_;
+      job->thread = std::thread([this, job, from = root, to = *to, path, folder, name, clash] {
+        const MoveObserver observe = [this, &job](const MoveProgress& progress) {
+          std::lock_guard<std::mutex> lock(jobs_mutex_);
+          job->progress = progress;
+          return !stopping_.load();
+        };
+        MoveSummary summary;
+        const auto error = store_.Move(from, path, to, folder, name, clash, &summary, observe);
+        job->transfer.reset();
+        {
+          std::lock_guard<std::mutex> lock(jobs_mutex_);
+          job->error = error;
+          job->summary = summary;
+          job->finished = SteadySeconds();
+          job->done = true;
+          --running_moves_;
+        }
+        jobs_changed_.notify_all();
+      });
+    }
+    std::unique_lock<std::mutex> lock(jobs_mutex_);
+    if (jobs_changed_.wait_for(lock, std::chrono::milliseconds(config_.move_wait_ms), [&] { return job->done; })) {
+      const auto error = job->error;
+      const auto summary = job->summary;
+      // Answered here: the page never asks for it.
+      if (job->thread.joinable()) job->thread.join();
+      jobs_.erase(id);
+      lock.unlock();
+      return SendMoveAnswer(response, error, summary);
+    }
+    const auto progress = job->progress;
+    lock.unlock();
+    SendJson(response, 202, "{" + Field("job", id) + "," + ProgressJson(progress) + "}");
+  });
+  // How far a move that answered 202 is. When it's over: the answer the move itself would have given, for as long as
+  // kMoveAnswerSeconds; 404 after that or after a restart.
+  router.Exact("/api/files/move/status", [this](const Request& request, const std::string&, Response& response) {
+    if (!RequirePaired(request, response)) return;
+    const auto id = QueryValue(request.query, "job").value_or(std::string());
+    std::unique_lock<std::mutex> lock(jobs_mutex_);
+    ReapMoves();
+    const auto found = jobs_.find(id);
+    if (found == jobs_.end()) return SendError(response, 404, "Playden has no news of this move. Check both folders: moving again finishes it.");
+    const auto job = found->second;
+    if (!job->done) {
+      const auto progress = job->progress;
+      lock.unlock();
+      return SendJson(response, 200, "{" + Field("running", true) + "," + ProgressJson(progress) + "}");
+    }
+    auto error = job->error;
+    const auto summary = job->summary;
+    lock.unlock();
+    // Busy is over for the move, not for this answer: a page that waits out a 503 would ask again for ever.
+    if (error.status == 503) error.status = 409;
+    SendMoveAnswer(response, error, summary);
+  });
 }
 
 }  // namespace playden::web

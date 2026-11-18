@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <charconv>
 #include <cstdio>
 #include <cstring>
@@ -91,6 +92,14 @@ std::vector<InstallRequest> ParseInstallRequests(const std::string& text) {
       id = token();
     }
     if (malformed || id.empty() || !token().empty() || malformed) continue;
+    if (id.rfind("gog-", 0) == 0) {
+      // A GOG game by its key: install, uninstall or cancel, as a Steam game.
+      const auto game = ParseKey(id);
+      if (!game || game->store != Store::kGog) continue;
+      request.game = *game;
+      requests.push_back(std::move(request));
+      continue;
+    }
     if (id.rfind("local-", 0) == 0) {
       // Imported games have no download to cancel.
       const auto game = ParseKey(id);
@@ -208,13 +217,18 @@ bool ValidOptionValue(std::string_view value) {
 // Past this a job's excluded DLC would not fit a registry line (Scan), and the game would be lost with its line.
 constexpr std::size_t kMaxRegisteredDlc = 1000;
 
-InstallOptions Registrable(InstallOptions options) {
+// A job's options as the registry keeps them. Excluded DLC are sorted and unique, and only valid IDs of the game's own
+// store other than the game itself stay: a DLC is always in its game's store.
+InstallOptions Registrable(InstallOptions options, const GameId& game) {
   if (!ValidOptionValue(options.language)) options.language.clear();
   if (!ValidOptionValue(options.branch)) options.branch.clear();
-  std::sort(options.excluded_dlc.begin(), options.excluded_dlc.end());
-  options.excluded_dlc.erase(std::unique(options.excluded_dlc.begin(), options.excluded_dlc.end()), options.excluded_dlc.end());
-  options.excluded_dlc.erase(std::remove(options.excluded_dlc.begin(), options.excluded_dlc.end(), 0u), options.excluded_dlc.end());
-  if (options.excluded_dlc.size() > kMaxRegisteredDlc) options.excluded_dlc.resize(kMaxRegisteredDlc);
+  auto& excluded = options.excluded_dlc;
+  excluded.erase(std::remove_if(excluded.begin(), excluded.end(),
+                                [&game](const GameId& dlc) { return !dlc.valid() || dlc.store != game.store || dlc == game; }),
+                 excluded.end());
+  std::sort(excluded.begin(), excluded.end());
+  excluded.erase(std::unique(excluded.begin(), excluded.end()), excluded.end());
+  if (excluded.size() > kMaxRegisteredDlc) excluded.resize(kMaxRegisteredDlc);
   return options;
 }
 
@@ -240,10 +254,11 @@ struct RegistryEntry {
 // followed by "\tpaused" for a job that should wait for Resume after a restart, or "\tremoving" for
 // an uninstall whose folder is not deleted yet, or "\tupdate" for an installed game with an update job
 // (then "\tpaused" is the update's), or "\tmove=<volume>\tfrom=<volume>" for one with a move job, then a job's install options as "\tlang=<code>",
-// "\tbranch=<name>" and "\tnodlc=<app>,<app>" (none: the defaults), "\tdlcset" for an update that changes the game's DLC
+// "\tbranch=<name>" and "\tnodlc=<key>,<key>" (none: the defaults; each DLC's ToKey: a Steam app ID, "gog-<id>"), "\tdlcset" for an update that changes the game's DLC
 // (InstallOptions::dlc_choice; an older Playden skips it and updates with the record's DLC), its estimate as "\test=<bytes>", and "\tfinished=<unix seconds>" for a moved game's install time. Fields
 // after the install bytes may come in any order, and
-// unknown ones are skipped. The key is ToKey: a Steam game's app ID, "local-<uuid>" for an imported game.
+// unknown ones are skipped. The key is ToKey: a Steam game's app ID, "gog-<id>" for a GOG game, "local-<uuid>" for an
+// imported game.
 std::optional<RegistryEntry> ParseRegistryLine(std::string_view line) {
   RegistryEntry entry;
   const auto first_tab = line.find('\t');
@@ -290,9 +305,8 @@ std::optional<RegistryEntry> ParseRegistryLine(std::string_view line) {
           const auto comma = list.find(',');
           const auto text = list.substr(0, comma);
           list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
-          std::uint32_t dlc = 0;
-          const auto parsed = std::from_chars(text.data(), text.data() + text.size(), dlc);
-          if (parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()) entry.options.excluded_dlc.push_back(dlc);
+          // An entry that isn't a canonical key is skipped, and the rest of the line stays.
+          if (const auto dlc = ParseKey(text)) entry.options.excluded_dlc.push_back(*dlc);
         }
       }
       else if (field.substr(0, kFinished.size()) == kFinished) {
@@ -302,7 +316,7 @@ std::optional<RegistryEntry> ParseRegistryLine(std::string_view line) {
         if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() && time > 0) entry.finished_at = time;
       }
     }
-    entry.options = Registrable(std::move(entry.options));
+    entry.options = Registrable(std::move(entry.options), entry.id);
   }
   return entry;
 }
@@ -474,9 +488,15 @@ bool FollowUsbDrives(std::vector<RegistryEntry>& entries, const std::vector<Inst
 void InstallService::Scan() {
   const auto& primary = volumes_.front().games_root;
   std::vector<RegistryEntry> entries;
-  if (FILE* registry = std::fopen((primary + "/" + kRegistry).c_str(), "r")) {
-    // A job's excluded DLC makes for long lines: kMaxRegisteredDlc entries fit. Not on the stack: it is small on the console.
-    std::vector<char> buffer(16 * 1024);
+  std::size_t skipped = 0;
+  FILE* registry = std::fopen((primary + "/" + kRegistry).c_str(), "r");
+  const int open_error = registry ? 0 : errno;
+  if (registry) {
+    // A job's excluded DLC makes for long lines: kMaxRegisteredDlc entries fit, GOG keys too ("gog-" and up to 20 digits,
+    // with a comma: 25 bytes each). Not on the stack: it is small on the console. Builds before GOG DLC read 16 KiB and
+    // parse "nodlc=" as Steam app IDs: they skip a "gog-<id>" entry (that update then keeps the record's DLC), and drop
+    // a GOG game's line with more than about 640 excluded DLC.
+    std::vector<char> buffer(32 * 1024);
     char* const line = buffer.data();
     while (std::fgets(line, static_cast<int>(buffer.size()), registry) && entries.size() < kMaxJobs * 4) {
       const auto length = std::strcspn(line, "\r\n");
@@ -484,16 +504,25 @@ void InstallService::Scan() {
       if (line[length] == '\0' && length == buffer.size() - 1) {
         int rest = 0;
         while ((rest = std::fgetc(registry)) != EOF && rest != '\n') {}
+        ++skipped;
         continue;
       }
       auto entry = ParseRegistryLine(std::string_view(line, length));
-      if (!entry) continue;
+      if (!entry) {
+        ++skipped;
+        continue;
+      }
       if (entry->volume_id.empty()) entry->volume_id = volumes_.front().id;
       if (std::none_of(entries.begin(), entries.end(), [&](const RegistryEntry& other) { return other.id == entry->id; }))
         entries.push_back(std::move(*entry));
     }
     std::fclose(registry);
   }
+  // An empty or zero-filled registry (a crash before it reached the disk) names no game: the log says so, as
+  // nothing else does.
+  scan_summary_ = registry ? "registry games=" + std::to_string(entries.size()) + " skipped=" + std::to_string(skipped)
+                           : "registry " + std::string(open_error == ENOENT ? "missing" : "unreadable errno=" +
+                                                                                     std::to_string(open_error));
   const bool followed = FollowUsbDrives(entries, volumes_);
   if (FILE* file = std::fopen((primary + "/" + kDefaultVolume).c_str(), "r")) {
     char line[64] = {};
@@ -586,7 +615,7 @@ void InstallService::Scan() {
           if (job.options.language.empty()) job.options.language = update->language;
           if (job.options.branch.empty()) job.options.branch = update->branch;
         }
-        job.options = Registrable(job.options);
+        job.options = Registrable(job.options, job.view.id);
         job.view.dlc_change = job.options.dlc_choice;
         job.view.locked = update && update->phase != UpdatePhase::kStaging;
         if (job.view.locked || (entry.update && !entry.paused)) {
@@ -642,11 +671,11 @@ void InstallService::Scan() {
     std::fclose(file);
   }
   // Saved now: anything that acts on these folders reads the volumes from here on.
-  if (followed) SaveRegistry(true);
+  if (followed) SaveRegistry();
   ++revision_;
 }
 
-bool InstallService::SaveRegistry(bool sync) {
+bool InstallService::SaveRegistry() {
   if (!default_volume_saved_) SaveDefaultVolume();
   const auto& primary = volumes_.front().games_root;
   mkdir(primary.c_str(), 0777);
@@ -660,7 +689,7 @@ bool InstallService::SaveRegistry(bool sync) {
     if (!job.options.language.empty()) fields += "\tlang=" + job.options.language;
     if (!job.options.branch.empty()) fields += "\tbranch=" + job.options.branch;
     for (std::size_t index = 0; index < job.options.excluded_dlc.size(); ++index)
-      fields += (index ? "," : "\tnodlc=") + std::to_string(job.options.excluded_dlc[index]);
+      fields += (index ? "," : "\tnodlc=") + ToKey(job.options.excluded_dlc[index]);
     // Also with nothing left out: turning every DLC on is a choice too.
     if (job.view.kind == InstallJobKind::kUpdate && job.options.dlc_choice) fields += "\tdlcset";
     if (job.view.kind != InstallJobKind::kMove && job.estimated_bytes) fields += "\test=" + std::to_string(*job.estimated_bytes);
@@ -687,14 +716,13 @@ bool InstallService::SaveRegistry(bool sync) {
   for (const auto& game : uninstalling_)
     std::fprintf(registry, "%s\t%s\t%llu\tremoving\n", ToKey(game.id).c_str(), game.volume_id.c_str(),
                  static_cast<unsigned long long>(game.install_bytes));
-  bool saved = std::fflush(registry) == 0 && !std::ferror(registry) && (!sync || ::fsync(::fileno(registry)) == 0);
+  bool saved = std::fflush(registry) == 0 && !std::ferror(registry) && ::fsync(::fileno(registry)) == 0;
   saved = std::fclose(registry) == 0 && saved;
   saved = saved && std::rename(temporary.c_str(), path.c_str()) == 0;
   if (!saved) {
     std::remove(temporary.c_str());
     return false;
   }
-  if (!sync) return true;
   const int folder = ::open(primary.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   saved = folder >= 0 && ::fsync(folder) == 0;
   if (folder >= 0) ::close(folder);
@@ -780,7 +808,7 @@ void InstallService::Install(GameId id, std::optional<std::uint64_t> estimated_b
   Job job;
   job.view.id = id;
   const auto& target = volume_id.empty() ? default_volume_id_ : volume_id;
-  job.options = Registrable(options);
+  job.options = Registrable(options, id);
   Admit(job, target, estimated_bytes);
   jobs_.push_back(job);
   Publish();
@@ -804,7 +832,7 @@ std::string InstallService::Update(GameId id, const InstallOptions& options, std
     if (job.options.language.empty()) job.options.language = game->record->language;
     if (job.options.branch.empty()) job.options.branch = game->record->branch;
   }
-  job.options = Registrable(job.options);
+  job.options = Registrable(job.options, id);
   job.view.dlc_change = job.options.dlc_choice;
   Admit(job, game->volume_id, estimated_bytes);
   jobs_.push_back(job);
@@ -1108,6 +1136,65 @@ void InstallService::Uninstall(GameId id) {
 
 bool InstallService::Adopt(GameId id, const std::string& volume_id, std::uint64_t install_bytes) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return AdoptLocked(id, volume_id, install_bytes, true);
+}
+
+std::size_t InstallService::Recover(const std::vector<std::pair<GameId, std::string>>& titles) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::size_t listed = 0;
+  bool queued = false;
+  for (const auto& title : titles) {
+    const GameId id = title.first;
+    const std::string& install_path = title.second;
+    if (!id.valid() || install_path.empty() ||
+        std::any_of(installed_.begin(), installed_.end(), [id](const InstalledGame& game) { return game.id == id; }))
+      continue;
+    // Only the folder Playden would list the game from: `<games root>/<key>` on a volume, never a folder the title
+    // names somewhere else (a game imported in place).
+    const auto volume = std::find_if(volumes_.begin(), volumes_.end(), [&](const InstallVolume& candidate) {
+      return candidate.available && RootOn(candidate.id, id) == install_path;
+    });
+    if (volume == volumes_.end()) continue;
+    const auto record = install_path + "/" + kRecord;
+    if (!AdoptLocked(id, volume->id, Exists(record) ? RecordedBytes(record) : 0, false)) continue;
+    ++listed;
+    // An update on disk comes back as Scan brings it back: one putting its files in place finishes by itself, and the
+    // game can't run until it does; one still downloading waits for Resume.
+    const auto update = ReadUpdateState(install_path);
+    if (update && jobs_.size() < kMaxJobs) {
+      Job job;
+      job.view.id = id;
+      job.view.kind = InstallJobKind::kUpdate;
+      job.view.volume_id = volume->id;
+      job.options.language = update->language;
+      job.options.branch = update->branch;
+      job.options = Registrable(job.options, id);
+      job.view.dlc_change = job.options.dlc_choice;
+      job.view.locked = update->phase != UpdatePhase::kStaging;
+      if (job.view.locked) {
+        job.view.state = InstallJobState::kQueued;
+        queued = true;
+      } else {
+        job.view.state = InstallJobState::kPaused;
+        job.view.failure = kInterrupted;
+      }
+      jobs_.push_back(std::move(job));
+    }
+    if (log_) log_("registry recovered game=" + ToKey(id) + " volume=" + volume->id + (update ? " update=1" : ""));
+  }
+  // One save for them all: each is a synced write.
+  if (listed) Publish();
+  if (queued) wake_.notify_all();
+  return listed;
+}
+
+void InstallService::SetLog(std::function<void(const std::string&)> log) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  log_ = std::move(log);
+  if (log_) log_(scan_summary_);
+}
+
+bool InstallService::AdoptLocked(GameId id, const std::string& volume_id, std::uint64_t install_bytes, bool publish) {
   if (std::any_of(installed_.begin(), installed_.end(), [id](const InstalledGame& game) { return game.id == id; }))
     return true;
   const auto* volume = FindVolume(volume_id);
@@ -1120,7 +1207,7 @@ bool InstallService::Adopt(GameId id, const std::string& volume_id, std::uint64_
                         ReadInstallRecord(root + "/" + kRecord)});
   std::sort(installed_.begin(), installed_.end(),
             [](const InstalledGame& left, const InstalledGame& right) { return left.id < right.id; });
-  Publish();
+  if (publish) Publish();
   return true;
 }
 
@@ -1648,7 +1735,7 @@ void InstallService::RunMove(GameId id, const std::string& from, const std::stri
       job->view.done_bytes = job->view.total_bytes;
       // The old folder goes only once the registry on the storage names the copy: a restart would
       // otherwise look for the game in a folder that is gone.
-      finish = SaveRegistry(true);
+      finish = SaveRegistry();
       if (!finish) {
         active_.reset();
         job->view.state = InstallJobState::kQueued;

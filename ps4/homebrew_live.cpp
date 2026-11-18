@@ -418,7 +418,6 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         (data / playden::app::kExperimentalFeaturesFileName).string(),
         playden::app::DefaultExperimentalFeatures(playden::update::CurrentVersion().nightly() || PLAYDEN_DEV_BUILD),
         nullptr);
-    simulation.SetCommunityRecipesEnabled(s.features.community_recipes);
     simulation.SetGameTestReportsEnabled(!s.features.game_test_reports_api.empty());
     playden::runtime::SetOnlineSteamEnabled(s.features.online_steam);
 
@@ -808,8 +807,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         *error = "too many redirects";
         return std::nullopt;
     };
-    runtime_config.community_recipe_bytes =
-        playden::homebrew::CommunityRecipeBytes(community_objects, s.features.community_recipes);
+    runtime_config.community_recipe_bytes = playden::homebrew::CommunityRecipeBytes(community_objects);
     runtime_config.log = [log_directory](const std::string &line) {
         if (line.rfind("startup ", 0) == 0 || line.find("unavailable") != std::string::npos ||
             line.find("directory") != std::string::npos || line.find("kit ") != std::string::npos)
@@ -962,9 +960,8 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         playden::app::AppendLogLine(log_directory, "launch.log", line);
     });
 
-    if (!s.features.community_recipes) {
-        s.services->SetCommunityRecipeCache(community_objects);
-    } else {
+    // Community recipes are part of every build since upstream 0.11.0-beta.4: the service always runs.
+    {
         playden::community::RecipeServiceConfig config;
         config.store_root = community_root.string();
         std::string endpoints_line;
@@ -1021,7 +1018,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
 
     const auto snapshot = s.installs->Snapshot();
     log_line("services up: data " + data.string() + ", installed games " + std::to_string(snapshot.installed.size()) +
-             ", community recipes " + (s.features.community_recipes ? "on" : "off") + ", stay signed in " +
+             ", stay signed in " +
              (stay_signed_in ? "on" : "off"));
     return true;
 }

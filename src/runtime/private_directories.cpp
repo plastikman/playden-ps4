@@ -88,6 +88,35 @@ bool EnsurePrivateDirectories(const fs::path& boundary, const fs::path& private_
   }
   return current->Validate();
 }
+bool EnsureOpenDirectories(const fs::path& boundary, const fs::path& open_root, const fs::path& directory,
+                           std::string* error) {
+  if (error) error->clear();
+  const auto fail = [&](const std::string& message) {
+    if (error) *error = message;
+    return false;
+  };
+  const auto relative = directory.lexically_relative(boundary);
+  const auto open_relative = open_root.lexically_relative(boundary);
+  const auto within = directory.lexically_relative(open_root);
+  if (!SafeRelative(relative) || !SafeRelative(open_relative) || (directory != open_root && !SafeRelative(within)))
+    return fail("data directory is outside its trusted boundary");
+  auto current = ManagedDirectory::Open(boundary, DirectoryPolicy::kApprovedTree);
+  if (!current) return fail("cannot open directory boundary: " + std::string(strerror(errno)));
+  fs::path path = boundary;
+  bool in_open = false;
+  for (const auto& part : relative) {
+    path /= part;
+    if (path == open_root) in_open = true;
+    auto next = in_open ? current->OpenChild(part.string(), DirectoryPolicy::kOpenTree, true, 0777)
+                        : current->OpenChild(part.string(), DirectoryPolicy::kApprovedTree, true, 0777);
+    if (!next)
+      return fail("cannot open/create data directory (wrong owner): " + path.string() + ": " + strerror(errno));
+    if (!next->Sync() || !current->Sync())
+      return fail("cannot sync data directory: " + path.string() + ": " + strerror(errno));
+    current = std::move(next);
+  }
+  return current->Validate();
+}
 namespace {
 #if defined(__PROSPERO__) || (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
     (defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4)
@@ -139,7 +168,7 @@ bool ShareFolder(int fd, const fs::path& path, int depth, Walk& walk) {
   if (::fstat(fd, &info) != 0 || !S_ISDIR(info.st_mode)) { ::close(fd); return false; }
   if (info.st_uid != ::geteuid()) { ::close(fd); ++result->skipped; return true; }
   const bool private_folder = IsPrivateProfilePath(path.lexically_relative(walk.root), walk.options.private_paths);
-  const mode_t folder_mode = private_folder ? 0700 : 0777;
+  const mode_t folder_mode = private_folder && !walk.options.open_private_folders ? 0700 : 0777;
   if ((info.st_mode & 07777) != folder_mode) {
     if (::fchmod(fd, folder_mode) != 0) { ::close(fd); ++result->skipped; return true; }
     ++result->changed;
@@ -158,6 +187,9 @@ bool ShareFolder(int fd, const fs::path& path, int depth, Walk& walk) {
     if (name == "." || name == "..") continue;
     if (++walk.entries > kSharedTreeEntries) { result->truncated = true; break; }
     if (entry->d_type == DT_LNK) continue;
+    if (entry->d_type == DT_REG && walk.options.visit_file &&
+        !walk.options.visit_file((path / name).lexically_relative(walk.root)))
+      continue;
     if (walk.options.before_open) walk.options.before_open(path / name);
     // O_NOFOLLOW: a link swapped in is refused, never followed.
     const int child = platform::OpenWalkChild(fd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
@@ -178,7 +210,8 @@ bool ShareFolder(int fd, const fs::path& path, int depth, Walk& walk) {
     // A file with another link is someone else's too (a private file linked in): left alone.
     if (S_ISREG(opened.st_mode) && opened.st_nlink != 1) {
       ++result->linked;
-    } else if (S_ISREG(opened.st_mode) && opened.st_uid == ::geteuid()) {
+    } else if (S_ISREG(opened.st_mode) && opened.st_uid == ::geteuid() &&
+               !(walk.options.keep_file && walk.options.keep_file((path / name).lexically_relative(walk.root)))) {
       const mode_t wanted = IsPrivateProfilePath((path / name).lexically_relative(walk.root), walk.options.private_paths)
                                 ? 0600 : 0666 | (opened.st_mode & 0111);
       if ((opened.st_mode & 07777) != wanted) {

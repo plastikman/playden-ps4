@@ -147,7 +147,13 @@ void TitleStoreSuffixPersistsAndVersionOneStillLoads() {
   TemporaryDirectory directory;
   playden::Storage storage(directory.path());
   playden::PreferencesStore store(storage);
+  const auto fresh = store.Load();
+  Check(fresh.status == playden::PreferencesLoadStatus::kDefaultMissing && fresh.preferences.title_store_suffix,
+        "a new install names PS5 titles with their store");
   playden::Preferences preferences;
+  preferences.title_store_suffix = false;
+  Check(store.Save(preferences).ok(), "suffix preference saves");
+  Check(!store.Load().preferences.title_store_suffix, "turning the store name off survives restart");
   preferences.title_store_suffix = true;
   Check(store.Save(preferences).ok(), "suffix preference saves");
   const auto loaded = store.Load();
@@ -181,17 +187,19 @@ void SignInMethodPersistsAndVersionThreeOpensQr() {
   playden::Storage storage(directory.path());
   playden::PreferencesStore store(storage);
   playden::Preferences preferences;
+  preferences.title_store_suffix = false;
   preferences.steam_sign_in_password = true;
   preferences.cloud_saves_auto = true;
   Check(store.Save(preferences).ok(), "sign-in method preference saves");
   const auto saved = storage.Read("preferences.conf");
   Check(saved.ok() && std::string(saved.value().begin(), saved.value().end()) ==
-                          "version=14\nreduce_motion=0\ntitle_store_suffix=0\ncloud_saves_auto=1\nsteam_sign_in_password=1\n"
+                          "version=16\nreduce_motion=0\ntitle_store_suffix=0\ncloud_saves_auto=1\nsteam_sign_in_password=1\n"
                           "downloads_slow_network=0\nsteam_stay_signed_in=1\nbeta_updates=0\ndownload_server=\nweb_access=1\n"
                           "content_language=english\nhide_run_once_help=0\nhide_launcher_help=0\nruntime_prompt_kit=\n"
                           "recipe_votes=0\nsharing_explained=0\nshare_name=\nreports_explained=0\nshare_as=none\n"
-                          "ask_after_games=1\n",
-        "version 14 format includes Automatic download server, web access, English, the community fields and reports");
+                          "ask_after_games=1\nsteam_invisible=0\nsteam_online_notice=1\n",
+        "version 16 format includes Automatic download server, web access, English, the community fields, reports, "
+        "the Steam friends status and the Steam sign-in notice (on)");
   const auto loaded = store.Load();
   Check(loaded.status == playden::PreferencesLoadStatus::kLoaded && loaded.preferences.steam_sign_in_password &&
             loaded.preferences.cloud_saves_auto,
@@ -344,6 +352,57 @@ void CommunityPreferencesPersistAndVersionSixStillLoads() {
           "asking off and votes on survive restart apart");
   }
   {
+    // A released version 14 file (every field): loads, and the account appears online to Steam friends.
+    const std::string fourteen = "version=14\nreduce_motion=1\ntitle_store_suffix=0\ncloud_saves_auto=0\n"
+                                 "steam_sign_in_password=0\ndownloads_slow_network=0\nsteam_stay_signed_in=1\n"
+                                 "beta_updates=0\ndownload_server=\nweb_access=1\ncontent_language=english\nhide_run_once_help=0\n"
+                                 "hide_launcher_help=0\nruntime_prompt_kit=\nrecipe_votes=1\nsharing_explained=1\nshare_name=Leo\n"
+                                 "reports_explained=1\nshare_as=name\nask_after_games=0\n";
+    Check(storage.WriteAtomic("preferences.conf", playden::Bytes(fourteen.begin(), fourteen.end())).ok(), "v14 fixture is written");
+    const auto kept = store.Load();
+    Check(kept.status == playden::PreferencesLoadStatus::kLoaded && kept.preferences.reduce_motion &&
+              !kept.preferences.ask_after_games && kept.preferences.share_as == playden::ShareAs::kName &&
+              !kept.preferences.steam_invisible,
+          "a version 14 file loads, appearing online to Steam friends");
+    // Invisible survives a restart, and Online again too.
+    playden::Preferences invisible = kept.preferences;
+    invisible.steam_invisible = true;
+    Check(store.Save(invisible).ok() && store.Load().status == playden::PreferencesLoadStatus::kLoaded &&
+              store.Load().preferences.steam_invisible && !store.Load().preferences.ask_after_games,
+          "appearing invisible survives restart");
+    invisible.steam_invisible = false;
+    Check(store.Save(invisible).ok() && !store.Load().preferences.steam_invisible, "appearing online again survives restart");
+    // A version 15 file with a value that is not 0 or 1 is corrupt, as for every other flag.
+    std::string bad = fourteen;
+    bad.replace(0, 10, "version=15");
+    bad += "steam_invisible=2\n";
+    Check(storage.WriteAtomic("preferences.conf", playden::Bytes(bad.begin(), bad.end())).ok(), "bad v15 fixture is written");
+    Check(store.Load().status == playden::PreferencesLoadStatus::kDefaultCorrupt, "a version 15 flag must be 0 or 1");
+    // A version 15 file (before the sign-in notice): loads, with the notice on.
+    std::string fifteen = fourteen;
+    fifteen.replace(0, 10, "version=15");
+    fifteen += "steam_invisible=1\n";
+    Check(storage.WriteAtomic("preferences.conf", playden::Bytes(fifteen.begin(), fifteen.end())).ok(), "v15 fixture is written");
+    const auto older = store.Load();
+    Check(older.status == playden::PreferencesLoadStatus::kLoaded && older.preferences.steam_invisible &&
+              older.preferences.steam_online_notice,
+          "a version 15 file loads, with the Steam sign-in notice on");
+    // Off survives a restart, and on again too.
+    playden::Preferences quiet = older.preferences;
+    quiet.steam_online_notice = false;
+    Check(store.Save(quiet).ok() && store.Load().status == playden::PreferencesLoadStatus::kLoaded &&
+              !store.Load().preferences.steam_online_notice && store.Load().preferences.steam_invisible,
+          "the sign-in notice off survives restart");
+    quiet.steam_online_notice = true;
+    Check(store.Save(quiet).ok() && store.Load().preferences.steam_online_notice, "the sign-in notice on again survives restart");
+    std::string bad_notice = fifteen;
+    bad_notice.replace(0, 10, "version=16");
+    bad_notice += "steam_online_notice=2\n";
+    Check(storage.WriteAtomic("preferences.conf", playden::Bytes(bad_notice.begin(), bad_notice.end())).ok(),
+          "bad v16 fixture is written");
+    Check(store.Load().status == playden::PreferencesLoadStatus::kDefaultCorrupt, "a version 16 flag must be 0 or 1");
+  }
+  {
     // Version 8 (download server) still loads, with votes not asked yet.
     const std::string version_eight = "version=8\nreduce_motion=0\ntitle_store_suffix=0\ncloud_saves_auto=0\n"
                                       "steam_sign_in_password=0\ndownloads_slow_network=0\nsteam_stay_signed_in=1\n"
@@ -384,7 +443,8 @@ void CommunityPreferencesPersistAndVersionSixStillLoads() {
 void CorruptPreferencesRestoreDefaultsWithVisibleDiagnostic() {
   TemporaryDirectory directory;
   playden::Storage storage(directory.path());
-  const playden::Bytes corrupt{'n', 'o', 't', ' ', 'v', 'a', 'l', 'i', 'd'};
+  const std::string text = "version=99\nnot valid\n";
+  const playden::Bytes corrupt(text.begin(), text.end());
   Check(storage.WriteAtomic("preferences.conf", corrupt).ok(),
         "corrupt fixture is written");
   playden::PreferencesStore store(storage);
@@ -398,6 +458,33 @@ void CorruptPreferencesRestoreDefaultsWithVisibleDiagnostic() {
   Check(!loaded.diagnostic.empty(), "corruption produces a visible diagnostic");
   Check(loaded.diagnostic.find("corrupt") != std::string::npos,
         "diagnostic explains that preferences are corrupt");
+  const auto still = storage.Read("preferences.conf");
+  Check(still.ok() && still.value() == corrupt, "a file that may be a newer Playden's stays as it is");
+}
+
+// A torn save (#907): empty or zero-filled. It is set aside, defaults are in use, and saving works.
+void TornPreferencesAreSetAside() {
+  TemporaryDirectory directory;
+  playden::Storage storage(directory.path());
+  playden::PreferencesStore store(storage);
+  const playden::Bytes torn[] = {playden::Bytes{}, playden::Bytes(512, 0), playden::Bytes{'v', 'e', 'r'}};
+  for (const auto& bytes : torn) {
+    Check(storage.WriteAtomic("preferences.conf", bytes).ok(), "torn preference fixture is written");
+    const auto loaded = store.Load();
+    Check(loaded.status == playden::PreferencesLoadStatus::kDefaultDamaged && !loaded.preferences.reduce_motion,
+          "a torn preference file restores defaults as damaged");
+    Check(loaded.diagnostic.find("preferences.conf.damaged") != std::string::npos,
+          "the diagnostic says where the damaged file is kept");
+    Check(!storage.Read("preferences.conf").ok(), "the torn file is gone");
+    const auto kept = storage.Read("preferences.conf.damaged");
+    Check(kept.ok() && kept.value() == bytes, "its bytes are kept as preferences.conf.damaged");
+    playden::Preferences saved;
+    saved.reduce_motion = true;
+    Check(store.Save(saved).ok(), "saving works after a torn file");
+    const auto again = store.Load();
+    Check(again.status == playden::PreferencesLoadStatus::kLoaded && again.preferences.reduce_motion,
+          "the save after a torn file loads back");
+  }
 }
 
 void VersionEightLoadsDownloadServerWithoutResettingOtherFields() {
@@ -515,8 +602,8 @@ void OlderPreferencesUseAutomaticDownloadServer() {
           "migration retains old fields and defaults later fields");
     Check(store.Save(loaded.preferences).ok(), "migrated preferences save");
     const auto saved = storage.Read("preferences.conf");
-    Check(saved.ok() && std::string(saved.value().begin(), saved.value().end()).rfind("version=14\n", 0) == 0,
-          "saving a migrated file writes version 14");
+    Check(saved.ok() && std::string(saved.value().begin(), saved.value().end()).rfind("version=16\n", 0) == 0,
+          "saving a migrated file writes version 16");
     Check(loaded.preferences.web_access, "every older preference version has web access on");
     Check(loaded.preferences.content_language == "english", "every older preference version downloads English");
   }
@@ -590,7 +677,10 @@ void VersionEightRejectsTruncatedOrMalformedFiles() {
     Check(storage.WriteAtomic("preferences.conf", playden::Bytes(truncated.begin(), truncated.end())).ok(),
           "truncated preference fixture is written");
     const auto loaded = store.Load();
-    Check(loaded.status == playden::PreferencesLoadStatus::kDefaultCorrupt && !loaded.preferences.reduce_motion,
+    // Cut before its "version=" ends, it reads as a torn save and is set aside.
+    const auto expected = length < 8 ? playden::PreferencesLoadStatus::kDefaultDamaged
+                                     : playden::PreferencesLoadStatus::kDefaultCorrupt;
+    Check(loaded.status == expected && !loaded.preferences.reduce_motion,
           "every truncated version 8 file restores defaults as corrupt");
   }
   std::string invalid_flag = serialized;
@@ -615,7 +705,7 @@ void PreferencesPrepareIndependentRoot() {
   Check(preferences.Save({true}).ok(),"preferences prepare a root independently of authentication");
   Check(preferences.Load().preferences.reduce_motion,"prepared preferences restore");
   struct stat info{};
-  Check(stat(root.c_str(),&info)==0 && (info.st_mode & 0777)==0700,"new preference root is private");
+  Check(stat(root.c_str(),&info)==0 && (info.st_mode & 0777)==0777,"new preference root is open to FTP (#868)");
   std::remove((root+"/preferences.conf").c_str());rmdir(root.c_str());
 }
 
@@ -687,6 +777,7 @@ int main() {
   MissingPreferencesUseDefaultsWithoutAnError();
   PreferencesPersistAcrossStoreInstances();
   CorruptPreferencesRestoreDefaultsWithVisibleDiagnostic();
+  TornPreferencesAreSetAside();
   TitleStoreSuffixPersistsAndVersionOneStillLoads();
   SignInMethodPersistsAndVersionThreeOpensQr();
   StaySignedInDefaultsOnAndPersistsOff();

@@ -2,20 +2,28 @@
 // Copyright (c) 2026 Playden contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "app/experimental_features.h"
-#include "community/endpoints.h"
 
 #include <cctype>
 #include <cstdio>
 #include <utility>
 
+#include "community/endpoints.h"
+
 namespace playden::app {
 
 ExperimentalFeatures DefaultExperimentalFeatures(bool all_on) {
-  // Reports require an explicit API endpoint in features.txt on every platform.
-  // Local game import is available in nightlies and development builds.
+  // Online and GOG are on in every build since 0.12.0-beta.1. 0.11.0, the oldest release a beta updates from and
+  // the release a nightly falls back to, reads GOG records and resets games set to Online, so going back stays safe.
+  (void)all_on;
   ExperimentalFeatures features;
-  features.community_recipes = true;
-  features.import_games = all_on;
+  features.online_steam = true;
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+  // PS4: GOG is not wired into this build yet -- src/gog and src/stores/gog*.cpp are not in
+  // ps4/CMakeLists.txt -- so the store stays off until it is. features.txt gog-store still turns it on.
+  features.gog_store = false;
+#else
+  features.gog_store = true;
+#endif
   return features;
 }
 
@@ -29,9 +37,10 @@ ExperimentalFeatures ParseExperimentalFeatures(std::string_view text, Experiment
     while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front()))) line.remove_prefix(1);
     while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.remove_suffix(1);
     if (line.empty() || line.front() == '#') continue;
-    if (line == "community-recipes") features.community_recipes = true;
-    else if (line == "online-steam") features.online_steam = true;
-    else if (line == "import-games") features.import_games = true;
+    // Retired: community recipes are part of every build. Older files still name it.
+    if (line == "community-recipes") continue;
+    if (line == "online-steam") features.online_steam = true;
+    else if (line == "gog-store") features.gog_store = true;
     else if (line.rfind("game-test-reports=https://", 0) == 0 &&
              line.find_first_of(" \t\r\n?#") == std::string_view::npos) {
       std::string endpoint(line.substr(sizeof("game-test-reports=") - 1));

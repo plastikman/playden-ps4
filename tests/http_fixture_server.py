@@ -8,6 +8,14 @@ import sys
 import threading
 import time
 
+# Streamed bodies: byte i is (i * 31 + 7) & 0xff, so the pattern repeats every 256 bytes.
+PATTERN = bytes((index * 31 + 7) & 0xFF for index in range(256))
+STREAM_BLOCK = 64 * 1024
+
+
+def pattern(length):
+    return (PATTERN * (length // len(PATTERN) + 1))[:length]
+
 
 class Server(http.server.ThreadingHTTPServer):
     accepted_connections = 0
@@ -44,8 +52,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError):
             pass
 
+    def _stream(self, status, length, blocks):
+        """Sends a Content-Length of `length`, then each (bytes, pause) in `blocks`, flushed one by one."""
+        self.send_response(status)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            for block, pause in blocks:
+                self.wfile.write(block)
+                self.wfile.flush()
+                if pause:
+                    time.sleep(pause)
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError):
+            pass
+
     def do_GET(self):
-        if self.path.startswith("/keep/"):
+        if self.path.startswith("/stream/"):
+            body = pattern(int(self.path[len("/stream/"):]))
+            self._stream(200, len(body), ((body[start:start + STREAM_BLOCK], 0)
+                                          for start in range(0, len(body), STREAM_BLOCK)))
+        elif self.path == "/stream-slow":
+            body = pattern(2 * STREAM_BLOCK)
+            self._stream(200, len(body), ((body[:STREAM_BLOCK], 3.0), (body[STREAM_BLOCK:], 0)))
+        elif self.path == "/stall":
+            body = pattern(2 * STREAM_BLOCK)
+            self._stream(200, len(body), ((body[:STREAM_BLOCK], 3.0), (body[STREAM_BLOCK:], 0)))
+        elif self.path == "/trickle":
+            body = pattern(25 * 4096)
+            self._stream(200, len(body), ((body[start:start + 4096], 0.1) for start in range(0, len(body), 4096)))
+        elif self.path == "/stream-404":
+            body = b'{"error":"not_found"}'
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/stream-403/"):
+            body = pattern(int(self.path[len("/stream-403/"):]))
+            self._stream(403, len(body), ((body[start:start + STREAM_BLOCK], 0)
+                                          for start in range(0, len(body), STREAM_BLOCK)))
+        elif self.path.startswith("/keep/"):
             if self.path == "/keep/slow":
                 self._reply(200, b"late", keep=True, marker="slow", slow=True)
             elif self.path == "/keep/large":
@@ -104,19 +152,33 @@ def main():
     server.socket = context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    # A TLS 1.2-only server, like the Alibaba Cloud storage hosts some Steam Cloud saves come from (#155). With an
+    # RSA key, OpenSSL (1.1.1 and later) signs the ServerKeyExchange with rsa_pss_rsae_* when the client offers it,
+    # which a client that offers TLS 1.3 always does. LibreSSL picks rsa_pkcs1 instead and would not test this.
+    if not ssl.OPENSSL_VERSION.startswith("OpenSSL") or ssl.OPENSSL_VERSION_INFO < (1, 1, 1):
+        raise SystemExit(f"http_fixture_server.py needs a Python built with OpenSSL 1.1.1 or later, not "
+                         f"{ssl.OPENSSL_VERSION} ({sys.executable}); configure with -DPython3_EXECUTABLE=...")
+    tls12 = Server(("127.0.0.1", 0), Handler)
+    tls12_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls12_context.maximum_version = ssl.TLSVersion.TLSv1_2
+    tls12_context.load_cert_chain(fixture_dir / "server.pem", fixture_dir / "server-key.pem")
+    tls12.socket = tls12_context.wrap_socket(tls12.socket, server_side=True)
+    tls12_thread = threading.Thread(target=tls12.serve_forever, daemon=True)
+    tls12_thread.start()
     plain = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     plain_thread = threading.Thread(target=plain.serve_forever, daemon=True)
     plain_thread.start()
     try:
         base_url = f"https://localhost:{server.server_port}"
         plain_url = f"http://localhost:{plain.server_port}"
+        tls12_url = f"https://localhost:{tls12.server_port}"
         environment = os.environ.copy()
         environment["HTTPS_PROXY"] = "http://127.0.0.1:1"
         environment["ALL_PROXY"] = "http://127.0.0.1:1"
         environment["NO_PROXY"] = ""
         result = subprocess.run(
             [sys.argv[1], base_url, str(fixture_dir / "ca.pem"),
-             str(fixture_dir / "wrong-ca.pem"), plain_url],
+             str(fixture_dir / "wrong-ca.pem"), plain_url, tls12_url],
             env=environment,
             check=False,
         )
@@ -128,6 +190,9 @@ def main():
         plain.shutdown()
         plain.server_close()
         plain_thread.join()
+        tls12.shutdown()
+        tls12.server_close()
+        tls12_thread.join()
 
 
 if __name__ == "__main__":

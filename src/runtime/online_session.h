@@ -38,14 +38,14 @@ struct OnlineSession {
   // Game settings › Network adapters is Off (PW_NSIPROXY_DISABLE): adapters=off, and the host doesn't make the
   // console's network adapters listable. Otherwise no key, and it does: Valve's client needs them for peer-to-peer.
   bool adapters_off = false;
-  // Settings › Online play › Steam sign-in notice: notice=1, and the host shows "Online on Steam as <name>" once the
+  // Settings › Accounts › Steam sign-in notice: notice=1, and the host shows "Online on Steam as <name>" once the
   // game may start. Off writes no key.
   bool notice = false;
 };
 
 // What one Play from Playden asks for once, beside the handoff (C:\playden\online-launch.txt, 0600): join a friend's
 // lobby, and invite friends to the first lobby the game opens or joins. The Steam host reads it and deletes it whatever
-// keep says, passes the lobby to the game and sends the invites (docs/online-play.md); Playden writes it only at a Play
+// keep says, passes the lobby to the game and sends the invites; Playden writes it only at a Play
 // that hands over the session, and removes a leftover wherever it removes a handoff, and whenever a Play does not start
 // or ends.
 struct OnlineLaunch {

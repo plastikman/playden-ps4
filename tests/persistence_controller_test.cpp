@@ -394,15 +394,64 @@ void LogsSaveFailuresOnceAndRecovery() {
   assert(lines[1] == "organization save works again");
 }
 
+// Organization and preferences files a crash left empty or zero-filled (#907) don't keep "Saved UI data is
+// unavailable" up for good: they are set aside, the log says so once, and edits are saved again.
+void TornFilesAreSetAsideAndSavingResumes() {
+  TemporaryDirectory directory;
+  const auto write = [&](const char* name, const std::string& bytes) {
+    std::FILE* file = std::fopen((directory.path() + "/" + name).c_str(), "wb");
+    assert(file);
+    assert(std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size());
+    std::fclose(file);
+  };
+  write("organization.v2", std::string(512, '\0'));
+  write("preferences.conf", "");
+  Storage storage(directory.path());
+  PreferencesStore preferences(storage);
+  OrganizationStore organizations(storage);
+  PersistenceService service(preferences, organizations);
+  Simulation model({}, {}, ModelMode::Live);
+  PersistenceController controller(model, service);
+  std::vector<std::string> lines;
+  controller.SetLog([&lines](const std::string& line) { lines.push_back(line); });
+  service.WaitIdle();
+  controller.Tick();
+  assert(model.state().persistence_available);
+  assert(std::none_of(model.state().notices.begin(), model.state().notices.end(),
+                      [](const Notice& notice) { return notice.id == "persistence"; }));
+  assert(std::count(lines.begin(), lines.end(),
+                    "organization load: organization.v2 was damaged (512 bytes), kept as organization.v2.damaged; "
+                    "started again") == 1);
+  assert(std::count(lines.begin(), lines.end(),
+                    "preferences load: preferences.conf was damaged (0 bytes), kept as preferences.conf.damaged; "
+                    "defaults restored") == 1);
+  const GameId local = GameId::Local("0b8f6c1e-4d2a-4f3b-9a1c-2e5d7f8a9b0c");
+  model.UpdateLibrary({{{local, "Imported game", {}, {}, {}, {}, {}}}, false, {}, false, false, {}, Store::kLocal});
+  assert(model.action("select:" + ToKey(local)));
+  assert(model.action("square"));
+  OpenSettings(model);
+  Choose(model, "toggle-motion");
+  controller.FlushAndShutdown();
+  const auto saved = organizations.Load(kDeviceOrganization);
+  assert(saved.ok() && saved.value() && saved.value()->favorites.count(local) == 1);
+  assert(preferences.Load().preferences.reduce_motion);
+  for (const char* name : {"organization.v2", "organization.v2.damaged", "preferences.conf.damaged"})
+    std::remove((directory.path() + "/" + name).c_str());
+}
+
 namespace {
 class UpdateRepository final : public UpdateCheckRepository {
  public:
   mutable std::mutex mutex;
   mutable std::map<std::uint64_t, SavedUpdateCheck> saved;
-  mutable std::atomic<int> saves{0};
+  std::map<std::uint64_t, SavedUpdateCheck> stored;  // what loads read
+  mutable std::atomic<int> saves{0}, loads{0};
   std::atomic<bool> fail_saves{false};
-  Result<std::optional<SavedUpdateCheck>> Load(std::uint64_t) const override {
-    return Result<std::optional<SavedUpdateCheck>>::Success(std::nullopt);
+  Result<std::optional<SavedUpdateCheck>> Load(std::uint64_t account) const override {
+    ++loads;
+    const auto found = stored.find(account);
+    return Result<std::optional<SavedUpdateCheck>>::Success(
+        found == stored.end() ? std::optional<SavedUpdateCheck>{} : std::optional<SavedUpdateCheck>{found->second});
   }
   Result<void> Save(std::uint64_t account, const SavedUpdateCheck& check) const override {
     ++saves;
@@ -443,6 +492,77 @@ void UpdateCheckSaveRetries() {
   assert(updates.saved[123].checked_at == model.state().update_check.checked_at && !model.UpdateCheckDirty());
 }
 
+// Steam's and GOG's update checks, for the same account number: each loads from and saves to its own repository,
+// and Steam leaving keeps GOG's.
+void UpdateChecksPerStore() {
+  using playden::homebrew::GameUpdate;
+  TemporaryDirectory directory;
+  Storage storage(directory.path());
+  PreferencesStore preferences(storage);
+  Repository repository;
+  UpdateRepository steam, gog;
+  const auto first = GameId::Gog(1207658924), second = GameId::Gog(2000000002);
+  steam.stored[123].checked_at = 1759990000;
+  steam.stored[123].games[SteamId(42)] = {true, false, 5, 6, 1, true};
+  gog.stored[123].checked_at = 1759980000;
+  gog.stored[123].games[first] = {true, false, 7, 8, 2, true};
+  gog.stored[123].games[SteamId(43)] = {true, false, 1, 1, 1, true};  // not GOG's: ignored
+  PersistenceService service(preferences, repository, &steam);
+  service.SetUpdateChecks(Store::kGog, &gog);
+  Simulation model({}, {}, ModelMode::Live);
+  PersistenceController controller(model, service);
+  model.SetWallClock(1760000000);
+  Connect(model, controller);
+  controller.Activate(Store::kGog, 123);
+  controller.Activate(Store::kGog, 123);  // the same account again: not read again
+  const auto& check = model.state().update_check;
+  Wait(controller, [&] { return check.loaded; });
+  assert(steam.loads.load() == 1 && gog.loads.load() == 1 && "each store reads its own repository once");
+  assert(check.games.size() == 2 && check.games.count(SteamId(42)) && check.games.count(first) && !check.games.count(SteamId(43)));
+  assert(check.stores.at(Store::kGog).checked_at == 1759980000 && check.checked_at == 1759980000);
+
+  // A GOG answer saves GOG's file only, with GOG's games only.
+  model.UpdateAppDetails(second, 1, 1, true, {}, {}, {}, GameUpdate{true, false, 9});
+  Wait(controller, [&] { return gog.saves.load() == 1; });
+  service.WaitIdle();
+  controller.Tick();
+  assert(steam.saves.load() == 0 && !model.UpdateCheckDirty(Store::kGog));
+  {
+    std::lock_guard<std::mutex> lock(gog.mutex);
+    assert(gog.saved[123].games.size() == 2 && gog.saved[123].games.count(first) && gog.saved[123].games.count(second) &&
+           gog.saved[123].checked_at == 1759980000);
+  }
+  // A Steam answer saves Steam's only.
+  model.UpdateAppDetails(SteamId(42), 1, 1, true, {}, {}, {}, {});
+  Wait(controller, [&] { return steam.saves.load() == 1; });
+  service.WaitIdle();
+  controller.Tick();
+  assert(gog.saves.load() == 1);
+  {
+    std::lock_guard<std::mutex> lock(steam.mutex);
+    assert(steam.saved[123].games.empty() && steam.saved[123].checked_at == 1759990000);
+  }
+
+  // Steam leaves: GOG's account, its entries and its loaded state stay, and it still saves.
+  controller.Reset(Store::kSteam);
+  assert(model.UpdateCheckAccount() == 0 && model.UpdateCheckAccount(Store::kGog) == 123);
+  assert(!check.stores.count(Store::kSteam) && check.stores.at(Store::kGog).loaded && check.loaded);
+  assert(check.games.size() == 2 && check.games.count(first) && check.games.count(second));
+  model.UpdateAppDetails(second, 1, 1, true, {}, {}, {}, {});
+  Wait(controller, [&] { return gog.saves.load() == 2; });
+  service.WaitIdle();
+  controller.Tick();
+  assert(steam.saves.load() == 1);
+  {
+    std::lock_guard<std::mutex> lock(gog.mutex);
+    assert(gog.saved[123].games.size() == 1 && gog.saved[123].games.count(first));
+  }
+  // GOG leaves: nothing of its stays.
+  controller.Reset(Store::kGog);
+  assert(check.games.empty() && check.stores.empty() && !check.loaded);
+  controller.FlushAndShutdown();
+}
+
 int main() {
   PendingLoadReplaysLocalEditAndSavesMergedSnapshot();
   SignOutClearKeepsOrganization();
@@ -453,5 +573,7 @@ int main() {
   InvalidMergedLoadStaysUnsavedUntilEditAndRetryResolveIt();
   InitialPreferencesFailureRetriesWithoutOverwritingUnknownData();
   LogsSaveFailuresOnceAndRecovery();
+  TornFilesAreSetAsideAndSavingResumes();
   UpdateCheckSaveRetries();
+  UpdateChecksPerStore();
 }

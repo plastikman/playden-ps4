@@ -253,12 +253,13 @@ target_link_libraries(playden_persistence_controller PUBLIC playden_homebrew_mod
 
 add_library(playden_homebrew_controller STATIC
     "${CMAKE_SOURCE_DIR}/src/homebrew/controller.cpp" "${CMAKE_SOURCE_DIR}/src/homebrew/uninstall_flow.cpp"
-    "${CMAKE_SOURCE_DIR}/src/homebrew/sharing_service.cpp")
+    "${CMAKE_SOURCE_DIR}/src/homebrew/sharing_service.cpp" "${CMAKE_SOURCE_DIR}/src/homebrew/web_recipe_imports.cpp"
+    "${CMAKE_SOURCE_DIR}/src/homebrew/gog_wiring.cpp")
 target_compile_features(playden_homebrew_controller PUBLIC cxx_std_20)
 target_include_directories(playden_homebrew_controller PUBLIC "${CMAKE_SOURCE_DIR}/src")
 target_link_libraries(playden_homebrew_controller PUBLIC
     playden_homebrew_model playden_steam_core playden_auth_diagnostics playden_library_controller playden_persistence_controller playden_runtime_settings_storage
-    playden_homebrew_runtime_host playden_self_update playden_local_store playden_web playden_community)
+    playden_homebrew_runtime_host playden_self_update playden_local_store playden_web playden_community playden_gog_store)
 
 # Worker-owned per-game runtime composition (OWNER records, native inventory, kit layer).
 add_library(playden_homebrew_runtime_host STATIC "${CMAKE_SOURCE_DIR}/src/homebrew/runtime_host.cpp"
@@ -270,7 +271,7 @@ target_link_libraries(playden_homebrew_runtime_host PUBLIC playden_native_coordi
     playden_runtime_installs playden_runtime_install_service playden_runtime_package_installer
     playden_runtime_private_directories playden_runtime_launch_service playden_runtime_session_reconciler
     playden_storage playden_steam_cm_codec playden_runtime_steamworks playden_runtime_layout_migration playden_local_store
-    playden_self_update playden_steam_core)
+    playden_self_update playden_steam_core playden_gog)
 
 add_library(playden_homebrew_artwork STATIC
     "${CMAKE_SOURCE_DIR}/src/homebrew/artwork.cpp"
@@ -447,6 +448,9 @@ if(BUILD_TESTING)
     add_executable(homebrew_runtime_host_test "${CMAKE_SOURCE_DIR}/tests/homebrew_runtime_host_test.cpp")
     target_link_libraries(homebrew_runtime_host_test PRIVATE playden_homebrew_runtime_host playden_runtime_artifact_hash)
     add_test(NAME homebrew_runtime_host COMMAND homebrew_runtime_host_test "${CMAKE_SOURCE_DIR}/runtime")
+    add_executable(open_data_modes_test "${CMAKE_SOURCE_DIR}/tests/open_data_modes_test.cpp")
+    target_link_libraries(open_data_modes_test PRIVATE playden_homebrew_runtime_host playden_runtime_artifact_hash)
+    add_test(NAME open_data_modes COMMAND open_data_modes_test "${CMAKE_SOURCE_DIR}/runtime")
     add_executable(homebrew_installed_locations_test "${CMAKE_SOURCE_DIR}/tests/homebrew_installed_locations_test.cpp")
     target_link_libraries(homebrew_installed_locations_test PRIVATE playden_homebrew_controller playden_runtime_artifact_hash)
     add_test(NAME homebrew_installed_locations COMMAND homebrew_installed_locations_test "${CMAKE_SOURCE_DIR}/runtime")
@@ -467,12 +471,14 @@ if(BUILD_TESTING)
         "${CMAKE_SOURCE_DIR}/src/runtime/self_heal.cpp")
     target_compile_features(runtime_self_heal_test PRIVATE cxx_std_20)
     target_include_directories(runtime_self_heal_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
-    target_link_libraries(runtime_self_heal_test PRIVATE playden_steam_protocol)
+    target_link_libraries(runtime_self_heal_test PRIVATE playden_steam_protocol playden_runtime_private_directories)
     add_test(NAME runtime_self_heal COMMAND runtime_self_heal_test)
     add_executable(runtime_self_heal_native_policy_test
         "${CMAKE_SOURCE_DIR}/tests/runtime_self_heal_test.cpp"
         "${CMAKE_SOURCE_DIR}/tests/directory_gateway_host.cpp"
-        "${CMAKE_SOURCE_DIR}/src/runtime/self_heal.cpp")
+        "${CMAKE_SOURCE_DIR}/src/runtime/self_heal.cpp"
+        "${CMAKE_SOURCE_DIR}/src/runtime/private_directories.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/managed_directory.cpp")
     target_compile_features(runtime_self_heal_native_policy_test PRIVATE cxx_std_20)
     target_include_directories(runtime_self_heal_native_policy_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(runtime_self_heal_native_policy_test PRIVATE playden_steam_protocol)
@@ -624,6 +630,10 @@ if(BUILD_TESTING)
     add_test(NAME prospero_profile COMMAND prospero_profile_test "${CMAKE_SOURCE_DIR}/fixtures/prospero-win-profiles")
     add_test(NAME game_settings COMMAND game_settings_test "${CMAKE_SOURCE_DIR}")
     add_test(NAME settings_only_recipe COMMAND settings_only_recipe_test)
+    add_executable(pe_architecture_test "${CMAKE_SOURCE_DIR}/tests/pe_architecture_test.cpp")
+    target_include_directories(pe_architecture_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    target_compile_features(pe_architecture_test PRIVATE cxx_std_17)
+    add_test(NAME pe_architecture COMMAND pe_architecture_test)
     add_executable(community_rules_test "${CMAKE_SOURCE_DIR}/tests/community_rules_test.cpp")
     target_link_libraries(community_rules_test PRIVATE playden_steam_cm_codec)
     target_compile_features(community_rules_test PRIVATE cxx_std_20)
@@ -733,6 +743,12 @@ if(BUILD_TESTING)
     target_compile_features(homebrew_account_test PRIVATE cxx_std_20)
     target_link_libraries(homebrew_account_test PRIVATE playden_homebrew_controller playden_local_session_repository)
     add_test(NAME homebrew_account COMMAND homebrew_account_test)
+    # GOG in the apps (gog-store line on and off): registry, relay, web routes, "Stay signed in" and shutdown order.
+    add_executable(homebrew_gog_wiring_test "${CMAKE_SOURCE_DIR}/tests/homebrew_gog_wiring_test.cpp")
+    target_compile_features(homebrew_gog_wiring_test PRIVATE cxx_std_20)
+    target_link_libraries(homebrew_gog_wiring_test PRIVATE playden_homebrew_controller)
+    add_test(NAME homebrew_gog_wiring COMMAND homebrew_gog_wiring_test "${CMAKE_SOURCE_DIR}/fixtures/gog"
+        "${CMAKE_CURRENT_BINARY_DIR}/homebrew_gog_wiring.tmp")
     add_executable(homebrew_download_servers_test "${CMAKE_SOURCE_DIR}/tests/homebrew_download_servers_test.cpp")
     target_link_libraries(homebrew_download_servers_test PRIVATE playden_homebrew_controller)
     add_test(NAME homebrew_download_servers COMMAND homebrew_download_servers_test)
@@ -810,6 +826,8 @@ if(BUILD_TESTING)
     add_test(NAME native_package_identity COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_native_package_identity.py")
     add_test(NAME console_kit_upload COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_console_kit_upload.py")
     add_test(NAME collect_logs COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_collect_logs.py")
+    add_test(NAME kit_module_diff COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_kit_module_diff.py")
+    add_test(NAME build_kit_cross COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_build_kit_cross.py")
     add_test(NAME ui_comparison_fixture
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/verify_ui_comparison.py"
             "${CMAKE_SOURCE_DIR}/fixtures/ui-comparison")

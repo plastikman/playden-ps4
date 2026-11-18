@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 #ifndef PROBE_MAC_IP
-#define PROBE_MAC_IP "0.0.0.0"
+#define PROBE_MAC_IP "10.0.1.72"
 #endif
 #define PROBE_PORT 47100
 

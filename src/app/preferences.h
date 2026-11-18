@@ -23,8 +23,9 @@ enum class ShareAs { kNone, kName, kAccount };
 
 struct Preferences {
   bool reduce_motion = false;
-  // PS5 titles made for games are named "<game> (<store>)", e.g. "Half-Life 2 (Steam)".
-  bool title_store_suffix = false;
+  // PS5 titles made for games are named "<game> (<store>)", e.g. "Half-Life 2 (Steam)". On for a new install;
+  // a version 1 file, written before the setting existed, keeps it off.
+  bool title_store_suffix = true;
   // Cloud saves move on their own: before Play, after a session, at startup and before an
   // uninstall. Off (the default, so a fresh install never changes Cloud saves unasked) leaves only
   // the Sync actions the player chooses.
@@ -70,13 +71,15 @@ struct Preferences {
   // or Invisible, which friends see as offline. Friends tab › Triangle.
   bool steam_invisible = false;
   // Whether an Online game's start shows the Steam account it signed in as (version 16, online-steam only; on in older
-  // files). Settings › Online play › Steam sign-in notice.
+  // files). Settings › Accounts › Steam sign-in notice.
   bool steam_online_notice = true;
 };
 
 enum class PreferencesLoadStatus {
   kLoaded,
   kDefaultMissing,
+  // The file was damaged (empty, zero-filled) and set aside: defaults, saved from now on.
+  kDefaultDamaged,
   kDefaultCorrupt,
   kDefaultReadError,
 };

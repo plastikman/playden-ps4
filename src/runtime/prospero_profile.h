@@ -69,6 +69,8 @@ bool IsProsperoDllOverrides(std::string_view value);
 // DXVK_, MESA_, RADV_ or SDL_ families or WINE_CPU_TOPOLOGY (not DXVK_HUD or
 // SDL_JOYSTICK_RAWINPUT, which the title sets), and a printable value without quotes.
 constexpr std::size_t kProsperoMaxEnvironmentEntries = 8;
+// The runtime's buffer for an [environment] value, terminator included: values are shorter.
+constexpr std::size_t kProsperoMaxEnvironmentValueBytes = 128;
 bool IsProsperoEnvironmentEntry(std::string_view name, std::string_view value);
 
 // Applies the rules of prospero-win's profile parsers (and prospero-win-profiles'
@@ -95,10 +97,10 @@ struct ProsperoProfileFeatures {
   bool steam_section = false;        // [steam] install_dir (kit capability steam-library-path)
 };
 
-// Where a runtime with [steam] shows a Steam game to Wine: kProsperoSteamCommon\\<install_dir>.
+// Where a runtime with [steam] shows a Steam game to Wine: kProsperoSteamCommon\<install_dir>.
 inline constexpr std::string_view kProsperoSteamCommon = "C:\\Program Files (x86)\\Steam\\steamapps\\common";
-// A [steam] install_dir accepted by prospero-win: one Windows path part without separators, reserved characters,
-// controls, or a trailing space/dot, and at most 128 bytes.
+// A [steam] install_dir the runtime takes (prospero-win src/pw_steam_view.h): one Windows path part, not . or ..,
+// without control characters or \ / : * ? " < > |, no trailing space or dot, at most 128 bytes.
 inline bool IsProsperoSteamInstallDir(std::string_view name) {
   if (name.empty() || name.size() > 128 || name == "." || name == ".." || name.back() == ' ' || name.back() == '.')
     return false;

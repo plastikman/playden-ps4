@@ -46,6 +46,19 @@ struct Cache final : LibraryRepository {
 };
 }
 
+// Whether two pixels of a capture have the same colour (to within a little).
+static bool same_colour(const std::filesystem::path& png, int ax, int ay, int bx, int by) {
+  int width = 0, height = 0, channels = 0;
+  unsigned char* pixels = stbi_load(png.string().c_str(), &width, &height, &channels, 3);
+  assert(pixels != nullptr && ax < width && bx < width && ay < height && by < height);
+  const unsigned char* a = pixels + (static_cast<std::size_t>(ay) * width + ax) * 3;
+  const unsigned char* b = pixels + (static_cast<std::size_t>(by) * width + bx) * 3;
+  bool same = true;
+  for (int c = 0; c < 3; ++c) same = same && std::abs(int(a[c]) - int(b[c])) <= 2;
+  stbi_image_free(pixels);
+  return same;
+}
+
 // Rows of a capture whose pixel at column x is the focus ring's orange, top to bottom.
 static std::vector<int> ring_rows(const std::filesystem::path& png, int x, int from, int to) {
   int width = 0, height = 0, channels = 0;
@@ -121,6 +134,21 @@ int main(int argc,char** argv) {
       for(int i=0;i<16;++i) renderer.draw(missing,1920,1080);
       assert(renderer.capture_png(output/"root-access-missing.png",1920,1080));
       assert(renderer.diagnostics().focused_control_key=="root-quit");
+    }
+    {
+      // A start with a saved account: Steam restores, and the screen says it is loading, not Welcome.
+      Simulation starting({}, {}, ModelMode::Live);
+      starting.UpdateAccount({AuthState::Restoring,{},{},{},{},true});
+      for(int i=0;i<16;++i) renderer.draw(starting,1920,1080);
+      assert(renderer.capture_png(output/"startup-restoring.png",1920,1080));
+      // No "Your games" card: below its text, the card's place is the page's background.
+      assert(same_colour(output/"startup-restoring.png",1350,840,1850,840));
+      // Nothing connected and nothing imported: the welcome, with its card and Connect Steam focused.
+      starting.UpdateAccount({AuthState::SignedOut,{},{},{},{},true});
+      for(int i=0;i<16;++i) renderer.draw(starting,1920,1080);
+      assert(renderer.capture_png(output/"startup-welcome.png",1920,1080));
+      assert(!same_colour(output/"startup-welcome.png",1350,840,1850,840));
+      assert(renderer.diagnostics().focused_control_key=="startup-connect");
     }
     assert(model.action("r1") && model.state().navigation.route==Route::Library);
     capture("library.png");
@@ -350,7 +378,7 @@ int main(int argc,char** argv) {
       assert(live.state().navigation.route == Route::Settings);
       live.UpdateLeftoverTitles({});
       live.UpdateLeftoverDeletions({});
-      // Settings > Storage: the default drive's usage above the rows, then the installed games list.
+      // Settings > Downloads: the default drive's usage above the rows, then the installed games list.
       while(!live.state().navigation.modals.empty()) assert(live.action("circle"));
       live.UpdateVolumes({{"internal","Console storage",true,825'000'000'000ull,512'000'000'000ull}}, "internal");
       live.UpdateInstalls({}, {{SteamId(42), 62'700'000'000ull, "internal"}, {SteamId(43), 8'400'000'000ull, "internal"},
@@ -360,6 +388,29 @@ int main(int argc,char** argv) {
       live.UpdateRuntime(RuntimeState::Ready, {titled, playing});
       assert(live.action("focus:settings-storage"));
       capture_live("settings-storage-drive.png");
+      {
+        // Every Settings section from the rail, in order (settings-section-N.png), with the clean-up rows shown.
+        live.UpdateLeftoverTitles({{"FAKE78001", "A Short Hike", 12'000'000}});
+        live.SetRuntimeLeftovers(1);
+        const auto focused_row = [&live]() -> const ViewRow& {
+          return live.view().rows[static_cast<std::size_t>(live.view().focused_row)];
+        };
+        assert(live.action("focus:settings-account") && live.action("left"));
+        for (int section = 0; section < 16 && !focused_row().rail_only; ++section) {
+          assert(live.action("right"));
+          const std::string name = "settings-section-" + std::to_string(section) + ".png";
+          capture_live(name.c_str());
+          assert(live.action("left") && live.action("down"));
+        }
+        // System's last groups (Help, Reset) below its first ones.
+        assert(live.action("focus:settings-remove-playden") && live.action("right"));
+        assert(!live.state().navigation.settings_rail_focused);
+        capture_live("settings-system-bottom.png");
+        live.UpdateLeftoverTitles({});
+        live.SetRuntimeLeftovers(0);
+        assert(live.action("focus:settings-storage"));
+        if (live.state().navigation.settings_rail_focused) live.action("right");
+      }
       assert(live.action("focus:settings-installed"));
       capture_live("settings-storage.png");
       assert(live.action("cross"));
@@ -389,14 +440,16 @@ int main(int argc,char** argv) {
       live.action("r1");
       live.action("r1");
       assert(live.state().navigation.route==Route::Settings);
-      // With every Storage row shown the list scrolls; back on the first row the usage card shows again.
+      // With every Games row shown the list scrolls; back on the first row its heading shows again.
       while(!live.state().navigation.modals.empty()) assert(live.action("circle"));
       live.SetRuntimeLeftovers(1);
-      assert(live.action("focus:settings-runtime"));
-      capture_live("settings-storage-bottom.png");
-      while(live.state().navigation.focus_key!="settings-storage") assert(live.action("up"));
-      capture_live("settings-storage-top-again.png");
+      assert(live.action("focus:settings-runtime-cleanup"));
+      capture_live("settings-games-bottom.png");
+      for(int step=0; step<16 && live.state().navigation.focus_key!="settings-installed"; ++step) assert(live.action("up"));
+      assert(live.state().navigation.focus_key=="settings-installed" && !live.state().navigation.tabs_focused);
+      capture_live("settings-games-top-again.png");
       // A drive without a space report that is disconnected: one line and its state.
+      assert(live.action("focus:settings-storage"));
       live.UpdateVolumes({{"internal","USB drive",false,{},{}}}, "internal");
       capture_live("settings-storage-unknown.png");
     }
@@ -422,16 +475,16 @@ int main(int argc,char** argv) {
       assert(fixture.action("focus:manage-move-to") && fixture.action("cross") && fixture.view().surface == "move-storage");
       for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
       assert(renderer.capture_png(output/"manage-move-picker.png",1920,1080));
-      // A game's Maintenance: Move to… opens the same picker for that game, its own drive disabled.
+      // A game's Game actions: Move to… opens the same picker for that game, its own drive disabled.
       assert(fixture.scenario("manage-move") && fixture.action("circle"));
       const auto first = fixture.state().games.front().id;
       assert(fixture.action("details:" + playden::ToKey(first)) && fixture.action("focus:details-more") && fixture.action("cross"));
-      assert(fixture.action("focus:game-maintenance") && fixture.action("cross") && fixture.action("focus:game-move"));
+      assert(fixture.action("focus:game-move"));
       for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
-      assert(renderer.capture_png(output/"maintenance-move.png",1920,1080));
+      assert(renderer.capture_png(output/"game-actions-move.png",1920,1080));
       assert(fixture.action("cross") && fixture.view().surface == "move-storage");
       for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
-      assert(renderer.capture_png(output/"maintenance-move-picker.png",1920,1080));
+      assert(renderer.capture_png(output/"game-actions-move-picker.png",1920,1080));
       assert(fixture.action("focus:volume-external") && fixture.action("cross") && fixture.state().navigation.modals.empty());
       assert(fixture.scenario("manage-move") && fixture.action("triangle") && fixture.state().navigation.route != Route::ManageGames);
       assert(std::any_of(fixture.state().notices.begin(), fixture.state().notices.end(),

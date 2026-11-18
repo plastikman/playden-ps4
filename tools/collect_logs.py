@@ -2,9 +2,11 @@
 """Collect Playden's logs from a PS5 over FTP into a zip for a test report.
 
 Reads only /data/playden/logs (or the app's logs folder on 0.4.x and older) and the active kit's manifest. Recipes
-exported from Game settings (recipe-<app id>.json, next to the logs) go in the zip's recipes folder. It never reads
-playden-data, which holds the Steam sign-in. The Steam account name, SteamIDs, family group ID,
-PS5 user ID and home network addresses are replaced in every file unless --no-redact is given.
+exported from Game settings are the player's to share: they have their own folder (/data/playden/exported-recipes), and
+an older version's export still in the logs folder is left out. It never reads playden-data, which holds the Steam
+sign-in. The Steam account name, SteamIDs, family group ID,
+PS5 user ID, home network addresses and sign-in codes and tokens are replaced in every file unless --no-redact is
+given.
 
   python3 tools/collect_logs.py --host 192.168.1.50
 
@@ -51,9 +53,24 @@ PS5_USER = re.compile(r"\buser=[1-9][0-9]*\b")
 PAD_INITIAL = re.compile(r"\bpad users initial=[1-9][0-9]*\b")
 PAD_FOREGROUND = re.compile(r"(\bpad users initial=[^\n]*?\bforeground=)[1-9][0-9]*\b")
 QUAD = re.compile(r"(?<![\w.])([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(?!\w|\.[0-9])")
+# Credentials, the same rules as src/diagnostics/credential_patterns.h, in one pass so the leftmost match wins as it
+# does there. Each value becomes <redacted> and the key stays:
+# - "access_token":"..." and "refresh_token":"..." in JSON, and access_token=... and refresh_token=..., any length;
+# - code=, token= and wsSecret= with a value of at least 16 characters of [A-Za-z0-9._~%+/=-] that is not only
+#   lowercase letters, '_' and '-': GOG sign-in codes, fastly's token=nva=...~token=... and gcore's wsSecret.
+#   "exit code=1", "code=0" and Playden's own error codes (code=publication-control-collision,
+#   code=authorization_pending) stay.
+SIGNED_VALUE_CHARS = r"[A-Za-z0-9._~%+/=-]"
+CREDENTIAL = re.compile(
+    r'("(?i:access_token|refresh_token)"[ \t\r\n]*:[ \t\r\n]*")[^"]+(?=")'
+    r"|(?<![A-Za-z0-9_])((?i:access_token|refresh_token)=)[^ \t\r\n\f\v&\"',;#<>]+"
+    r"|(?<![A-Za-z0-9_])((?i:code|token|wssecret)=)(?![a-z_-]*(?!" + SIGNED_VALUE_CHARS + r"))" + SIGNED_VALUE_CHARS + r"{16,}",
+    re.ASCII)
 REDACTED = "Steam account name, SteamIDs, family group ID, PS5 user ID and home network addresses"
 FIRMWARE = re.compile(r"console_firmware=(\S+)")
-RECIPE = re.compile(r"^recipe-\d+\.json$")  # Game settings > Advanced > Export as recipe
+# An export older versions wrote into the logs folder (recipe-<app id>.json, recipe-gog-<id>.json,
+# recipe-local-<uuid>.json), or its temporary file: the player's recipe, never part of a report.
+RECIPE = re.compile(r"^recipe-([1-9][0-9]{0,9}|gog-[1-9][0-9]{0,19}|local-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json(\.tmp)?$")
 SKIP_SUFFIXES = (".ppm",)
 
 
@@ -186,7 +203,13 @@ def home_address(match):
     return "<home-ip>" if home and max(a, b, c, d) <= 255 and d != 0 else match.group(0)
 
 
+def redact_credentials(text):
+    return CREDENTIAL.sub(lambda match: next(key for key in match.groups() if key) + "<redacted>", text)
+
+
 def redact(text, names):
+    # Credentials first: a later rule that replaced an ID or an address inside one would cut it into short pieces.
+    text = redact_credentials(text)
     text = STEAM_ID.sub("<steam-id>", text)
     text = OWNER_ID.sub("owner=<steam-id>", text)
     text = OWNER_IDS.sub(lambda match: OWNER_LIST_ID.sub("<steam-id>", match.group(0)), text)
@@ -301,18 +324,16 @@ def collect_over_http(args):
 
 
 def is_recipe(name):
-    """Whether a file in the logs folder is a recipe Game settings exported."""
+    """Whether a file in the logs folder is a recipe an older version's Export as file left there."""
     return bool(RECIPE.match(name))
 
 
-def write_bundle(out, report, logs, recipes):
-    """The zip for a test report: summary.md, logs/<name> and recipes/<name>."""
+def write_bundle(out, report, logs):
+    """The zip for a test report: summary.md and logs/<name>."""
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("summary.md", report)
         for name, text in sorted(logs.items()):
             archive.writestr(f"logs/{name}", text)
-        for name, text in sorted(recipes.items()):
-            archive.writestr(f"recipes/{name}", text)
 
 
 def main():
@@ -348,17 +369,15 @@ def main():
                  "Is an FTP server (zftpd) running on the PS5?")
 
     logs_dir, entries = pick_logs(ftp)
-    title_logs, playden_logs, recipes = {}, {}, {}
+    title_logs, playden_logs = {}, {}
     for name in entries:
-        if name.endswith(SKIP_SUFFIXES):
+        if name.endswith(SKIP_SUFFIXES) or is_recipe(name):
             continue
         match = TITLE_LOG.match(name)
         if match:
             title_logs[match.group(1)] = fetch(ftp, f"{logs_dir}/{name}").decode("utf-8", "replace")
         elif name.startswith("title-"):
             continue  # per-title extras such as registry dumps; taken with their title below
-        elif is_recipe(name):
-            recipes[name] = fetch(ftp, f"{logs_dir}/{name}").decode("utf-8", "replace")
         else:
             playden_logs[name] = fetch(ftp, f"{logs_dir}/{name}").decode("utf-8", "replace")
 
@@ -404,21 +423,19 @@ def main():
     info.update(active_kit(ftp))
     info["game titles"] = ", ".join(
         f"{title} (app {title_app(title_logs[title]) or '?'})" for title in chosen) or "none"
-    info["recipes"] = ", ".join(sorted(recipes)) or "none"
     ftp.quit()
 
     # Names come from every log, so a game that stopped before Wine named the user is still covered.
     names = set() if args.no_redact else account_names([*title_logs.values(), *playden_logs.values()])
     if not args.no_redact:
         files = {name: redact(text, names) for name, text in files.items()}
-        recipes = {name: redact(text, names) for name, text in recipes.items()}
     info["redacted"] = "no" if args.no_redact else REDACTED
     report = summary(info)
 
     out = args.out or Path(f"playden-logs-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip")
-    write_bundle(out, report, files, recipes)
+    write_bundle(out, report, files)
     print(report)
-    print(f"Wrote {out} ({len(files)} logs, {len(recipes)} recipes). Attach it to your test report.")
+    print(f"Wrote {out} ({len(files)} logs). Attach it to your test report.")
     if not args.no_redact:
         print("Logs can still name your games and file paths. Look through them before you share.")
 
