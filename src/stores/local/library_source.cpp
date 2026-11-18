@@ -537,6 +537,14 @@ bool LocalLibrarySource::CheckPresence() {
     const bool here = config_.present ? config_.present(volume)
         : volume.require_mount_point ? IsMountPoint(HostPath(volume.mount)) : IsFolder(HostPath(volume.mount));
     if (here) present.insert(volume.volume);
+    // Say what was decided about each configured volume and on what grounds. A volume that is not
+    // present is skipped by Scan() without a scan, an errno or a line, so a drive that is plugged
+    // in and holds games looks exactly like one that is empty -- which cost three rounds of
+    // guessing on a USB drive on the PS4, 2026-11-18. IsMountPoint compares the mount's st_dev
+    // against its parent's, so a console that does not report them apart answers no here.
+    if (!volume.require_mount_point) continue;  // the drop folder is always there; do not repeat it
+    Log("import volume " + volume.volume + " mount=" + volume.mount + " present=" + (here ? "1" : "0") +
+        " by=mount-point");
   }
   if (present == present_) return false;
   std::string line = "import volumes present=";
@@ -574,7 +582,10 @@ void LocalLibrarySource::FollowUsbDrives() {
 void LocalLibrarySource::Scan() {
   std::vector<ImportCandidate> candidates;
   for (const auto& volume : config_.volumes) {
-    if (!present_.count(volume.volume)) continue;
+    if (!present_.count(volume.volume)) {
+      Log("import scan skipped volume=" + volume.volume + " mount=" + volume.mount + ": not present");
+      continue;
+    }
     const auto root = Join(volume.mount, volume.folder);
     const auto listed = ScanImportRoot(HostPath(root));
     if (listed.status != ScanStatus::kOk) {
