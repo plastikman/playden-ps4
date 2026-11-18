@@ -345,7 +345,16 @@ cp "$FIXTURE_FONTS"/*.txt "$ROOT/assets/fonts/NotoSans-OFL.txt" "$STAGE/homebrew
 cp -r "$ROOT/runtime" "$STAGE/homebrew/assets/runtime"
 cp "$FIXTURE_CATALOG" "$ROOT/fixtures/ui-comparison/scenarios.json" "$STAGE/homebrew/fixtures/"
 cp "$ROOT/scripts/network-deps/.deps/ps4/cacert.pem" "$STAGE/assets/cacert.pem"
-KIT_ID="orbis-win-ps4-${PW_SOURCE_COMMIT:0:12}-${TEMPLATE_STAMP:0:12}"
+# The kit's identity, not its contents. It must NOT move with the runtime: a marker's kit_id is
+# part of a bottle's identity (RespinIdentity in src/runtime/package_installer.cpp), while
+# files_sha256, runtime_revision, runtime_path and variant_id are deliberately excluded from it so
+# they can change. Minting "orbis-win-ps4-<commit>-<template>" meant every runtime build orphaned
+# every installed game: "installed title and bottle are not this install's from a compatible kit",
+# and Update runtime kit refused with the message it was supposed to fix, leaving Recreate bottle
+# -- which discards the prefix -- as the only path. What actually changed still reaches the console
+# through the kit view: runtime.artifact_revision carries $PW_SOURCE_COMMIT, files_sha256 covers
+# the template, and capabilities say what the runtime can do.
+KIT_ID="orbis-win-ps4"
 python3 "$ROOT/scripts/ps4-kit-view.py" "$STAGE" "$KIT_ID" \
     "$PW_SOURCE_COMMIT" "$WINE_VERSION"
 cp "$STEAMWORKS_DIR/steam_api.dll" "$STEAMWORKS_DIR/steam_api64.dll" \

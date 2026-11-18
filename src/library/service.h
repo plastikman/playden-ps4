@@ -4,6 +4,7 @@
 #include "library/repository.h"
 #include "steam/library_backend.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -89,6 +90,9 @@ class LibraryService {
                    bool cache_available = false);
   void PushEvent(LibraryEvent, bool destructive_terminal = false);
   bool DestructiveRequest(std::uint64_t request) const;
+  // Waits up to `delay` before another fetch attempt, returning false the moment the job is
+  // superseded, cancelled or the service stops. A new Submit wakes it early.
+  bool WaitBeforeRetry(const Job&, std::chrono::milliseconds delay);
   std::uint64_t Now() const;
   std::optional<std::vector<LibraryCollection>> SavedCollections(std::uint64_t account) const;
 

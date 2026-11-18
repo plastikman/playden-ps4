@@ -8,6 +8,11 @@
 
 namespace playden {
 namespace {
+// A library refresh retries a network failure this many times, waiting kRefreshRetryDelay,
+// then twice that, then three times that: about 9 s in all before the player is told.
+constexpr unsigned kRefreshRetries = 3;
+constexpr std::chrono::milliseconds kRefreshRetryDelay{1500};
+
 constexpr std::size_t kMaximumPending = 16;
 constexpr std::size_t kMaximumEvents = 64;
 constexpr std::uint64_t kMaximumTimestamp =
@@ -122,6 +127,15 @@ bool LibraryService::Current(const Job& job) const {
   return !stopping_ && job.command != Command::kClear &&
          job.request == request_ && job.generation == generation_ &&
          !job.cancel->load();
+}
+
+bool LibraryService::WaitBeforeRetry(const Job& job, std::chrono::milliseconds delay) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  const auto done = [this, &job] {
+    return stopping_ || job.cancel->load() || job.request != request_ || job.generation != generation_;
+  };
+  wake_.wait_for(lock, delay, done);
+  return !done();
 }
 
 void LibraryService::NotifyLateGames() {
@@ -335,6 +349,18 @@ void LibraryService::ExecuteRefresh(const Job& job) {
   if (trace_) trace_("network-fetch-start");
   auto result = backend_.Fetch(*session.value(), *job.cancel);
   if (trace_) trace_("network-fetch-done");
+  // A refresh at startup often runs before the console's network is up, and a single transient
+  // failure used to be final: the library stayed empty until the player refreshed by hand. Retry a
+  // network failure a few times, waiting longer each time. kProtocol, kNoSession, kCredentialsRevoked
+  // and kPersistence are answers, not outages, so they are not retried.
+  for (unsigned attempt = 1;
+       attempt <= kRefreshRetries && result.error == steam::LibraryError::kNetwork; ++attempt) {
+    if (!WaitBeforeRetry(job, kRefreshRetryDelay * attempt)) return;
+    if (trace_) trace_("network-fetch-retry");
+    result = backend_.Fetch(*session.value(), *job.cancel);
+    if (trace_) trace_(result.error == steam::LibraryError::kNone ? "network-fetch-retry-ok"
+                                                                  : "network-fetch-retry-failed");
+  }
   if (!Current(job)) return;
   if (result.error != steam::LibraryError::kNone) {
     EmitFailure(job, result.error, cache_error, cache_available);

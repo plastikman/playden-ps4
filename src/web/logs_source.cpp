@@ -57,7 +57,11 @@ std::vector<Entry> ListDirectory(const std::string& path) {
   std::vector<Entry> entries;
   const int fd = platform::OpenDirectoryWalk(path);
   if (fd < 0) return entries;
-  DIR* directory = ::fdopendir(fd);
+  // Not ::fdopendir: a PS4 title may not list a folder through a descriptor it already holds
+  // (fdopendir, and the getdents behind it, are refused), so every web listing came back empty --
+  // no Playden logs, no game logs, no runtime kit. OpenHeldListing lists the path there and the
+  // descriptor everywhere else; the caller has already walked the path without following links.
+  DIR* directory = platform::OpenHeldListing(fd, path);
   if (!directory) {
     ::close(fd);
     return entries;

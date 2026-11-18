@@ -360,6 +360,7 @@ set(PLAYDEN_PS4_WEB_ASSETS
 add_custom_command(OUTPUT "${PLAYDEN_PS4_WEB_ASSETS_CPP}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
     COMMAND "${CMAKE_COMMAND}" "-DOUTPUT=${PLAYDEN_PS4_WEB_ASSETS_CPP}" "-DASSETS=${PLAYDEN_PS4_WEB_ASSETS}"
+        "-DCONSOLE=PS4"
         -P "${PLAYDEN_ROOT}/cmake/EmbedWebAssets.cmake"
     DEPENDS "${PLAYDEN_ROOT}/src/web/page/index.html" "${PLAYDEN_ROOT}/cmake/EmbedWebAssets.cmake"
     VERBATIM)
