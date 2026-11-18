@@ -40,8 +40,16 @@ VIEW = "runtime-template/playden-kit-view.json"
 # 03.38 on 2026-11-18: every regeneration was refused with "keyboard_stick: unknown movement
 # stick" and Playden crashed on its title screen. An imported game needs to be owned by Playden
 # instead -- the importer should copy a tree it does not own rather than rename it.
-CAPABILITIES = sorted(["input-keyboard-stick", "input-touchpad", "settings-dxvk-config",
-                       "title-any-id"])
+# profile-version-2: Playden gates its "32-bit code" row (cpu = native|translator) on this, and a
+# kit that declares it writes "version = 2" into [runtime] beside the cpu line. Orbis-Win has read
+# cpu all along (prospero-win src/pw_game_profile.c), but until it also accepted "version" an
+# unknown key in that section refused the whole profile -- so declaring this used to break every
+# game. The runtime this kit ships now accepts it (upstream PR #753); do not move this line ahead
+# of a runtime that does. Without it the row reads "Needs a newer runtime kit" and an imported
+# game cannot be switched to the translator: MDK, a 1997 32-bit title, crashed on native with
+# c0000005 five seconds in (2026-11-18).
+CAPABILITIES = sorted(["input-keyboard-stick", "input-touchpad", "profile-version-2",
+                       "settings-dxvk-config", "title-any-id"])
 
 
 def capabilities(stage) -> list:
