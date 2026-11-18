@@ -6,11 +6,16 @@
 // Copyright (c) 2026 Playden contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "community/install_secret.h"
+#include "community/recipe_import.h"
 #include "community/recipe_release.h"
+#include "community/recipe_service.h"
 #include "community/recipe_store.h"
 #include "homebrew/controller.hpp"
 #include "homebrew/sharing_service.hpp"
 #include "homebrew/simulation.hpp"
+#include "homebrew/web_recipe_imports.hpp"
+#include "library/store.h"
+#include "runtime/game_probe.h"
 #include "runtime/game_settings.h"
 
 #include <strings.h>
@@ -20,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -27,6 +33,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -42,6 +49,15 @@ using playden::homebrew::SharingResult;
 using playden::homebrew::Simulation;
 namespace cm = playden::community;
 namespace rt = playden::runtime;
+
+// The model's loader as Playden gives it (CommunityRecipeService::LoadRecipe): a stored object, read and checked.
+std::function<std::optional<rt::CommunityRecipe>(const std::string&)> store_loader(const std::filesystem::path& root) {
+  return [store = std::make_shared<cm::RecipeStore>(root)](const std::string& revision) -> std::optional<rt::CommunityRecipe> {
+    std::string error;
+    if (!store->prepared() && !store->Prepare(&error)) return std::nullopt;
+    return cm::LoadStoredRecipe(*store, revision, &error);
+  };
+}
 
 void check(bool condition, const char* message) {
     if (!condition) {
@@ -61,13 +77,48 @@ std::string read_text(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-const playden::homebrew::ViewRow* find_row(const Simulation& model, const std::string& key) {
+// Game settings has two pages: the summary, and over it the list that Change settings… opens. Tests name rows on
+// either page; this goes to the page that has the row, as a player would, and stays put when neither has it.
+bool settings_page_with(playden::homebrew::Simulation& simulation, const std::string& key) {
+    const auto shown = [&] {
+        for (const auto& row : simulation.view().rows)
+            if (row.key == key) return true;
+        return false;
+    };
+    if (shown()) return true;
+    const auto& modals = simulation.state().navigation.modals;
+    if (modals.empty()) return false;
+    // A row on neither page leaves the page and its focus as they were.
+    const std::string start_id = modals.back().id;
+    const std::string start_focus = simulation.state().navigation.focus_key;
+    const auto restore = [&] {
+        if (!simulation.state().navigation.modals.empty() && simulation.state().navigation.modals.back().id == start_id)
+            simulation.action("focus:" + start_focus);
+        return false;
+    };
+    if (modals.back().id == "game-settings-list") {
+        simulation.action("circle");
+        if (shown()) return true;
+        simulation.action("focus:change-settings");
+        simulation.action("cross");
+    } else if (modals.back().id == "game-settings" && simulation.action("focus:change-settings") && simulation.action("cross")) {
+        if (shown()) return true;
+        simulation.action("circle");
+    } else {
+        return false;
+    }
+    return shown() || restore();
+}
+
+const playden::homebrew::ViewRow* find_row(Simulation& model, const std::string& key) {
+    settings_page_with(model, key);
     for (const auto& row : model.view().rows)
         if (row.key == key) return &row;
     return nullptr;
 }
 
 void activate(Simulation& model, const std::string& key) {
+    settings_page_with(model, key);
     if (!model.action("focus:" + key)) {
         std::fprintf(stderr, "missing row %s on %s\n", key.c_str(), model.view().surface.c_str());
         check(false, "requested row exists");
@@ -555,6 +606,7 @@ void share_and_vote(const std::filesystem::path& base) {
                   report.based_on->revision == kRevision && report.installed_on == "console" && !sent[2].attach_logs,
               "the report names the game, the result, the recipe and where it is installed");
         check(report.origin == "prompt", "an answer to the after-game prompt says so");
+        check(report.versions.empty(), "a game that isn't Online names no Steam client");
         std::lock_guard<std::mutex> lock(api.mutex);
         check(api.requests.size() == 2 && api.requests[1].url.find("/v1/reports") != std::string::npos,
               "a report that works sends no logs");
@@ -1111,7 +1163,7 @@ void report_with_logs(const std::filesystem::path& base) {
     config.now = [] { return std::int64_t{1'762'000'000}; };
     playden::homebrew::SharingService service(config);
     service.Start();
-    service.SetAccount({"leoaccount", 76561198000000001ull});
+    service.SetAccount({{{"steam", "leoaccount", "76561198000000001"}}});
     api.answer_with({answer(201, R"({"id":"att_9","url":"https://attachments.playden.club/att_9/playden-logs.zip"})"),
                      answer(201, R"({"id":"r_9","state":"open","issue_url":"https://github.com/leolobato/playden-ps5/issues/809"})")});
     SharingRequest request;
@@ -1133,6 +1185,8 @@ void report_with_logs(const std::filesystem::path& base) {
     report.kit = "0.19";
     report.firmware = "13.60";
     report.playden_version = "0.10.0";
+    // A game set to Online names Valve's Steam client version: after the logs' facts.
+    report.versions = {{"Steam client", "1792618285"}};
     service.Submit(std::move(request));
     service.Wait();
     const auto results = service.TakeResults();
@@ -1154,12 +1208,14 @@ void report_with_logs(const std::filesystem::path& base) {
     const std::string body(api.requests[1].body.begin(), api.requests[1].body.end());
     check(contains(body, "\"attachment\":\"att_9\"") && contains(body, "\"versions\":[[") && !contains(body, "leoaccount"),
           "the report names the logs and carries the versions");
+    check(contains(body, "[\"Steam client\",\"1792618285\"]") && body.find("Playden version") < body.find("Steam client"),
+          "the report's own row comes after the logs' facts");
     check(contains(body, "capability-number-1") && !contains(body, "capability-number-39") && contains(body, "\u2026"),
           "a long fact is shortened to fit a version row, not refused");
     service.Shutdown();
 }
 
-// Settings › Community › Playden account: a code and QR code, polled until approved; the token stays with the
+// Settings › Accounts › Playden account: a code and QR code, polled until approved; the token stays with the
 // worker (0600), shares and reports carry it, and an ended link is forgotten.
 void account_link(const std::filesystem::path& base) {
     std::filesystem::create_directories(base);
@@ -1431,7 +1487,7 @@ void start_failed(const std::filesystem::path& base) {
     // Change settings from the report leaves the dialog too.
     activate(model, "start-failed-report");
     activate(model, "feedback-change-settings");
-    check(top().id == "game-settings" &&
+    check(top().id == "game-settings-list" &&
               std::none_of(model.state().navigation.modals.begin(), model.state().navigation.modals.end(),
                            [](const auto& modal) { return modal.id == "start-failed" || modal.id == "feedback"; }),
           "Change settings from the report closes the report and the dialog");
@@ -1440,7 +1496,8 @@ void start_failed(const std::filesystem::path& base) {
     model.NotifyStartFailed(kGame, "");
     check(top().id == "start-failed" && contains(top().body, "It stopped before it got going."), "without a reason it says so plainly");
     activate(model, "start-failed-settings");
-    check(top().id == "game-settings" && model.state().navigation.selected_game_id == kGame, "Change settings opens Game settings");
+    check(top().id == "game-settings-list" && model.state().navigation.selected_game_id == kGame,
+          "Change settings opens the settings list");
     while (!model.state().navigation.modals.empty()) model.action("circle");
     check(model.state().navigation.modals.empty(), "and no question follows");
 }
@@ -1454,237 +1511,422 @@ bool has(const std::vector<std::string>& keys, const std::string& key) {
     return std::find(keys.begin(), keys.end(), key) != keys.end();
 }
 
-// Community recipes off (features.txt): no service, so no catalog and no requests. A game that chose a recipe while
-// they were on keeps it, read from the cache already on disk; every way to share, vote, report or pick another is gone.
-void community_off(const std::filesystem::path& base) {
+// The runtime's reader over the community recipes folder (RuntimeHostConfig::community_recipe_bytes): a stored recipe
+// by its full revision and by the 32-hex prefix a title records; nothing for one that isn't there. The folder is made
+// when missing.
+void community_recipe_bytes(const std::filesystem::path& base) {
     std::filesystem::create_directories(base);
     std::filesystem::permissions(base, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
     const std::string bytes =
         read_text(std::filesystem::path(PLAYDEN_COMMUNITY_FIXTURES) / "recipes/steam/274520/120hz-left-stick-pointer.json");
     check(!bytes.empty(), "the recipe fixture reads");
-    const std::string id = "community-steam-274520-120hz-left-stick-pointer";
     const std::string revision = cm::Sha256Hex(bytes);
     const auto root = base / "community-recipes";
-
-    // No cache yet: the readers find nothing and make no folder.
-    check(!playden::homebrew::CommunityRecipeCacheLoader(std::make_shared<cm::RecipeStore>(root))(revision),
-          "no cache: the model's loader reads nothing");
-    check(!playden::homebrew::CommunityRecipeBytes(std::make_shared<cm::RecipeStore>(root), false)(revision),
-          "no cache: the runtime's reader reads nothing");
-    check(!std::filesystem::exists(root), "and neither makes the community recipes folder");
-
-    // On: the service stored the recipe and the player chose it for Darkwood.
+    const auto read = playden::homebrew::CommunityRecipeBytes(std::make_shared<cm::RecipeStore>(root));
+    check(!read(revision), "an empty folder has nothing");
+    check(std::filesystem::is_directory(root / "objects"), "and the reader made it");
     {
         cm::RecipeStore writer(root);
         std::string error;
-        check(writer.Prepare(&error) && writer.WriteObjects({bytes}, &error), "the cache is written");
+        check(writer.Prepare(&error) && writer.WriteObjects({bytes}, &error), "the recipe is stored");
     }
-    {
-        Simulation on("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
-        set_up(on, base, false);
-        playden::homebrew::CommunityCatalog catalog;
-        catalog.release_tag = "r20261107.1";
-        auto listed = offer(revision);
-        listed.id = id;
-        listed.title = "120 Hz, pointer on left stick";
-        catalog.games[kGameRef] = {listed};
-        on.UpdateCommunityCatalog(catalog);
-        on.SetCommunityRecipeLoader(playden::homebrew::CommunityRecipeCacheLoader(std::make_shared<cm::RecipeStore>(root)));
-        open_game_settings(on);
-        activate(on, "preset-picker");
-        activate(on, "recipe-" + revision);
-        if (on.state().navigation.modals.back().id == "confirmation") activate(on, "recipe-switch-confirm");
-        check(on.RecipeBaseFor(kGame) && on.RecipeBaseFor(kGame)->id == id, "on: the recipe is Darkwood's base");
-    }
-    // And shared it once: the record names its submission (Game settings would ask its state while on).
-    {
-        const auto file = base / "game-settings.json";
-        auto text = read_text(file);
-        const auto at = text.find("\"community_recipe\"");
-        check(at != std::string::npos, "the saved record names its community recipe");
-        text.insert(at, "\"shared_recipe\":{\"submission_id\":\"sub-1\",\"recipe_id\":\"" + id + "\"},");
-        std::ofstream(file, std::ios::binary | std::ios::trunc) << text;
-    }
-
-    // Off from the start, as Playden starts without the line: no catalog, the cache-only loader.
-    Simulation model("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
-    model.SetCommunityRecipesEnabled(false);
-    check(!model.CommunityRecipesEnabled(), "the model has community recipes off");
-    set_up(model, base, false);
-    model.SetCommunityRecipeLoader(playden::homebrew::CommunityRecipeCacheLoader(std::make_shared<cm::RecipeStore>(root)));
-    // No service sends either while off; given anyway, a catalog with a newer revision and the vote memory change
-    // nothing: the gates are the model's, not the missing data's.
-    {
-        playden::homebrew::CommunityCatalog catalog;
-        catalog.release_tag = "r20261108.1";
-        auto newer = offer(kNewerRevision);
-        newer.id = id;
-        catalog.games[kGameRef] = {newer};
-        model.UpdateCommunityCatalog(catalog);
-        model.UpdateVoteMemory({});
-    }
-    const auto runtime_bytes = playden::homebrew::CommunityRecipeBytes(std::make_shared<cm::RecipeStore>(root), false);
-    check(runtime_bytes(revision) == bytes && runtime_bytes(revision.substr(0, 32)) == bytes,
-          "the runtime still reads the game's recipe from the cache, by revision and by prefix");
-
-    // The game keeps its recipe: same base, same values, nothing falls back.
-    check(model.RecipeBaseFor(kGame) && model.RecipeBaseFor(kGame)->id == id && model.RecipeBaseFor(kGame)->revision == revision,
-          "off: the recipe stays Darkwood's base");
-    check(model.RecipeFallbackFor(kGame).empty(), "and it applies");
-    rt::EffectiveSettings values;
-    check(model.EffectiveSettingsFor(kGame, &values) && values.values["resolution"].value == "3840x2160" &&
-              values.values["refresh"].value == "120",
-          "its values come from the cached recipe");
-
-    // Game details and Game actions: no recipe tag, no Share feedback.
-    check(model.action("details:274520"), "Darkwood's page opens");
-    check(!find_row(model, "details-recipe"), "no Recipe available or Recipe in use tag");
-    check(!find_row(model, "details-compat"), "nothing from the community's compatibility list");
-    activate(model, "details-more");
-    check(has(top_keys(model), "game-settings") && !has(top_keys(model), "share-feedback"), "Game actions has no Share feedback");
-
-    // Game settings: the base by its title; no update, vote, shared recipe or Share recipe; Export as file stays.
-    activate(model, "game-settings");
-    check(contains(find_row(model, "preset-picker")->value, "120 Hz, pointer on left stick"), "the base shows by its title");
-    {
-        const auto record = model.state().game_settings.find(kGame);
-        check(record != model.state().game_settings.end() && record->second.shared_recipe.submission_id == "sub-1",
-              "the record keeps its shared recipe");
-    }
-    activate(model, "section-advanced");
-    for (const char* key : {"recipe-update", "recipe-vote", "shared-recipe", "share-recipe"})
-        check(!has(top_keys(model), key), "Game settings has no community row");
-    check(has(top_keys(model), "export-recipe"), "Export as file stays");
-    check(model.TakeSharingRequests().empty(), "opening Game settings asks nothing");
-    check(!model.state().submissions.count("sub-1") || !model.state().submissions.at("sub-1").checking,
-          "and its shared recipe isn't left Checking…");
-
-    // Choose settings: Playden default, the recipe in use (focused) and the presets; no search, link or other recipes.
-    activate(model, "preset-picker");
-    check(!contains(model.view().subtitle, "Players share"), "the chooser doesn't describe community recipes");
-    check(top_keys(model) == std::vector<std::string>{"preset-playden-default", "chooser-heading-community", "recipe-" + revision,
-                                                      "chooser-heading-presets", "cancel"},
-          "the chooser lists only the recipe in use besides Playden's");
-    check(model.state().navigation.focus_key == "recipe-" + revision, "focus is on the recipe in use");
-    // Back to Playden default: the recipe row goes, as it can't be chosen again.
-    activate(model, "preset-playden-default");
-    if (model.state().navigation.modals.back().id == "confirmation") activate(model, "recipe-switch-confirm");
-    check(!model.RecipeBaseFor(kGame), "Playden default replaces the recipe");
-    while (!model.state().navigation.modals.empty() && model.state().navigation.modals.back().id != "game-settings")
-        model.action("circle");
-    activate(model, "preset-picker");
-    check(!has(top_keys(model), "chooser-heading-community") && !has(top_keys(model), "recipes-search"),
-          "with no recipe in use, the chooser has no community section");
-    check(!contains(model.view().subtitle, "community"), "and its text doesn't mention community recipes");
-    while (!model.state().navigation.modals.empty()) model.action("circle");
-
-    // After a game: no question. A start failure: no Report the problem.
-    model.NotifySessionEnded(kGame, 600);
-    check(model.state().navigation.modals.empty(), "no question after a game");
-    model.NotifyStartFailed(kGame, "Wine exited with code 3");
-    check(top_keys(model) == std::vector<std::string>{"start-failed-settings", "start-failed-logs", "alert-ok"},
-          "the start failure offers Change settings, Open logs and OK");
-    while (!model.state().navigation.modals.empty()) model.action("circle");
-
-    // Settings: no Community section. Time passing asks nothing (no account check).
-    model.action("circle");
-    model.action("l1");
-    check(model.state().navigation.route == playden::homebrew::Route::Settings, "Settings opens");
-    for (const char* key : {"settings-ask-after-games", "settings-recipe-votes", "settings-share-as", "settings-account-link",
-                            "settings-sharing-reset"})
-        check(!find_row(model, key), "Settings has no Community row");
-    model.SetWallClock(1'000'000 + 3600);
-    check(model.TakeSharingRequests().empty() && !model.TakeCommunityRefreshRequest(), "nothing is asked of the services");
-    check(!model.state().account_link.waiting && !model.state().account_link.checked, "no account check was queued");
-
-    // The Install sheet of a game with community recipes in the catalog: no Settings row, no catalog refresh.
-    {
-        playden::GameSummary darkwood;
-        darkwood.id = kGame;
-        darkwood.title = "Darkwood";
-        playden::GameSummary other;
-        other.id = GameId::Steam(220);
-        other.title = "Half-Life 2";
-        check(model.UpdateLibrary({{darkwood, other}, false, {}, false, true, 101}), "a second game is in the library");
-        playden::homebrew::CommunityCatalog catalog;
-        catalog.release_tag = "r20261108.2";
-        auto listed = offer(kNewerRevision);
-        listed.id = "community-steam-220-sample";
-        catalog.games[playden::GameRef::Steam(220)] = {listed};
-        model.UpdateCommunityCatalog(catalog);
-        while (!model.state().navigation.modals.empty()) model.action("circle");
-        check(model.action("details:220"), "Half-Life 2's page opens");
-        check(model.UpdateAppDetails(GameId::Steam(220), 300'000'000, 600'000'000, true), "its details arrive");
-        model.UpdateVolumes({{"internal", "Console storage", true, 2'000'000'000, 1'000'000'000}}, "internal");
-        activate(model, "details-install");
-        check(model.state().navigation.modals.back().id == "install", "the Install sheet opens");
-        check(!has(top_keys(model), "install-settings"), "the Install sheet has no Settings row");
-        check(!model.TakeCommunityRefreshRequest(), "and asks for no catalog refresh");
-    }
+    check(read(revision) == bytes, "the runtime reads it by revision");
+    check(read(revision.substr(0, 32)) == bytes, "and by prefix");
+    check(!read(std::string(64, '0')) && !read(std::string(32, '0')), "an unknown revision or prefix reads nothing");
+    check(!read("not-a-revision"), "neither does a name that isn't one");
 }
 
-// Community recipes off and the game's recipe is gone from the cache: nothing can fetch it again, so the status row
-// says so and offers Playden default, keeping the player's changes. On, the row stays a status (the catalog can help).
-void community_off_recipe_missing(const std::filesystem::path& base) {
+// The game's recipe is gone from the cache: Playden's own recipe runs and the status row says why. It stays a status
+// (a catalog refresh can bring the recipe back): pressing it changes nothing, and the player's change stays.
+void community_recipe_missing(const std::filesystem::path& base) {
     std::filesystem::create_directories(base);
     std::filesystem::permissions(base, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
     const auto nothing_cached = [](const std::string&) -> std::optional<rt::CommunityRecipe> { return std::nullopt; };
     std::string resolution;
     {
-        // On: the player chose the recipe for Darkwood and changed its resolution.
-        Simulation on("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
-        set_up(on, base);
-        open_game_settings(on);
-        activate(on, "preset-picker");
-        activate(on, "recipe-" + kRevision);
-        if (on.state().navigation.modals.back().id == "confirmation") activate(on, "recipe-switch-confirm");
-        check(on.RecipeBaseFor(kGame) && on.RecipeBaseFor(kGame)->id == kRecipeId, "on: the recipe is Darkwood's base");
-        activate(on, "setting-resolution");
+        // The player chose the recipe for Darkwood and changed its resolution.
+        Simulation chose("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
+        set_up(chose, base);
+        open_game_settings(chose);
+        activate(chose, "preset-picker");
+        activate(chose, "recipe-" + kRevision);
+        if (chose.state().navigation.modals.back().id == "confirmation") activate(chose, "recipe-switch-confirm");
+        check(chose.RecipeBaseFor(kGame) && chose.RecipeBaseFor(kGame)->id == kRecipeId, "the recipe is Darkwood's base");
+        activate(chose, "setting-resolution");
         std::string choice;
-        for (const auto& row : on.view().rows)
+        for (const auto& row : chose.view().rows)
             if (row.title.find("1280") != std::string::npos) choice = row.key;
         check(!choice.empty(), "another resolution can be chosen");
-        activate(on, choice);
-        resolution = on.state().game_settings.at(kGame).overrides.at("resolution");
+        activate(chose, choice);
+        resolution = chose.state().game_settings.at(kGame).overrides.at("resolution");
     }
-    {
-        // On with the recipe missing: the row only says why, as before.
-        Simulation on("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
-        set_up(on, base, false);
-        on.SetCommunityRecipeLoader(nothing_cached);
-        open_game_settings(on);
-        const auto* status = find_row(on, "recipe-status");
-        check(status && status->kind == playden::homebrew::RowKind::Status && !status->enabled &&
-                  status->subtitle == rt::kCommunityRecipeRemoved,
-              "on: the status row says why and offers nothing");
-        activate(on, "recipe-status");
-        check(on.state().game_settings.at(kGame).community_recipe.id == kRecipeId, "on: the row changes nothing");
-    }
-
-    // Off, with nothing in the cache: Playden's own recipe runs, and the row offers Playden default.
+    // Next start, with the recipe missing: the row only says why.
     Simulation model("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
-    model.SetCommunityRecipesEnabled(false);
     set_up(model, base, false);
     model.SetCommunityRecipeLoader(nothing_cached);
-    check(!model.RecipeBaseFor(kGame) && !model.RecipeFallbackFor(kGame).empty(), "off: the missing recipe falls back");
+    check(!model.RecipeBaseFor(kGame) && !model.RecipeFallbackFor(kGame).empty(), "the missing recipe falls back");
     open_game_settings(model);
     const auto* status = find_row(model, "recipe-status");
-    check(status && status->title == "Playden's own recipe is used" && status->kind == playden::homebrew::RowKind::Choice &&
-              status->enabled && status->value == "Use Playden default" &&
-              status->subtitle == "The recipe isn't on this console.",
-          "off: the status row says the recipe isn't here and offers Playden default");
+    check(status && status->kind == playden::homebrew::RowKind::Status && !status->enabled &&
+              status->title == "Playden's own recipe is used" && status->subtitle == rt::kCommunityRecipeRemoved,
+          "the status row says why and offers nothing");
     activate(model, "recipe-status");
-    if (model.state().navigation.modals.back().id == "confirmation") {
-        check(contains(model.state().navigation.modals.back().title, "Playden default"), "the switch names Playden default");
-        activate(model, "recipe-switch-confirm");
-    }
     const auto& record = model.state().game_settings.at(kGame);
-    check(record.community_recipe.id.empty() && (record.preset_id.empty() || record.preset_id == "playden-default"),
-          "Playden default replaces the recipe");
+    check(record.community_recipe.id == kRecipeId, "the row changes nothing");
     check(record.overrides.count("resolution") && record.overrides.at("resolution") == resolution, "the player's change stays");
-    check(model.state().navigation.modals.back().id == "game-settings" && !find_row(model, "recipe-status"),
-          "Game settings shows no status row afterwards");
-    check(model.TakeSharingRequests().empty() && !model.TakeCommunityRefreshRequest(), "nothing is asked of the services");
+}
+
+// A recipe file sent over web access: the worker keeps it in the community recipes folder, the main thread (as
+// Controller::TickRecipeImports) makes Darkwood use it without closing what the TV shows, and it stays local: a share
+// makes a new recipe, and nobody votes on it.
+void web_import(const std::filesystem::path& base) {
+    std::filesystem::create_directories(base);
+    std::filesystem::permissions(base, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+    const auto root = base / "community-recipes";
+    const std::string file =
+        read_text(std::filesystem::path(PLAYDEN_COMMUNITY_FIXTURES) / "hostile/export-no-slug-no-title.json");
+    check(!file.empty(), "the export fixture reads");
+
+    Simulation model("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
+    set_up(model, base, false);
+    model.SetCommunityRecipeLoader(store_loader(root));
+
+    auto keep = std::make_shared<playden::homebrew::CommunityKeepSet>();
+    keep->revisions = std::set<std::string>{};
+    playden::homebrew::WebRecipeImports imports;
+    imports.SetKeeper([store = std::make_shared<cm::RecipeStore>(root)](const std::string& bytes, std::string* error) {
+        return (store->prepared() || store->Prepare(error)) && store->WriteObjects({bytes}, error);
+    }, keep);
+    const auto send = [&](const std::string& game, const std::string& bytes) {
+        playden::web::RecipeImportAnswer answer;
+        std::thread worker([&] { answer = imports.Import(game, bytes); });
+        for (int i = 0; i < 500; ++i) {
+            bool served = false;
+            for (const auto& pending : imports.Take()) {
+                const auto id = playden::ParseInstallId(pending.game);
+                auto [status, message] = id ? model.ImportRecipe(*id, pending.revision) : std::pair<int, std::string>{404, ""};
+                imports.Answer(pending.ticket, {status, message});
+                served = true;
+            }
+            if (served) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        worker.join();
+        return answer;
+    };
+
+    // A lost object read once is tried again after the import keeps it anew.
+    {
+        const auto imported = cm::PrepareImportedRecipe(file, nullptr);
+        check(imported.has_value(), "the export prepares");
+        rt::CommunityRecipeChoice missing{imported->recipe.recipe.id, cm::Sha256Hex(imported->bytes), {}};
+        (void)model.ImportRecipe(kGame, missing.revision);  // not kept yet: a failed read is cached
+    }
+    (void)model.TakeMaintenanceRequests();
+
+    // Game settings open on the TV: the import doesn't close it.
+    open_game_settings(model);
+    const auto modals = model.state().navigation.modals.size();
+    const auto answer = send("steam-274520", file);
+    check(answer.status == 200, "the import is used");
+    check(contains(answer.message, "Darkwood now uses this recipe"), "and the page hears so");
+    check(model.state().navigation.modals.size() == modals, "what the TV shows stays open");
+    const auto maintenance = model.TakeMaintenanceRequests();
+    check(std::any_of(maintenance.begin(), maintenance.end(), [](const auto& request) {
+              return request.first == kGame && request.second == playden::homebrew::MaintenanceKind::ApplySettings;
+          }),
+          "the prepared title gets the recipe now");
+    check(std::any_of(model.state().notices.begin(), model.state().notices.end(),
+                      [](const auto& notice) { return notice.id == "recipe-imported" && contains(notice.detail, "Darkwood"); }),
+          "a notification on the TV says so");
+    const auto base_choice = model.RecipeBaseFor(kGame);
+    check(base_choice && cm::IsImportedRecipeId(base_choice->id), "Darkwood's base is the imported recipe");
+    check(base_choice && imports.Revisions().count(base_choice->revision) && keep->revisions->count(base_choice->revision),
+          "the cache keeps it");
+    check(std::filesystem::exists(root / "objects" / (base_choice->revision + ".json")), "in the community recipes folder");
+    // Local: a share is a new recipe, not an update of it, and there is nothing to vote on.
+    const auto decision = model.ShareDecisionFor(kGame);
+    check(decision.kind == cm::ShareKind::kNewRecipe && !decision.send_based_on, "a share makes a new recipe");
+    check(!model.VoteTargetFor(kGame), "nobody votes on an imported recipe");
+
+    // From the games list: the game the recipe names, or why none.
+    {
+        int status = 0;
+        std::string message;
+        check(model.GameForRecipe(base_choice->revision, &status, &message) == std::optional<GameId>(kGame),
+              "a recipe for Darkwood finds Darkwood");
+        std::string other_game = file;
+        for (std::size_t at; (at = other_game.find("274520")) != std::string::npos;) other_game.replace(at, 6, "220");
+        const auto other_kept = cm::PrepareImportedRecipe(other_game, nullptr);
+        check(other_kept.has_value(), "another game's recipe prepares");
+        cm::RecipeStore writer(root);
+        std::string error;
+        check(writer.Prepare(&error) && writer.WriteObjects({other_kept->bytes}, &error), "and is kept");
+        check(!model.GameForRecipe(cm::Sha256Hex(other_kept->bytes), &status, &message) && status == 404 &&
+                  contains(message, "isn't on this console"),
+              "a recipe for a game not on the console finds none");
+    }
+
+    // The same file again changes nothing.
+    check(send("steam-274520", file).status == 200, "the same file again is fine");
+    // Another game's recipe, an unknown game, a file that isn't a recipe: refused, the choice stays.
+    std::string other = file;
+    for (std::size_t at; (at = other.find("274520")) != std::string::npos;) other.replace(at, 6, "220");
+    check(send("steam-274520", other).status == 422, "another game's recipe is refused");
+    check(send("steam-999", file).status == 404, "an unknown game is refused");
+    check(send("steam-274520", "{}").status == 422, "a file that isn't a recipe is refused");
+    // A recipe that needs an experimental feature that is off, as the catalog would leave it out.
+    std::string online = file;
+    online.replace(online.find("\"steam_features\": \"emulate\""), 27, "\"steam_features\": \"online\"");
+    const auto refused = send("steam-274520", online);
+    check(refused.status == 422 && contains(refused.message, "online-steam"), "a recipe that needs online-steam is refused");
+    check(model.RecipeBaseFor(kGame) == base_choice, "and Darkwood keeps its recipe");
+
+    // The Share sheet open for Darkwood: the import waits until it is closed.
+    {
+        Simulation on("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
+        set_up(on, base / "on");
+        open_share(on);
+        const auto refused_share = on.ImportRecipe(kGame, base_choice->revision);
+        check(refused_share.first == 409 && contains(refused_share.second, "Share sheet"), "an open Share sheet refuses the import");
+    }
+
+    // Playden closing answers a waiting page.
+    imports.Close();
+    check(imports.Import("steam-274520", file).status == 503, "closed: imports answer 503");
+}
+
+// An imported game without a Steam app ID has no community recipes of its own, yet a recipe file sent from its page is
+// used: the choice names the game the recipe is for, as when the player picks another game's recipe in the chooser.
+// A recipe it exported itself (imported/<name key>) finds it from the games list.
+void web_import_without_app_id(const std::filesystem::path& base) {
+    std::filesystem::create_directories(base);
+    std::filesystem::permissions(base, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+    const auto root = base / "community-recipes";
+    const std::string file =
+        read_text(std::filesystem::path(PLAYDEN_COMMUNITY_FIXTURES) / "hostile/export-no-slug-no-title.json");
+    check(!file.empty(), "the export fixture reads");
+
+    Simulation model("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
+    set_up(model, base, false);
+    const auto imported_game = GameId::Local("6d1f3a52-0c55-4f3e-9b2a-5d1c7e0a9f11");
+    playden::GameSummary gloomwood;
+    gloomwood.id = imported_game;
+    gloomwood.title = "Gloomwood";
+    check(model.UpdateLibrary({{gloomwood}, false, {}, false, true, 101, playden::Store::kLocal}), "an imported game joins");
+    model.UpdateInstalls({}, {{kGame, 1024, "internal", true}, {imported_game, 1024, "internal", true}});
+    std::vector<playden::homebrew::LiveRuntimeGame> runtimes;
+    for (const auto& id : {kGame, imported_game}) {
+        playden::homebrew::LiveRuntimeGame runtime;
+        runtime.game_id = id;
+        runtime.status = "Ready";
+        runtime.prepared = runtime.has_title = runtime.ready = true;
+        runtime.launch_entry_id = "game";
+        runtime.activity = playden::homebrew::TitleActivity::Stopped;
+        runtimes.push_back(runtime);
+    }
+    model.UpdateRuntime(RuntimeState::Ready, runtimes);
+    model.SetCommunityRecipeLoader(store_loader(root));
+    const auto kept = [&](const std::string& bytes) {
+        const auto prepared = cm::PrepareImportedRecipe(bytes, nullptr);
+        check(prepared.has_value(), "the recipe prepares");
+        cm::RecipeStore writer(root);
+        std::string error;
+        check(writer.Prepare(&error) && writer.WriteObjects({prepared->bytes}, &error), "and is kept");
+        return cm::Sha256Hex(prepared->bytes);
+    };
+
+    // Darkwood's recipe, sent from the imported game's page: used, and the choice names Darkwood.
+    const auto darkwood_revision = kept(file);
+    const auto answer = model.ImportRecipe(imported_game, darkwood_revision);
+    check(answer.first == 200 && contains(answer.second, "Gloomwood now uses this recipe"), "the imported game takes it");
+    const auto choice = model.RecipeBaseFor(imported_game);
+    check(choice && choice->revision == darkwood_revision && choice->game == kGameRef, "its choice names the recipe's game");
+    check(model.RecipeFallbackFor(imported_game).empty(), "and the game runs with it");
+    check(model.ImportRecipe(imported_game, darkwood_revision).first == 200, "the same file again is fine");
+
+    // A recipe the imported game exported (imported/gloomwood): the games list finds it.
+    std::string own = file;
+    const auto swap = [&own](const std::string& from, const std::string& to) { own.replace(own.find(from), from.size(), to); };
+    swap("\"recipe_id\": \"community-steam-274520\"", "\"recipe_id\": \"community-imported-gloomwood\"");
+    swap("{\"store\": \"steam\", \"key\": \"274520\", \"name\": \"Darkwood\"}",
+         "{\"store\": \"imported\", \"key\": \"gloomwood\", \"name\": \"Gloomwood\"}");
+    const auto own_revision = kept(own);
+    int status = 0;
+    std::string message;
+    check(model.GameForRecipe(own_revision, &status, &message) == std::optional<GameId>(imported_game),
+          "a recipe for imported/gloomwood finds the imported game");
+    check(model.ImportRecipe(imported_game, own_revision).first == 200, "and it takes it");
+    // A Steam game still takes only its own recipe.
+    check(model.ImportRecipe(kGame, own_revision).first == 422, "Darkwood refuses the imported game's recipe");
+}
+
+// A report and a share list Library overrides only when the overrides the player or the recipe set change: the DXVK
+// entries that follow the Graphics row and vkd3d-proton's that follow Direct3D 12 are Playden's, and those rows are
+// listed on their own.
+namespace overrides_text {
+void set_up_model(Simulation& model, const std::filesystem::path& base, bool with_catalog, const std::string& graphics) {
+    std::filesystem::create_directories(base);
+    std::filesystem::permissions(base, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+    set_up(model, base, with_catalog);
+    model.SetKitCapabilities(rt::KitCapabilitiesFromManifest({"dxvk", "display-120hz", "vkd3d-proton"}, true));
+    // Playden's own recipe for the game, whose DXVK overrides follow the Graphics row.
+    rt::GameRecipe own;
+    own.id = rt::GeneratedRecipeId(274520);
+    own.version = 1;
+    own.app_id = 274520;
+    own.name = "Darkwood";
+    own.launch_entries = {{"game", "Darkwood", "Darkwood.exe", ""}};
+    own.architecture = "pe64";
+    own.graphics = graphics;
+    model.SetGeneratedRecipes({own});
+}
+
+// What a test report sends as the settings the player changed.
+std::string report_settings(Simulation& model) {
+    while (!model.state().navigation.modals.empty()) model.action("circle");
+    (void)model.TakeSharingRequests();
+    check(model.action("details:274520"), "Darkwood's page opens for a report");
+    activate(model, "details-more");
+    activate(model, "share-feedback");
+    activate(model, "feedback-good");
+    activate(model, "feedback-send");
+    if (model.state().navigation.modals.back().title == "Before you send") activate(model, "feedback-send-confirm");
+    const auto sent = model.TakeSharingRequests();
+    const auto report = std::find_if(sent.begin(), sent.end(), [](const SharingRequest& r) { return r.kind == SharingRequestKind::Report; });
+    check(report != sent.end(), "the report is sent");
+    while (!model.state().navigation.modals.empty()) model.action("circle");
+    return report == sent.end() ? std::string() : report->report.settings;
+}
+
+// The Share sheet's What is sent: what is sent, then "Your changes" from the recipe the settings start from.
+std::string share_what(Simulation& model) {
+    open_share(model);
+    const auto* row = find_row(model, "share-what");
+    check(row != nullptr, "the Share sheet says what is sent");
+    std::string text = row ? row->subtitle : std::string();
+    if (row)
+        for (const auto& line : row->lines) text += "\n" + line;
+    return text;
+}
+
+// Opens a setting, with its section first when that is collapsed.
+void change(Simulation& model, const std::string& key) {
+    open_game_settings(model);
+    for (const char* section : {"section-compatibility", "section-advanced"})
+        if (!find_row(model, key) && find_row(model, section)) activate(model, section);
+    activate(model, key);
+    // A row the recipe locks asks first.
+    if (find_row(model, "unlock-setting")) activate(model, "unlock-setting");
+}
+}  // namespace overrides_text
+
+void report_library_overrides(const std::filesystem::path& base) {
+    using namespace overrides_text;
+    {
+        // Graphics from Automatic to DXVK: Playden adds DXVK's overrides (Silent Hill: Homecoming's report).
+        Simulation model("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
+        set_up_model(model, base / "to-dxvk", false, "auto");
+        change(model, "setting-graphics");
+        activate(model, "choice-2");
+        const auto settings = report_settings(model);
+        check(contains(settings, "Graphics DXVK") && !contains(settings, "Library overrides"),
+              "a report for Graphics DXVK doesn't list DXVK's overrides as the player's change");
+        check(!contains(share_what(model), "Library overrides"), "nor does the Share sheet");
+    }
+    Simulation model("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
+    set_up_model(model, base / "from-dxvk", false, "dxvk");
+    // Graphics from DXVK to OpenGL: Playden drops DXVK's overrides, which were never the player's (Hedon Bloodrite's).
+    change(model, "setting-graphics");
+    activate(model, "choice-3");
+    auto settings = report_settings(model);
+    check(contains(settings, "Graphics OpenGL") && !contains(settings, "Library overrides"),
+          "a report for Graphics OpenGL doesn't list DXVK's overrides as the player's change");
+    check(!contains(share_what(model), "Library overrides"), "nor does the Share sheet");
+    // Direct3D 12 (on DXVK again) to vkd3d-proton brings its own entries and DXVK's dxgi: also Playden's.
+    change(model, "setting-graphics");
+    activate(model, "choice-2");
+    change(model, "setting-d3d12");
+    activate(model, "choice-1");
+    settings = report_settings(model);
+    check(contains(settings, "Direct3D 12 vkd3d-proton") && !contains(settings, "Library overrides"),
+          "a report for vkd3d-proton doesn't list its overrides as the player's");
+    // An override the player adds is theirs: listed, without Playden's entries.
+    change(model, "setting-dll_overrides");
+    activate(model, "override-add");
+    model.SubmitEditorText("xinput1_3=n");
+    settings = report_settings(model);
+    check(contains(settings, "Library overrides xinput1_3=n") && !contains(settings, "d3d11") && !contains(settings, "d3d12"),
+          "an override the player added is listed, without Playden's own entries");
+    check(contains(share_what(model), "Library overrides xinput1_3=n"), "and so does the Share sheet");
+    // Direct3D 12 back to Wine (Everwind's report): only the player's override is left to list.
+    change(model, "setting-d3d12");
+    activate(model, "choice-0");
+    settings = report_settings(model);
+    check(!contains(settings, "Direct3D 12") && contains(settings, "Library overrides xinput1_3=n"),
+          "Direct3D 12 back to Wine leaves the player's override");
+}
+
+// A community recipe that names DXVK's overrides itself keeps them whatever Graphics is: the same list as before is
+// no change, so a player who only changes Graphics doesn't get a Library overrides item.
+void report_recipe_dxvk_overrides(const std::filesystem::path& base) {
+    using namespace overrides_text;
+    Simulation model("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
+    set_up_model(model, base, true, "dxvk");
+    model.SetCommunityRecipeLoader([](const std::string& revision) -> std::optional<rt::CommunityRecipe> {
+        if (revision != kRevision) return std::nullopt;
+        auto community = community_recipe(revision);
+        community.recipe.dll_overrides = rt::kDxvkOverrides;
+        return community;
+    });
+    open_game_settings(model);
+    activate(model, "preset-picker");
+    activate(model, "recipe-" + kRevision);
+    if (model.state().navigation.modals.back().id == "confirmation") activate(model, "recipe-switch-confirm");
+    check(model.RecipeBaseFor(kGame) && model.RecipeBaseFor(kGame)->revision == kRevision, "Darkwood uses the community recipe");
+    change(model, "setting-graphics");
+    activate(model, "choice-3");
+    const auto settings = report_settings(model);
+    check(contains(settings, "Graphics OpenGL") && !contains(settings, "Library overrides"),
+          "the recipe's own DXVK overrides aren't listed when only Graphics changed");
+    const auto what = share_what(model);
+    check(contains(what, "Your changes: Graphics OpenGL") && !contains(what, "Library overrides"),
+          "nor does the Share sheet, against Playden's recipe or the community one");
+    // Back on DXVK, the player removes the recipe's DXVK overrides: a change of theirs, listed.
+    change(model, "setting-graphics");
+    activate(model, "choice-2");
+    change(model, "setting-dll_overrides");
+    check(find_row(model, "override-remove-0") && find_row(model, "override-remove-0")->title == rt::kDxvkOverrides &&
+              !find_row(model, "override-remove-1"),
+          "the recipe's DXVK overrides are its list");
+    activate(model, "override-remove-0");
+    const auto removed = report_settings(model);
+    check(contains(removed, "Library overrides none") && !contains(removed, "Graphics") && !contains(removed, "Direct3D 12"),
+          "removing the recipe's DXVK overrides is listed");
+    check(contains(share_what(model), "Your changes: Library overrides none"), "and so does the Share sheet");
+    // A recipe on OpenGL that names DXVK's overrides: the player chooses DXVK and vkd3d-proton. Only Direct3D 12's
+    // entries are new, and the recipe's own are the same list.
+    Simulation opengl("fixtures-not-used", "profile-not-used.json", ModelMode::Live);
+    set_up_model(opengl, base / "opengl", true, "dxvk");
+    opengl.SetCommunityRecipeLoader([](const std::string& revision) -> std::optional<rt::CommunityRecipe> {
+        if (revision != kRevision) return std::nullopt;
+        auto community = community_recipe(revision);
+        community.recipe.graphics = "opengl";
+        community.recipe.dll_overrides = rt::kDxvkOverrides;
+        return community;
+    });
+    open_game_settings(opengl);
+    activate(opengl, "preset-picker");
+    activate(opengl, "recipe-" + kRevision);
+    if (opengl.state().navigation.modals.back().id == "confirmation") activate(opengl, "recipe-switch-confirm");
+    change(opengl, "setting-graphics");
+    activate(opengl, "choice-2");
+    change(opengl, "setting-d3d12");
+    activate(opengl, "choice-1");
+    const auto on_vkd3d = share_what(opengl);
+    check(contains(on_vkd3d, "Your changes: Graphics DXVK") && contains(on_vkd3d, "Direct3D 12 vkd3d-proton") &&
+              !contains(on_vkd3d, "Library overrides"),
+          "Direct3D 12's entries don't make the recipe's own DXVK overrides a change");
 }
 
 int main() {
@@ -1695,13 +1937,17 @@ int main() {
     share_and_vote(base);
     community_keep(base / "keep");
     report_with_logs(base / "report");
+    report_library_overrides(base / "report-overrides");
+    report_recipe_dxvk_overrides(base / "report-recipe-overrides");
     account_link(base / "account");
     feedback_prompt_waits_for_library(base / "prompt");
     start_failed(base / "start-failed");
     start_failed_waits_for_library(base / "start-failed-late");
-    community_off(base / "off");
-    community_off_recipe_missing(base / "off-missing");
+    community_recipe_bytes(base / "recipe-bytes");
+    community_recipe_missing(base / "recipe-missing");
     settings_only_base(base / "settings-only");
+    web_import(base / "web-import");
+    web_import_without_app_id(base / "web-import-no-app");
     std::filesystem::remove_all(base, ignored);
     std::puts("homebrew_sharing_test passed");
     return 0;

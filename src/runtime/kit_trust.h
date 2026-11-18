@@ -13,7 +13,7 @@ namespace playden::runtime {
 inline constexpr const char* kDevelopmentKitId = "playden-kit";
 inline constexpr const char* kDevelopmentKitRoot = "/data/playden/kits/playden-kit";
 inline constexpr const char* kExpectedKitManifestSha256 =
-    "9ded9e100402461429eb5f8f3ee6902c5cd4c055113d1584408b43e9b0a94e13";
+    "18dc30584e24117cf4c71765ea3c5627d600f92aa5da1e4ac4e06c52a5680d0d";
 
 // Ids a kit had before it was renamed: its folder under /data/playden/kits and its manifest's kit_id.
 // A title, bottle or settings publication made from the earlier id belongs to the renamed kit (Update
@@ -25,10 +25,21 @@ struct KitIdRename {
 };
 inline constexpr KitIdRename kKitIdRenames[] = {{"hl2-fw1360-dev1", "playden-kit"}};
 
+// PS4: every build before 03.35 minted "orbis-win-ps4-<commit>-<template>", so each new runtime
+// made a new kit and orphaned every installed game. The id is "orbis-win-ps4" now; adopt the old
+// composite ones rather than invalidate the bottles they made. What the runtime actually is still
+// reaches the console through the kit view's runtime.artifact_revision, files_sha256 and
+// capabilities, none of which are part of a bottle's identity.
+inline constexpr const char* kPs4KitId = "orbis-win-ps4";
+
 // Whether the kit `from` was renamed to `to`.
 inline bool KitIdRenamedTo(std::string_view from, std::string_view to) {
   for (const auto& renamed : kKitIdRenames)
     if (from == renamed.from && to == renamed.to) return true;
+  const std::string_view ps4(kPs4KitId);
+  if (to == ps4 && from.size() > ps4.size() + 1 && from.substr(0, ps4.size()) == ps4 &&
+      from[ps4.size()] == '-')
+    return true;
   return false;
 }
 

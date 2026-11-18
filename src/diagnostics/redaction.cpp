@@ -1,4 +1,6 @@
 #include "diagnostics/redaction.h"
+
+#include "diagnostics/credential_patterns.h"
 namespace playden::diagnostics {
 const char* AuthMessage(steam::AuthError error) {
   switch (error) {
@@ -36,6 +38,19 @@ std::string AuthRecord(const steam::SteamEvent& event) {
   }
   return std::string("{\"kind\":\"") + kind + "\",\"request\":" + std::to_string(event.request_id) +
       ",\"generation\":" + std::to_string(event.generation) + ",\"error\":\"" + AuthMessage(event.error) + "\"}";
+}
+std::string AccountRecord(const stores::AccountEvent& event) {
+  const char* kind = "unknown";
+  switch (event.kind) {
+    case stores::AccountEventKind::kSignedIn: kind="signed-in"; break;
+    case stores::AccountEventKind::kOffline: kind="offline"; break;
+    case stores::AccountEventKind::kSignedOut: kind="signed-out"; break;
+    case stores::AccountEventKind::kExpired: kind="expired"; break;
+    case stores::AccountEventKind::kFailure: kind="failure"; break;
+  }
+  return std::string("{\"store\":\"") + std::string(Traits(event.store).key) + "\",\"kind\":\"" + kind +
+      "\",\"request\":" + std::to_string(event.request_id) + ",\"generation\":" + std::to_string(event.generation) +
+      (event.restoring ? ",\"restoring\":true}" : "}");
 }
 std::string RedactSecrets(std::string_view text, std::string_view known_secret) {
   std::string out;
@@ -87,6 +102,6 @@ std::string RedactSecrets(std::string_view text, std::string_view known_secret) 
     result.push_back(out[i]);
     ++i;
   }
-  return result;
+  return RedactCredentialPatterns(result);
 }
 }

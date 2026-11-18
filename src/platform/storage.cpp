@@ -62,13 +62,10 @@ Storage::Storage(std::string root) : root_(std::move(root)) {
 Result<void> Storage::EnsureRootDirectory() const {
   if(root_.empty() || root_.find('\0')!=std::string::npos)
     return Result<void>::Failure(StorageError::kInvalidPath,"Storage root is invalid.");
-  const mode_t root_mode = traversable_root_ ? 0711 : 0700;
-  if(mkdir(root_.c_str(),root_mode)!=0 && errno!=EEXIST)
+  // Open, so the console owner can delete it over FTP (#868); an existing root keeps its mode.
+  if(mkdir(root_.c_str(),0777)==0) (void)chmod(root_.c_str(),0777);
+  else if(errno!=EEXIST)
     return Result<void>::Failure(StorageError::kOpenFailed,"Storage root could not be created.");
-  // A collaborating title can traverse to known public children (such as the game library),
-  // but cannot list this directory. Private session files retain their own 0600 modes.
-  if (traversable_root_ && chmod(root_.c_str(), root_mode) != 0)
-    return Result<void>::Failure(StorageError::kPermissionFailed,"Storage root could not be made traversable.");
   struct stat info{};
   if(stat(root_.c_str(),&info)!=0 || !S_ISDIR(info.st_mode))
     return Result<void>::Failure(StorageError::kOpenFailed,"Storage root is unavailable.");
@@ -135,6 +132,12 @@ Result<Bytes> Storage::Read(const std::string& relative_path, std::size_t max_by
 
 Result<void> Storage::WriteAtomic(const std::string& relative_path,
                                   const Bytes& bytes) const {
+  return WriteAtomicImpl(relative_path, bytes, false);
+}
+
+Result<void> Storage::WriteAtomicOpen(const std::string& relative_path, const Bytes& bytes) const {
+  // As WriteAtomicPrivate: a root raise on another thread would leave a root-owned file Playden can't replace.
+  const auto uid = ps5::HoldEffectiveUid();
   return WriteAtomicImpl(relative_path, bytes, false);
 }
 
@@ -207,7 +210,17 @@ Result<void> Storage::WriteAtomicImpl(const std::string& relative_path,
                                        "' (errno " + std::to_string(stream_error) + ")");
     }
   } else {
-    file = std::fopen(temporary_path.c_str(), "wb");
+    // 0666 so FTP (root, no permission bypass on /data) can read and replace it (#868). A filesystem
+    // that keeps no modes (exFAT) refuses the chmod; the file is fine as it is there. A stale temporary file is
+    // removed and a new one made exclusively: a name linked to another file is never written through.
+    if (::unlink(temporary_path.c_str()) != 0 && errno != ENOENT)
+      return Result<void>::Failure(StorageError::kOpenFailed, "Storage temporary file could not be removed.");
+    const int descriptor = open(temporary_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666);
+    if (descriptor >= 0) {
+      (void)fchmod(descriptor, 0666);
+      file = fdopen(descriptor, "wb");
+      if (!file) close(descriptor);
+    }
   }
   if (file == nullptr) {
     return Result<void>::Failure(
@@ -231,6 +244,16 @@ Result<void> Storage::WriteAtomicImpl(const std::string& relative_path,
     return Result<void>::Failure(
         StorageError::kWriteFailed,
         WriteErrorMessage("could not flush", relative_path, flush_error, private_file));
+  }
+  // On disk before the rename: a crash or power loss after it must find the old file or the new one,
+  // never an empty or zero-filled one under the real name.
+  if (::fsync(fileno(file)) != 0) {
+    const int sync_error = errno;
+    std::fclose(file);
+    std::remove(temporary_path.c_str());
+    return Result<void>::Failure(
+        StorageError::kSyncFailed,
+        WriteErrorMessage("could not sync", relative_path, sync_error, private_file));
   }
   if (private_file) {
     struct stat status{};
@@ -257,6 +280,15 @@ Result<void> Storage::WriteAtomicImpl(const std::string& relative_path,
     return Result<void>::Failure(
         StorageError::kRenameFailed,
         WriteErrorMessage("could not replace", relative_path, rename_error, private_file));
+  }
+  // The rename itself reaches the disk with the folder. The new contents are already in place, so a failed
+  // folder sync doesn't fail the save. Opened by path: a title's openat takes no real folder descriptor.
+  const auto slash = resolved.value().rfind('/');
+  const std::string folder = slash == std::string::npos ? std::string(".") : resolved.value().substr(0, slash);
+  if (const int directory = ::open(folder.empty() ? "/" : folder.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      directory >= 0) {
+    ::fsync(directory);
+    ::close(directory);
   }
   return Result<void>::Success();
 }

@@ -205,18 +205,52 @@ void Server::Work() {
       std::lock_guard<std::mutex> lock(mutex_);
       clients_.erase(std::remove(clients_.begin(), clients_.end(), accepted.fd), clients_.end());
     }
-    ::shutdown(accepted.fd, SHUT_RDWR);
+    // NOT shutdown(SHUT_RDWR): send() only queues bytes, so tearing both directions down here threw
+    // away whatever had not reached the wire. A response bigger than the socket's buffer arrived cut
+    // off around 33 KB -- the web page ended in the middle of its script, so no JavaScript ran and
+    // the page was blank (measured 2026-11-18: 33,145 bytes of a declared 98,579). Serve() already
+    // does this dance for an answer sent before the body was read, for the same reason. Send FIN on
+    // our side, let close() linger over the queue, and read to EOF so it ends with a FIN, not an
+    // RST -- an RST would discard the queue all over again.
+    ::shutdown(accepted.fd, SHUT_WR);
+    linger hold{};
+    hold.l_onoff = 1;
+    hold.l_linger = 10;  // seconds close() may take to finish the transfer
+    ::setsockopt(accepted.fd, SOL_SOCKET, SO_LINGER, &hold, sizeof hold);
+    SetTimeout(accepted.fd, SO_RCVTIMEO, 1000);
+    for (int reads = 0; reads < 64; ++reads) {
+      char sink[512];
+      const auto count = ::recv(accepted.fd, sink, sizeof sink, 0);
+      if (count == 0) break;                      // the client acknowledged our FIN
+      if (count < 0 && errno == EINTR) continue;
+      if (count < 0) break;                       // timed out or failed: close anyway
+    }
     ::close(accepted.fd);
   }
 }
 
 void Server::Serve(int client, const std::string& client_ip) {
+  // A page is tens of kilobytes and the console's socket send buffer is about 33 KB, so a response
+  // larger than that cannot leave in one send: the rest goes as the client drains it. SO_SNDTIMEO
+  // (set above) makes a full buffer return EAGAIN rather than block forever, and treating that as
+  // fatal truncated every big response at the buffer's size -- the web page arrived cut off in the
+  // middle of its script, so no JavaScript ran and the page was blank (measured 2026-11-18: 33,145
+  // of 98,579 bytes). A timeout means the buffer stayed full for that window, not that the client
+  // is gone, so keep sending; only a real error, a closed socket, or a client that has taken
+  // nothing at all for kStallLimit ends the response.
   const auto write = [this, client](const char* data, std::size_t size) {
+    constexpr int kStallLimit = 6;  // x write_timeout_ms with no progress at all
+    int stalled = 0;
     while (size > 0) {
       if (stop_.load()) return false;
       const auto sent = ::send(client, data, size, kSendFlags);
       if (sent < 0 && errno == EINTR) continue;
+      if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (++stalled >= kStallLimit) return false;
+        continue;
+      }
       if (sent <= 0) return false;
+      stalled = 0;
       data += sent;
       size -= static_cast<std::size_t>(sent);
     }
@@ -266,6 +300,7 @@ void Server::Serve(int client, const std::string& client_ip) {
       }
       return -1;
     };
+    request.client = client_ip;
     handler_(request, response);
     if (!response.started()) SendError(response, 500, "No answer.");
     // An answer sent before the whole body was read (a refused upload): closing now could reset the connection

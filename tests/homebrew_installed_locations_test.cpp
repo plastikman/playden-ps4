@@ -3,6 +3,7 @@
 #include "homebrew/controller.hpp"
 #include "homebrew/runtime_host.hpp"
 #include "installs/install_record.h"
+#include "installs/install_service.h"
 #include "runtime_host_fixture.h"
 #include "stores/local/library_source.h"
 #include "fake_library_source.h"
@@ -333,7 +334,8 @@ void ImportedGamePreparesWithoutSteam() {
            std::any_of(model.state().games.begin(), model.state().games.end(), [&](const hb::Game& game) { return game.id == local; });
   });
   for (int i = 0; i < 6 && model.state().navigation.route != hb::Route::Settings; ++i) model.action("r1");
-  CHECK(model.action("focus:settings-title-store") && model.action("cross") && model.state().title_store_suffix);
+  // On by default for a new install (no preferences file).
+  CHECK(model.action("focus:settings-title-store") && model.state().title_store_suffix);
   model.RequestRuntimePrepare(local);
   auto refused = tick_until([](const RuntimeSnapshot& s) { return s.prepares_handled > 0 && !s.preparing_app; });
   const auto number = NumberOf(refused, local);
@@ -544,7 +546,7 @@ void ImportedGamePlaysInPlace() {
   pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
   pe[0x44] = 0x64; pe[0x45] = static_cast<char>(0x86); pe[0x40 + 24] = 0x0b; pe[0x40 + 25] = 0x02;
   const auto usb = fixture.root / "mnt/usb0/playden/import";
-  Write(usb / "Rally/Bin/Rally.exe", pe + std::string(4096, 'x'), 0644);
+  Write(usb / "Rally/Bin/x64/Shipping/Win64/Release/Rally.exe", pe + std::string(4096, 'x'), 0644);
   Write(usb / "Rally/Redist/vcredist_x64.exe", pe, 0644);
   Write(usb / "Rally/data.pak", "data", 0644);
   Write(usb / "Caf\xc3\xa9/Game.exe", pe, 0644);
@@ -557,8 +559,8 @@ void ImportedGamePlaysInPlace() {
   std::atomic<unsigned> drop_raises{0};
   std::atomic<unsigned> drop_opens{0};
   std::atomic<bool> hold_opens{false};
-  // imports.json sits next to installs.json, in the folder the runtime host makes private at its start.
-  playden::Storage import_storage((fixture.root / "data/runtime-state").string());
+  // imports.json sits next to installs.json, in the folder the runtime host makes at its start (open to FTP, #868).
+  auto import_storage = playden::Storage((fixture.root / "data/runtime-state").string()).OpenTree();
   std::string id;
 
   const auto run = [&](bool signed_in, const std::function<void(hb::Simulation&, hb::Controller&, RuntimeHost&,
@@ -657,8 +659,8 @@ void ImportedGamePlaysInPlace() {
     const auto rally = std::find_if(candidates.begin(), candidates.end(), [](const hb::LiveImportCandidate& c) { return c.title == "Rally"; });
     CHECK(rally != candidates.end() && rally->volume_id == "usb0" && rally->folder == "playden/import/Rally");
     CHECK(rally->ascii_ok && !rally->imported.valid() && rally->programs.size() == 2);
-    CHECK(rally->programs[0].path == "Bin/Rally.exe" && !rally->programs[0].helper && rally->programs[1].helper);
-    CHECK(rally->total_bytes > 4096);
+    CHECK(rally->programs[0].path == "Bin/x64/Shipping/Win64/Release/Rally.exe" && !rally->programs[0].helper && rally->programs[1].helper);
+    CHECK(rally->gap == hb::ImportScanGap::None);
     const auto cafe = std::find_if(candidates.begin(), candidates.end(),
                                    [](const hb::LiveImportCandidate& c) { return c.folder == "playden/import/Caf\xc3\xa9"; });
     CHECK(cafe != candidates.end() && !cafe->ascii_ok);
@@ -667,8 +669,8 @@ void ImportedGamePlaysInPlace() {
                                      [](const hb::LiveImportCandidate& c) { return c.folder == "playden/import/Space: Marine"; });
     CHECK(marine != candidates.end() && !marine->ascii_ok);
 
-    // Add: the game is in the library with its folder's name, and plays in place.
-    model.RequestImport({hb::ImportRequestKind::Add, {}, "usb0", "Rally", "Bin/Rally.exe"});
+    // Add: the game is in the library with its folder's name, and plays in place. Its program is six levels deep.
+    model.RequestImport({hb::ImportRequestKind::Add, {}, "usb0", "Rally", "Bin/x64/Shipping/Win64/Release/Rally.exe"});
     tick_until([&] {
       const auto snapshot = source.Snapshot();
       if (snapshot->games.empty()) return false;
@@ -683,8 +685,8 @@ void ImportedGamePlaysInPlace() {
     // Never one of Playden's installs.
     CHECK(model.state().installations.empty());
     // A bad program or an unknown drive is refused, and nothing is added.
-    const auto refused = source.Add("usb0", "Rally", "Bin/Missing.exe");
-    const auto unknown = source.Add("usb9", "Rally", "Bin/Rally.exe");
+    const auto refused = source.Add("usb0", "Rally", "Bin/x64/Shipping/Win64/Release/Missing.exe");
+    const auto unknown = source.Add("usb9", "Rally", "Bin/x64/Shipping/Win64/Release/Rally.exe");
     tick_until([&] {
       const auto snapshot = source.Snapshot();
       const auto outcome = [&](std::uint64_t request) {
@@ -711,10 +713,10 @@ void ImportedGamePlaysInPlace() {
       CHECK(number >= 0xF0000000u && !snapshot.refusals.count(number));
       const auto view = std::find_if(snapshot.installs.begin(), snapshot.installs.end(), [&](const RuntimeInstallView& v) { return v.game == game; });
       CHECK(view->install_path == console_root);
-      CHECK(model.state().game_settings.at(game).overrides.at("program") == "Bin/Rally.exe");
+      CHECK(model.state().game_settings.at(game).overrides.at("program") == "Bin/x64/Shipping/Win64/Release/Rally.exe");
       std::map<GameId, GameSettingsRecord> saved;
       std::string reason;
-      CHECK(LoadGameSettingsFile(settings_file.string(), &saved, &reason) && saved.at(game).overrides.at("program") == "Bin/Rally.exe");
+      CHECK(LoadGameSettingsFile(settings_file.string(), &saved, &reason) && saved.at(game).overrides.at("program") == "Bin/x64/Shipping/Win64/Release/Rally.exe");
     }
   });
 
@@ -765,14 +767,14 @@ void ImportedGamePlaysInPlace() {
       return !game_of(model, game) && source.Snapshot()->games.empty() &&
              std::any_of(snapshot.kept_bottles.begin(), snapshot.kept_bottles.end(), [&](const auto& kept) { return kept.game == game; });
     });
-    CHECK(fs::is_regular_file(usb / "Rally/Bin/Rally.exe") && fs::is_regular_file(usb / "Rally/data.pak"));
+    CHECK(fs::is_regular_file(usb / "Rally/Bin/x64/Shipping/Win64/Release/Rally.exe") && fs::is_regular_file(usb / "Rally/data.pak"));
     CHECK(model.state().external_games.empty());
 
     // Added again: the same ID, its settings and the program chosen before.
-    model.RequestImport({hb::ImportRequestKind::Add, {}, "usb0", "Rally", "Bin/Rally.exe"});
+    model.RequestImport({hb::ImportRequestKind::Add, {}, "usb0", "Rally", "Bin/x64/Shipping/Win64/Release/Rally.exe"});
     tick_until([&] { return game_of(model, game) && external_of(model, game) && external_of(model, game)->available; });
     CHECK(source.Snapshot()->games.front().id == id);
-    CHECK(model.state().game_settings.at(game).overrides.at("program") == "Bin/Rally.exe");
+    CHECK(model.state().game_settings.at(game).overrides.at("program") == "Bin/x64/Shipping/Win64/Release/Rally.exe");
   });
 
   // Signed in to Steam, after a restart: the imported game is listed from imports.json and Details offers Play.
@@ -945,6 +947,7 @@ void ImportedGamePlaysInPlace() {
     open_details(model, game);
     CHECK(model.action("focus:details-more") && model.action("cross"));
     CHECK(model.action("focus:game-settings") && model.action("cross"));
+    CHECK(model.action("focus:change-settings") && model.action("cross"));
     CHECK(model.action("focus:section-compatibility") && model.action("cross"));
     // Sky's recipe leaves Graphics automatic; 120 Hz output is for DXVK and OpenGL.
     tick_until([&] { const auto* row = row_of(model, "setting-graphics"); return row && row->enabled; });
@@ -958,6 +961,7 @@ void ImportedGamePlaysInPlace() {
     CHECK(model.action("focus:choice-1") && model.action("cross"));
     CHECK(model.state().game_settings.at(game).overrides.at("refresh") == "120" &&
           model.state().game_settings.at(game).overrides.at("frame_limit") == "120");
+    CHECK(model.action("circle"));  // back from the list to the summary
     CHECK(model.action("circle"));  // closing the sheet applies the settings
     tick_until([&] {
       const auto* runtime = runtime_of();
@@ -1200,6 +1204,233 @@ void BranchInstallWaitsForItsLaunchOptions() {
   }
 }
 
+namespace {
+// GOG's install runner for the queue: the games here are installed already.
+class NoGogDownloads final : public playden::installs::InstallRunner {
+ public:
+  Result Install(const playden::GameId&, const std::string&, const playden::installs::InstallOptions&,
+                 const std::atomic<bool>&, const std::function<void(std::uint64_t, std::uint64_t, std::uint64_t)>&,
+                 const std::function<void(playden::installs::InstallStep)>&) override {
+    Result result;
+    result.failure = "no downloads here";
+    return result;
+  }
+  std::string Remove(const std::string&) override { return {}; }
+};
+// GOG's account: it restores nothing, until the test says a sign-in came or went.
+class ScriptedGogAccount final : public playden::stores::StoreAccount {
+ public:
+  playden::Store store() const override { return playden::Store::kGog; }
+  std::uint64_t RestoreSession() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Queue(playden::stores::AccountEventKind::kSignedOut, ++next_);
+    return next_;
+  }
+  void Cancel(std::uint64_t) override {}
+  void SignOut() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Queue(playden::stores::AccountEventKind::kSignedOut, 0);
+  }
+  std::vector<playden::stores::AccountEvent> PumpEvents(std::size_t max_events) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<playden::stores::AccountEvent> result;
+    while (!events_.empty() && result.size() < max_events) {
+      result.push_back(std::move(events_.front()));
+      events_.erase(events_.begin());
+    }
+    return result;
+  }
+  // A session that comes back (a phone sign-in, say), or ends on its own (expiry).
+  void Raise(playden::stores::AccountEventKind kind) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Queue(kind, 0);
+  }
+
+ private:
+  void Queue(playden::stores::AccountEventKind kind, std::uint64_t request) {
+    playden::stores::AccountEvent event;
+    event.store = playden::Store::kGog;
+    event.kind = kind;
+    event.request_id = request;
+    event.generation = ++generation_;
+    if (kind == playden::stores::AccountEventKind::kSignedIn) {
+      event.account_key = 0xabc;
+      event.display_name = "Synthetic GOG player";
+    }
+    events_.push_back(std::move(event));
+  }
+  std::mutex mutex_;
+  std::uint64_t next_ = 100;
+  std::uint64_t generation_ = 0;
+  std::vector<playden::stores::AccountEvent> events_;
+};
+// GOG's details as the GOG source gives them: sizes, and no launch options (they come from the install record).
+class SizesOnlyDetails final : public playden::stores::DetailsSource {
+ public:
+  playden::Store store() const override { return playden::Store::kGog; }
+  void Request(const playden::GameId& id, std::uint64_t generation) override {
+    std::lock_guard<std::mutex> lock(mutex);
+    playden::stores::GameDetails details;
+    details.id = id;
+    details.account_generation = generation;
+    details.available = true;
+    details.windows_installable = true;
+    details.download_bytes = 1024;
+    details.install_bytes = 4096;
+    answers.push_back(details);
+    ++asked;
+  }
+  void Invalidate(std::uint64_t) override {}
+  std::vector<playden::stores::GameDetails> Pump(std::size_t) override {
+    std::lock_guard<std::mutex> lock(mutex);
+    return std::exchange(answers, {});
+  }
+  void Shutdown() override {}
+  std::mutex mutex;
+  std::vector<playden::stores::GameDetails> answers;
+  int asked = 0;
+};
+}  // namespace
+
+// A GOG game prepares from the programs its install record names (its play tasks), with Steam signed out and no
+// GOG account, also after a GOG sign-in comes and goes: GOG games need no sign-in to play. The program on disk is
+// spelled SYNTHETIC.EXE and the record says synthetic.exe, as Jazz Jackrabbit 2's files do. Its details, which name
+// no program, never replace the record's.
+void GogGamePreparesFromItsRecord() {
+  using playden::GameId;
+  namespace hb = playden::homebrew;
+  const auto gog = GameId::Gog(1900000001);
+  Fixture fixture;
+  auto config = fixture.Config();
+  config.host_namespace_prefix = fixture.root;
+  config.package_paths.console_data_root = "/data";
+  config.package_paths.host_data_root = fixture.root / "data";
+  config.package_operations.hash_file = HashArtifactFile;
+  config.package_operations.hash_bytes = HashArtifactBytes;
+  config.package_operations.free_space_unverifiable = true;
+  config.package_operations.validate_bottle = [](const fs::path& bottle) {
+    return fs::is_regular_file(bottle / "system.reg") && fs::is_regular_file(bottle / "user.reg");
+  };
+  const auto kit = SyntheticKit(fixture.root / "kit");
+  config.admit_kit = [&kit](std::string*) { return std::optional<RuntimeKit>(kit); };
+  unsigned uuids = 0;
+  config.uuid = [&uuids]() -> std::optional<std::string> {
+    ++uuids; return std::string("00000000-0000-4000-8000-0000000000") + (uuids < 10 ? "0" : "") + std::to_string(uuids);
+  };
+  config.unix_time = [] { return std::int64_t{1760000000}; };
+  std::mutex log_mutex;
+  std::vector<std::string> lines;
+  config.log = [&](const std::string& line) { std::lock_guard<std::mutex> lock(log_mutex); lines.push_back(line); };
+  std::string pe(0x80 + 26, '\0');
+  pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+  pe[0x44] = 0x64; pe[0x45] = static_cast<char>(0x86); pe[0x40 + 24] = 0x0b; pe[0x40 + 25] = 0x02;
+  // The queue lists the game by its folder on the host; the runtime reads that path inside its console namespace (the
+  // fixture's root). The game's files are in both places.
+  const auto games = fixture.root / "data/playden-games";
+  const auto folder = games / "gog-1900000001";
+  const auto runtime_folder = fixture.root / folder.relative_path();
+  playden::installs::GogRecord gog_record;
+  gog_record.build_id = "1000000000000000101";
+  gog_record.products = {1900000001};
+  gog_record.language = "en-US";
+  gog_record.meta_id = std::string(32, 'a');
+  const auto record = playden::installs::FormatGogInstallRecord(
+      gog, 4096, 2, "english", gog_record,
+      {{"SyntheticLauncher.exe", "", "", "Synthetic Launcher"}, {"synthetic.exe", "-windowed", "", "Synthetic"}});
+  for (const auto& where : {folder, runtime_folder}) {
+    Write(where / playden::installs::kInstallRecordName, record, 0644);
+    Write(where / "SYNTHETIC.EXE", pe, 0644);
+    CHECK(chmod(where.c_str(), 0777) == 0);
+  }
+  Write(games / ".playden-games", "gog-1900000001\tinternal\t4096\n", 0644);
+
+  hb::Simulation model({}, {}, hb::ModelMode::Live);
+  model.SetGogStoreEnabled(true);
+  model.SetStoreInstalls(playden::Store::kGog, true);
+  MemorySessions sessions;  // signed out of Steam
+  RestoringBackend backend;
+  playden::stores::Registry registry;
+  registry.Add(std::make_unique<playden::stores::SteamAccount>(backend, sessions));
+  registry.Add(std::make_unique<playden::test::FakeLibrarySource>(playden::Store::kSteam));
+  auto account_owned = std::make_unique<ScriptedGogAccount>();
+  auto& account = *account_owned;
+  registry.Add(std::unique_ptr<playden::stores::StoreAccount>(std::move(account_owned)));
+  auto library = std::make_unique<playden::test::FakeLibrarySource>(playden::Store::kGog);
+  library->games = {playden::GameSummary{gog, "Synthetic GOG game", {}, {}, {}}};
+  registry.Add(std::move(library));
+  auto details_owned = std::make_unique<SizesOnlyDetails>();
+  auto& details = *details_owned;
+  registry.Add(std::unique_ptr<playden::stores::DetailsSource>(std::move(details_owned)));
+  NoDownloads steam_downloads(sessions);
+  NoGogDownloads gog_downloads;
+  playden::installs::InstallService installs(
+      {{playden::Store::kSteam, &steam_downloads}, {playden::Store::kGog, &gog_downloads}},
+      {playden::installs::InstallVolume{"internal", "Console storage", games.string(), true}});
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  hb::Controller controller(model, registry, nullptr, &installs, nullptr, &host);
+  const auto tick_until = [&](const std::function<bool(const RuntimeSnapshot&)>& done) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (;;) {
+      controller.Tick();
+      const auto snapshot = host.Snapshot();
+      if (done(snapshot)) return snapshot;
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  };
+  tick_until([&](const RuntimeSnapshot& s) {
+    return s.status == RuntimeHostStatus::kReady && model.state().runtime == hb::RuntimeState::Ready &&
+           model.state().account(playden::Store::kGog).authentication == hb::AuthState::SignedOut &&
+           std::any_of(model.state().installations.begin(), model.state().installations.end(),
+                       [&](const hb::Installation& item) { return item.game_id == gog; });
+  });
+  CHECK(model.state().account().authentication != hb::AuthState::SignedIn);
+  const auto prepare = [&] {
+    const auto before = host.Snapshot().prepares_handled;
+    model.RequestRuntimePrepare(gog);
+    return tick_until([before](const RuntimeSnapshot& s) { return s.prepares_handled > before && !s.preparing_app; });
+  };
+  // The game's recipe is made from the record's programs. Its publication then stops at the title's descriptor, which
+  // takes a game folder under /data or /mnt only, and this test's folders are host paths: homebrew_runtime_host
+  // prepares a GOG game to Ready from such a request.
+  const auto check_prepared = [&](const RuntimeSnapshot& done) {
+    const auto number = NumberOf(done, gog);
+    CHECK(number >= 0xF0000000u);
+    if (done.refusals.count(number)) {
+      const auto& refusal = done.refusals.at(number);
+      CHECK(refusal.find("program") == std::string::npos && refusal.find("Sign in") == std::string::npos &&
+            refusal.find("descriptor") != std::string::npos);
+    }
+    const auto view = std::find_if(done.installs.begin(), done.installs.end(),
+                                   [&](const RuntimeInstallView& item) { return item.game == gog; });
+    CHECK(view != done.installs.end());
+    // The record's program, found on disk ignoring case, under the game's generated recipe.
+    CHECK(view->recipe_id == "gog-1900000001-auto" && view->launch_path == "SYNTHETIC.EXE");
+  };
+  // Signed out of both stores: the record's programs, never "Choose the program…".
+  check_prepared(prepare());
+  // GOG signs in (its page asks the details, which name no program), then the session ends: the record still counts.
+  account.Raise(playden::stores::AccountEventKind::kSignedIn);
+  tick_until([&](const RuntimeSnapshot&) {
+    return model.state().account(playden::Store::kGog).authentication == hb::AuthState::SignedIn;
+  });
+  CHECK(model.action("details:" + playden::ToKey(gog)));
+  tick_until([&](const RuntimeSnapshot&) {
+    std::lock_guard<std::mutex> lock(details.mutex);
+    return details.asked > 0 && details.answers.empty();
+  });
+  check_prepared(prepare());
+  account.Raise(playden::stores::AccountEventKind::kExpired);
+  tick_until([&](const RuntimeSnapshot&) {
+    return model.state().account(playden::Store::kGog).authentication != hb::AuthState::SignedIn;
+  });
+  check_prepared(prepare());
+  controller.Shutdown();
+  host.Shutdown();
+  installs.Shutdown();
+}
+
 int main(int argc, char** argv) {
   CHECK(argc == 2);
   g_runtime_dir = argv[1];
@@ -1208,6 +1439,7 @@ int main(int argc, char** argv) {
   FirstPrepareOfAnImportedGameNeverWaitsForTheWorker();
   ImportedGamePlaysInPlace();
   BranchInstallWaitsForItsLaunchOptions();
+  GogGamePreparesFromItsRecord();
   std::puts("installed locations tests passed");
   return 0;
 }

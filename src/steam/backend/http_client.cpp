@@ -40,6 +40,16 @@ struct TransferBuffer {
   bool body_overflow = false;
   bool header_overflow = false;
   bool malformed_header = false;
+
+  // Streaming (HttpRequest::body_sink) only.
+  const std::function<bool(const std::uint8_t*, std::size_t)>* sink = nullptr;
+  const std::atomic<bool>* cancel = nullptr;
+  CURL* easy = nullptr;
+  std::uint64_t streamed = 0;
+  Clock::time_point last_activity;
+  bool sink_failed = false;
+  bool canceled = false;
+  bool error_body_cut = false;  // a non-2xx body reached kMaxHttpStreamErrorBodyBytes: stopped, status kept
 };
 
 struct TransferTrace {
@@ -115,8 +125,53 @@ bool MultiplyWithin(std::size_t left, std::size_t right, std::size_t limit,
   return true;
 }
 
+// A 2xx body goes to the sink, checked against the limit before each block; any other status is buffered so the
+// caller can read the error: its first kMaxHttpStreamErrorBodyBytes, apart from max_response_bytes (which sizes the
+// 2xx body), then the transfer stops with the status kept. Headers have all arrived before the first body block.
+size_t StreamBody(TransferBuffer& transfer, const char* bytes, size_t size, size_t count) {
+  if (transfer.cancel->load(std::memory_order_acquire)) {
+    transfer.canceled = true;
+    return 0;
+  }
+  long status = 0;
+  if (curl_easy_getinfo(transfer.easy, CURLINFO_RESPONSE_CODE, &status) != CURLE_OK) return 0;
+  const auto* begin = reinterpret_cast<const std::uint8_t*>(bytes);
+  if (status < 200 || status > 299) {
+    std::size_t length = 0;
+    const std::size_t room = kMaxHttpStreamErrorBodyBytes - transfer.response.body.size();
+    if (!MultiplyWithin(size, count, std::numeric_limits<std::size_t>::max(), length)) length = room + 1;
+    if (length == 0) return 0;
+    transfer.response.body.insert(transfer.response.body.end(), begin, begin + std::min(length, room));
+    transfer.last_activity = Clock::now();
+    if (length > room) {
+      transfer.error_body_cut = true;
+      return 0;
+    }
+    return length;
+  }
+  std::size_t length = 0;
+  if (!MultiplyWithin(size, count, transfer.body_limit, length)) {
+    transfer.body_overflow = true;
+    return 0;
+  }
+  if (length == 0) return 0;
+  if (length > transfer.body_limit - transfer.streamed) {
+    transfer.body_overflow = true;
+    return 0;
+  }
+  if (!(*transfer.sink)(begin, length)) {
+    transfer.sink_failed = true;
+    return 0;
+  }
+  transfer.streamed += length;
+  // Stamped after the sink returns: time spent in the sink (a disk write) is not a network stall.
+  transfer.last_activity = Clock::now();
+  return length;
+}
+
 size_t WriteBody(char* bytes, size_t size, size_t count, void* context) {
   auto& transfer = *static_cast<TransferBuffer*>(context);
+  if (transfer.sink) return StreamBody(transfer, bytes, size, count);
   std::size_t length = 0;
   if (!MultiplyWithin(size, count, transfer.body_limit, length) ||
       length > transfer.body_limit - transfer.response.body.size()) {
@@ -217,11 +272,20 @@ bool ValidUrl(const std::string& url, bool allow_plain_http) {
   return valid;
 }
 
+bool ValidStreamRequest(const HttpRequest& request) {
+  return request.method == HttpMethod::kGet && !request.depot_manifest && request.stall_timeout_ms != 0 &&
+         request.stall_timeout_ms <= kMaxHttpStallTimeoutMs && request.timeout_ms <= kMaxHttpStreamTimeoutMs &&
+         request.max_response_bytes != 0 && request.max_response_bytes <= kMaxHttpStreamResponseBytes;
+}
+
 bool ValidRequest(const HttpRequest& request) {
-  if (!ValidUrl(request.url, request.allow_plain_http) || request.timeout_ms == 0 ||
-      request.timeout_ms > kMaxHttpTimeoutMs || request.max_response_bytes == 0 ||
-      request.max_response_bytes > (request.depot_manifest ? kMaxHttpManifestResponseBytes : kMaxHttpResponseBytes) ||
-      request.body.size() > kMaxHttpResponseBytes ||
+  if (request.body_sink) {
+    if (!ValidStreamRequest(request)) return false;
+  } else if (request.timeout_ms == 0 || request.timeout_ms > kMaxHttpTimeoutMs || request.max_response_bytes == 0 ||
+             request.max_response_bytes > (request.depot_manifest ? kMaxHttpManifestResponseBytes : kMaxHttpResponseBytes)) {
+    return false;
+  }
+  if (!ValidUrl(request.url, request.allow_plain_http) || request.body.size() > kMaxHttpResponseBytes ||
       request.headers.size() > kMaxHttpResponseHeaderCount)
     return false;
   if ((request.method != HttpMethod::kGet && request.method != HttpMethod::kPost && request.method != HttpMethod::kPut) ||
@@ -244,9 +308,12 @@ bool ValidRequest(const HttpRequest& request) {
 
 HttpError MapError(CURLcode code, const TransferBuffer& transfer, bool canceled) {
   if (canceled) return HttpError::kCanceled;
+  if (transfer.sink_failed) return HttpError::kSinkFailed;
   if (transfer.body_overflow) return HttpError::kResponseTooLarge;
   if (transfer.header_overflow) return HttpError::kResponseHeadersTooLarge;
   if (transfer.malformed_header) return HttpError::kProtocolError;
+  // The write callback stopped it on purpose: the status and the start of the error body stand.
+  if (transfer.error_body_cut && code == CURLE_WRITE_ERROR) return HttpError::kNone;
   switch (code) {
     case CURLE_OK:
       return HttpError::kNone;
@@ -282,6 +349,7 @@ const char* HttpErrorName(HttpError error) {
     case HttpError::kResponseTooLarge: return "response_too_large";
     case HttpError::kResponseHeadersTooLarge: return "response_headers_too_large";
     case HttpError::kProtocolError: return "protocol_error";
+    case HttpError::kSinkFailed: return "sink_failed";
   }
   return "protocol_error";
 }
@@ -326,7 +394,16 @@ class HttpClient::Impl {
     return internal::PerformNativeHttpPs4(request, cancel, trace_);
 #endif
     const auto request_start = Clock::now();
-    const auto deadline = request_start + std::chrono::milliseconds(request.timeout_ms);
+    // A streamed request may have no total deadline (timeout_ms 0); a stall limit bounds it instead.
+    const bool streaming = static_cast<bool>(request.body_sink);
+    const bool has_deadline = request.timeout_ms != 0;
+    const auto deadline = has_deadline ? request_start + std::chrono::milliseconds(request.timeout_ms)
+                                       : Clock::time_point::max();
+    const auto stall_limit = std::chrono::milliseconds(request.stall_timeout_ms);
+    // The console resolver needs a nonzero budget: for a stream, the stall limit, within the total when there is one.
+    const std::uint32_t resolve_ms =
+        !streaming ? request.timeout_ms
+                   : (has_deadline ? std::min(request.timeout_ms, request.stall_timeout_ms) : request.stall_timeout_ms);
 
     CURL* easy = curl_easy_init();
     CURLM* multi = multi_;
@@ -340,6 +417,11 @@ class HttpClient::Impl {
     TraceLine(&trace, "start host=" + RequestHost(request.url) + " timeout=" +
                          std::to_string(request.timeout_ms) + "ms");
     transfer.body_limit = request.max_response_bytes;
+    if (streaming) {
+      transfer.sink = &request.body_sink;
+      transfer.cancel = &cancel;
+      transfer.easy = easy;
+    }
     CURLcode result = CURLE_FAILED_INIT;
     internal::NativeResolveError resolve_error = internal::NativeResolveError::kFailed;
     bool added = false;
@@ -408,7 +490,7 @@ class HttpClient::Impl {
 
     {
       const auto start = Clock::now();
-      resolve_error = resolution_cache_.Attach(easy, request.url, request.timeout_ms, cancel,
+      resolve_error = resolution_cache_.Attach(easy, request.url, resolve_ms, cancel,
                                                &resolve_entries_, Clock::now());
       transfer.response.address = resolution_cache_.address();
 #if (defined(PLAYDEN_PLATFORM_PS5) && PLAYDEN_PLATFORM_PS5) || \
@@ -433,19 +515,23 @@ class HttpClient::Impl {
       goto cleanup;
     }
     {
-      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-          deadline - Clock::now()).count();
-      if (remaining <= 0) {
+      // Without a deadline (a stream with timeout_ms 0) curl gets no total timeout: 0 means none.
+      const long remaining = has_deadline ? static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                deadline - Clock::now()).count())
+                                          : 0;
+      if (has_deadline && remaining <= 0) {
         result = CURLE_OPERATION_TIMEDOUT;
         goto cleanup;
       }
-      const long connect_ms = request.connect_timeout_ms != 0
-                                  ? std::min<long>(static_cast<long>(request.connect_timeout_ms), static_cast<long>(remaining))
-                                  : static_cast<long>(remaining);
+      long connect_ms = request.connect_timeout_ms != 0 ? static_cast<long>(request.connect_timeout_ms)
+                                                        : (streaming ? static_cast<long>(request.stall_timeout_ms) : remaining);
+      if (has_deadline) connect_ms = std::min(connect_ms, remaining);
       if (curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, connect_ms) != CURLE_OK ||
-          curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, static_cast<long>(remaining)) != CURLE_OK)
+          curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, remaining) != CURLE_OK)
         goto cleanup;
     }
+    // The stall clock starts with the transfer, so it also bounds connecting and the time to the first byte.
+    transfer.last_activity = Clock::now();
     if (curl_multi_add_handle(multi, easy) != CURLM_OK) goto cleanup;
     added = true;
     {
@@ -469,8 +555,13 @@ class HttpClient::Impl {
               result = message->data.result;
           break;
         }
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - Clock::now()).count();
+        // Checked after curl_multi_perform, so a block that arrived during the last poll counts as activity.
+        if (streaming && Clock::now() - transfer.last_activity >= stall_limit) {
+          result = CURLE_OPERATION_TIMEDOUT;
+          break;
+        }
+        const auto remaining = has_deadline ? std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - Clock::now()).count() : 25;
         const int wait_ms = static_cast<int>(std::clamp<long long>(remaining, 1, 25));
         if (curl_multi_poll(multi, nullptr, 0, wait_ms, nullptr) != CURLM_OK) break;
       } while (true);
@@ -499,12 +590,13 @@ class HttpClient::Impl {
       transfer.response.timing.uploaded_bytes =
           static_cast<std::uint64_t>(std::max<curl_off_t>(0, uploaded));
     }
-    transfer.response.timing.body_bytes = transfer.response.body.size();
+    transfer.response.timing.body_bytes = transfer.response.body.size() + transfer.streamed;
     transfer.response.timing.total_ms = static_cast<std::uint32_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - request_start).count());
     if (added) curl_multi_remove_handle(multi, easy);
     if (easy) curl_easy_cleanup(easy);
     curl_slist_free_all(request_headers);
+    canceled = canceled || transfer.canceled;
     transfer.response.error = MapError(result, transfer, canceled);
     // A transport failure is not an HTTP response, even if curl saw a status
     // line before the connection failed. Callers use zero to distinguish it

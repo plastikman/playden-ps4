@@ -1,8 +1,10 @@
 #pragma once
 
+#include "library/collections_cache.h"
 #include "library/repository.h"
 #include "steam/library_backend.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -23,7 +25,7 @@ struct LibraryEvent {
   std::uint64_t request_id = 0;
   std::uint64_t account_id = 0;
   std::uint64_t account_generation = 0;
-  steam::LibraryError error = steam::LibraryError::kNone;
+  LibraryError error = LibraryError::kNone;
   std::vector<GameSummary> games;
   bool metadata_partial = false;
   std::uint64_t retrieved_at_unix_seconds = 0;
@@ -31,6 +33,11 @@ struct LibraryEvent {
   StorageError cache_error = StorageError::kNone;
   // kComplete: this load read the account's licenses too (never for a cached library).
   bool licenses_read = false;
+  // The store's collections (Steam collections, GOG tags) on kCached, kComplete and kUpdated, when known: read
+  // from the store with this load, or its saved copy. A store that couldn't read them keeps the saved copy; with
+  // none, collections_known is false and the model keeps what it has.
+  std::vector<LibraryCollection> collections;
+  bool collections_known = false;
 };
 
 // A single worker owns session, network, and cache IO. Dependencies outlive the
@@ -41,6 +48,7 @@ class LibraryService {
   LibraryService(steam::LibraryBackend&, SessionRepository&,
                  LibraryRepository* cache = nullptr,
                  std::function<std::uint64_t()> unix_seconds = {},
+                 CollectionsRepository* collections = nullptr,
                  std::function<void(const char*)> trace = {});
   ~LibraryService();
   LibraryService(const LibraryService&) = delete;
@@ -82,12 +90,18 @@ class LibraryService {
                    bool cache_available = false);
   void PushEvent(LibraryEvent, bool destructive_terminal = false);
   bool DestructiveRequest(std::uint64_t request) const;
+  // Waits up to `delay` before another fetch attempt, returning false the moment the job is
+  // superseded, cancelled or the service stops. A new Submit wakes it early.
+  bool WaitBeforeRetry(const Job&, std::chrono::milliseconds delay);
   std::uint64_t Now() const;
+  std::optional<std::vector<LibraryCollection>> SavedCollections(std::uint64_t account) const;
 
   steam::LibraryBackend& backend_;
   SessionRepository& sessions_;
   LibraryRepository* cache_;
   std::function<std::uint64_t()> unix_seconds_;
+  CollectionsRepository* collections_;
+  // PS4: a step trace for the library refresh, so a silent console run can be read back from the klog.
   std::function<void(const char*)> trace_;
   mutable std::mutex mutex_;
   std::condition_variable wake_;
@@ -106,6 +120,7 @@ class LibraryService {
   std::uint64_t completed_request_ = 0;
   std::uint64_t completed_account_ = 0;
   bool completed_cache_available_ = false;
+  std::optional<std::vector<LibraryCollection>> completed_collections_;
   std::thread worker_;
 };
 

@@ -9,29 +9,32 @@
 
 namespace playden::app {
 
-// features.txt in Playden's data folder (on PS4: /data/PLDN10001/features.txt); one feature per line, read at startup.
+// features.txt in Playden's data folder (/data/playden/features.txt on the console, which FTP and the file manager
+// can write): one feature name per line; blank lines and lines starting with # are skipped. Read once at startup.
 // A line can only turn a feature on: a feature on by default for the build stays on.
 inline constexpr const char* kExperimentalFeaturesFileName = "features.txt";
 // The longest file read; the rest is ignored.
 inline constexpr std::size_t kExperimentalFeaturesMaxBytes = 16384;
 
+// A line that names a retired feature (community-recipes, part of every build since 0.11.0-beta.4) is accepted and
+// ignored: it turns nothing on and is not reported as unknown.
 struct ExperimentalFeatures {
-  // Line community-recipes: community recipes, sharing, votes and the Playden account
-  // (docs/community-recipes.md). My presets is not part of it. Enabled in every build; the line is still accepted.
-  bool community_recipes = false;
-  // Enabled only with a valid `game-test-reports=https://...` endpoint in features.txt.
-  bool game_test_reports = false;
   // Line online-steam: Steam features = Online (Steam's client beside the game), Steam sign-in and Steam network
-  // (runtime::SetOnlineSteamEnabled). Off in every build unless the file names it.
+  // (runtime::SetOnlineSteamEnabled). On by default in every build since 0.12.0-beta.1; the line is still accepted.
   bool online_steam = false;
-  // Line import-games: show the local game import workflow. Off in stable builds; on in nightlies and local dev builds.
-  bool import_games = false;
-  // The `game-test-reports=https://host` line both enables reports and selects their API base.
-  // There is no default report endpoint.
+  // Line gog-store: GOG as a second store (sign-in, library, installs). On by default in every build since
+  // 0.12.0-beta.1; the line is still accepted. Going back to a build older than the first release that reads GOG
+  // records (Phase 1 of the GOG plan) breaks Play for every game until the GOG titles are removed: that build refuses
+  // the whole runtime install records file when one record names GOG.
+  bool gog_store = false;
+  // PS4: line game-test-reports=https://host both enables game test reports and selects their API base. There is no
+  // default endpoint, so a stable build without the line sends nothing.
+  bool game_test_reports = false;
   std::string game_test_reports_api;
 };
 
-// What a build has on before features.txt: community recipes are always on; all_on enables development-only features.
+// What a build has on before features.txt. Online and GOG are on in every build; all_on (nightlies and local dev
+// builds) is kept for the next experimental feature and turns nothing more on today.
 ExperimentalFeatures DefaultExperimentalFeatures(bool all_on);
 // defaults with the features text names turned on. unknown: each line that names no feature, as written.
 ExperimentalFeatures ParseExperimentalFeatures(std::string_view text, ExperimentalFeatures defaults = {},

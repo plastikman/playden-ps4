@@ -7,7 +7,10 @@
 
 namespace playden::runtime {
 
-// A relative folder inside drive_c/users/prospero, recorded from Steam Cloud metadata.
+// A folder of a game's Steam Cloud saves inside the bottle's Windows user folder (drive_c/users/prospero), as the
+// download's facts name it and the bottle gets it (SteamworksIdentity::save_folders, InstallService::AddProfileFolders):
+// a path relative to that folder with '/' separators, at most kMaxProfileSaveFolderDepth plain names (no ".", "..",
+// empty part, drive, wildcard, placeholder or control character) and kMaxProfileSaveFolderBytes in all.
 inline constexpr std::size_t kMaxProfileSaveFolders = 32;
 inline constexpr std::size_t kMaxProfileSaveFolderDepth = 16;
 inline constexpr std::size_t kMaxProfileSaveFolderBytes = 512;

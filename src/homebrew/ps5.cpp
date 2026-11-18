@@ -6,6 +6,7 @@
 #include "homebrew/simulation.hpp"
 #include "homebrew/store_art.hpp"
 #include "homebrew/controller.hpp"
+#include "homebrew/gog_wiring.hpp"
 #include "runtime/private_directories.h"
 #include "steam/install_volumes.h"
 #include "installs/game_move.h"
@@ -25,6 +26,7 @@
 #include "homebrew/sharing_service.hpp"
 #include "homebrew/title_icon.hpp"
 #include "platform/ps5/title_allow_list.h"
+#include "runtime/playden_removal.h"
 #include "platform/ps5/console_address.h"
 #include "platform/ps5/console_services.h"
 #include "platform/ps5/system_keyboard.h"
@@ -48,6 +50,7 @@
 #include "steam/backend/cm_app_details.h"
 #include "steam/backend/cm_friends_source.h"
 #include "steam/backend/download_server_source.h"
+#include "steam/backend/collections_client.h"
 #include "steam/backend/entitled_library.h"
 #include "steam/backend/steam_install_runner.h"
 #include "steam/backend/steam_cloud_runner.h"
@@ -55,6 +58,7 @@
 #include "steam/local_session_repository.h"
 #include "steam/secret.h"
 #include "library/cache.h"
+#include "library/recipe_exports.h"
 #include "platform/ps5/display_egl.hpp"
 #include "platform/ps5/pad.hpp"
 #include "platform/ps5/system.hpp"
@@ -241,6 +245,31 @@ void show_root_access_missing(hui::ps5::Display& display, const playden::ps5::Na
         pad.tick(1.0F / 60.0F);
     }
 }
+// Startup finished an Uninstall Playden that had stopped (NativeAccessResult::playden_removed): only its screen shows.
+void show_playden_removed(hui::ps5::Display& display, const playden::ps5::NativeAccessResult& access) {
+    hui::sys::log("Playden removal finished at startup complete=%d", access.playden_removal_complete ? 1 : 0);
+    sceUserServiceInitialize(nullptr);
+    playden::homebrew::Simulation simulation({}, {}, playden::homebrew::ModelMode::Live);
+    simulation.ShowPlaydenRemoved(access.playden_removal_complete, access.playden_removal_notes);
+    playden::homebrew::Render renderer(access.launcher_ready ? access.paths.assets_root : std::string("/app0/assets"));
+    hui::ps5::Pad pad;
+    pad.open();
+    hui::InputTracker tracker;
+    std::array<hui::PadSample, 64> samples{};
+    bool presented = false;
+    while (!simulation.state().quit_requested) {
+        const auto count = pad.read(samples);
+        dispatch(simulation, tracker.update(std::span<const hui::PadSample>(samples.data(), count),
+                                            hui::sys::monotonic_us()));
+        renderer.draw(simulation, display.width(), display.height(), 1.0F / 60.0F);
+        if (!display.swap()) break;
+        if (!presented) {
+            hui::sys::hide_splash_screen();
+            presented = true;
+        }
+        pad.tick(1.0F / 60.0F);
+    }
+}
 }  // namespace
 
 int main() {
@@ -258,6 +287,12 @@ int main() {
 #else
     const bool root_access_missing = !native_access.runtime_ready;
 #endif
+    if (native_access.playden_removed) {
+        show_playden_removed(display, native_access);
+        display.close();
+        hui::sys::quit();
+        return 0;
+    }
     if (root_access_missing) {
         show_root_access_missing(display, native_access);
         display.close();
@@ -280,12 +315,10 @@ int main() {
         const auto& features_root = paths.runtime_data_root.empty() ? user_root : paths.runtime_data_root;
         features = playden::app::ReadExperimentalFeatures(
             features_root + "/" + playden::app::kExperimentalFeaturesFileName, features, &unknown);
-        if (features.community_recipes)
-            playden::app::AppendLogLine(log_root, "launch.log", "experimental feature community-recipes on");
+        if (features.online_steam) playden::app::AppendLogLine(log_root, "launch.log", "experimental feature online-steam on");
+        if (features.gog_store) playden::app::AppendLogLine(log_root, "launch.log", "experimental feature gog-store on");
         if (features.game_test_reports)
             playden::app::AppendLogLine(log_root, "launch.log", "experimental feature game-test-reports on");
-        if (features.online_steam) playden::app::AppendLogLine(log_root, "launch.log", "experimental feature online-steam on");
-        if (features.import_games) playden::app::AppendLogLine(log_root, "launch.log", "experimental feature import-games on");
         for (const auto& name : unknown)
             playden::app::AppendLogLine(log_root, "launch.log", "experimental feature unknown: " + name.substr(0, 64));
     }
@@ -308,9 +341,7 @@ int main() {
         playden::homebrew::Simulation simulation({}, {}, playden::homebrew::ModelMode::Live);
 #endif
 #if !PLAYDEN_UI_SIMULATION
-        simulation.SetCommunityRecipesEnabled(features.community_recipes);
         simulation.SetGameTestReportsEnabled(features.game_test_reports);
-        simulation.SetImportGamesEnabled(features.import_games);
 #endif
         {
             std::vector<playden::runtime::SettingsPreset> presets;
@@ -416,8 +447,17 @@ int main() {
         library_backend.SetFamilyDiagnostics(paths.trust_store, [](const std::string& line) {
             playden::app::AppendLogLine(log_root, "steam-cm.log", line);
         });
+        // Steam collections (#536), read with each library load; one log line per read, without names.
+        library_backend.SetCollectionsSource([&cm_client](const playden::StoredSession& session,
+                                                          const std::atomic<bool>& cancel) {
+            return playden::steam::FetchLibraryCollections(cm_client, session, cancel, [](const std::string& line) {
+                playden::app::AppendLogLine(log_root, "steam-cm.log", line);
+            });
+        });
         playden::LibraryCache library_cache(library_storage);
-        playden::LibraryService library_service(library_backend,library_sessions,&library_cache);
+        playden::CollectionsCache collections_cache(library_storage);
+        playden::LibraryService library_service(library_backend,library_sessions,&library_cache,
+                                                std::function<std::uint64_t()>{},&collections_cache);
         playden::PreferencesStore preferences(library_storage);
         bool saved_steam_invisible = false;
         bool saved_steam_online_notice = true;
@@ -438,9 +478,12 @@ int main() {
             content_language = saved.content_language;
         }
         playden::OrganizationStore organization(library_storage);
-        // Each Steam account's last update check, next to its library cache.
+        // Each store account's last update check, next to its library cache: Steam's by account number, GOG's by
+        // its account key (read and written only once GOG signs in).
         playden::UpdateCheckStore update_checks(library_storage);
+        playden::UpdateCheckStore gog_update_checks(library_storage,"updates-gog-");
         playden::app::PersistenceService persistence(preferences,organization,&update_checks);
+        persistence.SetUpdateChecks(playden::Store::kGog,&gog_update_checks);
         playden::steam::CmClient details_cm(paths.trust_store, library_storage);
         details_cm.SetOwner("details");
         details_cm.SetSharedSession(steam_cm);
@@ -555,8 +598,12 @@ int main() {
                                     "self-update: Playden " + playden::update::CurrentVersion().ToString() + " started");
         self_update.Start();
         self_update.Check(false);
-        // "Export as recipe" writes next to the logs, which are read over FTP already.
-        simulation.SetRecipeExportTarget(log_root, playden::ps5::ConsoleFirmwareVersion().value_or(""));
+        // "Export as file" writes into its own folder beside the logs (/data/playden/exported-recipes), readable over
+        // FTP but never in a log report. Older versions wrote into the logs folder: those move once.
+        const auto exported_recipes = std::filesystem::path(log_root).parent_path() / playden::kExportedRecipesFolder;
+        for (const auto& line : playden::MoveLogsFolderRecipes(log_root, exported_recipes))
+            playden::app::AppendLogLine(log_root, "launch.log", line);
+        simulation.SetRecipeExportTarget(exported_recipes, playden::ps5::ConsoleFirmwareVersion().value_or(""));
         // Community recipes, kept by content in the user data (community/recipe_store.h). The runtime
         // reads the objects games use through a second store on the same folder; the service that
         // fetches them starts once the runtime is up (after the root grant and the settings storage).
@@ -695,13 +742,17 @@ int main() {
                 return presets;
             };
             config.log = [](const std::string& line) { playden::app::AppendLogLine(log_root, "runtime.log", line); };
-            // Off (features.txt): only a cache already there is read; its folders are not made.
-            config.community_recipe_bytes = playden::homebrew::CommunityRecipeBytes(community_objects, features.community_recipes);
+            config.community_recipe_bytes = playden::homebrew::CommunityRecipeBytes(community_objects);
             config.title_log = [](const std::string& title, const std::string& text) {
+                // Copied after the first frame (RuntimeHost::CopyTitleLogs), while a report may read the folder: written
+                // beside its name and moved over it, so a reader sees the old copy or the new one. The partial file's
+                // name is no title's log or extra (logs_source.cpp, collect_logs.py).
                 const auto path = log_root + "/title-" + title + ".log";
-                if (FILE* file = std::fopen(path.c_str(), "wb")) {
-                    std::fwrite(text.data(), 1, text.size(), file);
-                    std::fclose(file);
+                const auto partial = log_root + "/title-copy-" + title + ".log";
+                if (FILE* file = std::fopen(partial.c_str(), "wb")) {
+                    const bool written = std::fwrite(text.data(), 1, text.size(), file) == text.size();
+                    if (std::fclose(file) == 0 && written) std::rename(partial.c_str(), path.c_str());
+                    else std::remove(partial.c_str());
                 }
             };
             // The game's PS5 title icon, from its Steam cover; without one, the game's own icon
@@ -899,14 +950,12 @@ int main() {
             hui::sys::quit();
             return 0;
         }
-        // Community recipes and sharing (features.txt): off, neither service exists, nothing is fetched or sent and
-        // community.log stays untouched; the runtime and the model read the recipes games already use from the cache.
-        // Each HTTP client is declared first: its service uses it until it stops.
+        // Community recipes and sharing. Each HTTP client is declared first: its service uses it until it stops.
         std::optional<playden::steam::HttpClient> community_http;
         std::unique_ptr<playden::community::CommunityRecipeService> community;
         std::optional<playden::steam::HttpClient> sharing_http;
         std::unique_ptr<playden::homebrew::SharingService> sharing;
-        if (features.community_recipes) {
+        {
             community_http.emplace(paths.trust_store);
             playden::community::RecipeServiceConfig community_config;
             community_config.store_root = community_root;
@@ -972,7 +1021,7 @@ int main() {
         std::unique_ptr<playden::stores::local::LocalCopyRunner> copy_runner;
         if (!paths.runtime_data_root.empty()) {
             import_storage = std::make_unique<playden::Storage>(
-                (std::filesystem::path(paths.runtime_data_root) / "runtime-state").string());
+                playden::Storage((std::filesystem::path(paths.runtime_data_root) / "runtime-state").string()).OpenTree());
             imports = std::make_unique<playden::stores::local::ImportStore>(*import_storage);
             // "Copy into Playden": imported games become managed installs.
             playden::stores::local::LocalCopyOptions copy_options;
@@ -1041,10 +1090,47 @@ int main() {
             return answer;
         };
         playden::installs::GameMover game_mover(std::move(move_options));
+        // GOG, with the gog-store line (after the /data grant, as Steam's session): declared before the install
+        // service, which runs its install runner, and before the registry, which owns its account and library
+        // source. Off, nothing is made; a GOG session left from an earlier run still goes when "Stay signed in" is
+        // off.
+        playden::homebrew::GogWiringConfig gog_config;
+        gog_config.enabled = features.gog_store;
+        gog_config.stay_signed_in = stay_signed_in;
+        gog_config.user_root = user_root;
+        gog_config.ca_bundle = paths.trust_store;
+        gog_config.log_directory = log_root;
+        gog_config.install_log_directory = log_root;
+        gog_config.library_storage = &library_storage;
+        gog_config.content_language = [] { return selected_content_language(); };
+        // Installed GOG games' records and folders, for their updates, as Steam's details source has them. The
+        // install service is made below (it runs GOG's install runner), so they reach it through this pointer, set
+        // once it is made; the controller's Shutdown joins the details worker before the install service stops.
+        playden::steam::InstallService* gog_installs = nullptr;
+        gog_config.installed_record = [&gog_installs](const playden::GameId& id) -> std::optional<playden::installs::InstalledRecord> {
+            if (!gog_installs) return std::nullopt;
+            const auto snapshot = gog_installs->Snapshot();
+            for (const auto& game : snapshot.installed)
+                if (game.id == id && game.available) return game.record;
+            return std::nullopt;
+        };
+        gog_config.install_root = [&gog_installs](const playden::GameId& id) -> std::optional<std::string> {
+            if (!gog_installs) return std::nullopt;
+            const auto snapshot = gog_installs->Snapshot();
+            for (const auto& game : snapshot.installed)
+                if (game.id == id && game.available) return game.root;
+            return std::nullopt;
+        };
+        const auto gog = playden::homebrew::MakeGogServices(std::move(gog_config));
+        // Without the GOG store there are no GOG tags: a saved GOG tag view falls back at once instead of waiting.
+        if (!gog) simulation.UpdateStoreCollections(playden::Store::kGog, {});
         playden::installs::InstallService::Runners install_runners{{playden::Store::kSteam, &install_runner}};
         if (copy_runner) install_runners[playden::Store::kLocal] = copy_runner.get();
+        if (gog) install_runners[playden::Store::kGog] = gog->install_runner();
         playden::steam::InstallService installs(std::move(install_runners), std::move(install_volumes));
+        gog_installs = &installs;
         installs.SetMoveRunner(&game_mover);
+        installs.SetLog([](const std::string& line) { playden::app::AppendLogLine(log_root, "install.log", line); });
         // Installed games' records, for their updates. Set before the controller asks for details; its
         // Shutdown joins the details worker before the install service stops.
         details_source.SetInstalled([&installs](std::uint32_t app) -> std::optional<playden::installs::InstalledRecord> {
@@ -1105,6 +1191,7 @@ int main() {
         stores.Add(std::make_unique<playden::stores::SteamAccount>(auth, sessions, auth_log));
         stores.Add(std::make_unique<playden::stores::SteamLibrarySource>(library_service));
         stores.Add(std::make_unique<playden::stores::SteamDetailsSource>(app_details));
+        if (gog) gog->Register(stores, simulation);
         // Imported games: imports.json next to installs.json in the runtime state folder; their
         // folders in /data/playden-import and playden/import on each drive (a drive counts while mounted).
         playden::stores::local::LocalLibrarySource* local_library = nullptr;
@@ -1128,7 +1215,7 @@ int main() {
             };
             import_config.remove_copy_folder = [runner = copy_runner.get()](const std::string& root) { return runner->Remove(root).empty(); };
             import_config.game_program = [](const std::string& folder, const std::string& program) {
-                return playden::runtime::UnrealGameProgram(folder, program);
+                return playden::runtime::GameProgramInstead(folder, program);
             };
             auto source = std::make_unique<playden::stores::local::LocalLibrarySource>(*imports, std::move(import_config));
             local_library = source.get();
@@ -1171,18 +1258,35 @@ int main() {
         };
         for (const auto& private_path : playden::runtime::PrivateProfilePaths())
             web_config.files.private_profile_paths.push_back(private_path.generic_string());
+        // Browsers paired with "Remember this browser": hashes of their tokens in user data, kept across restarts.
+        web_config.files.pairing.store_root = user_root + "/web-access";
+        // A game's page offers its exported recipe for download.
+        web_config.files.exported_recipes = (std::filesystem::path(log_root).parent_path() / playden::kExportedRecipesFolder).string();
+        // Recipe files from a paired browser: kept through the community service.
+        auto recipe_imports = std::make_shared<playden::homebrew::WebRecipeImports>();
+        recipe_imports->SetKeeper([service = community.get()](const std::string& bytes, std::string* error) {
+            return service->KeepObject(bytes, error);
+        }, community_keep);
+        recipe_imports->SetFeatureCheck([online_steam = features.online_steam](const std::string& feature) {
+            return feature == "online-steam" && online_steam;
+        });
+        web_config.files.import_recipe = [recipe_imports](const std::string& game, std::string file) {
+            return recipe_imports->Import(game, std::move(file));
+        };
+        if (gog) gog->ConfigureWeb(web_config);
         playden::web::Service web(std::move(web_config));
         playden::homebrew::Controller services(simulation, stores, &persistence, &installs, &cloud, runtime_host.get(), auth_log);
         services.SetDownloadServers(&servers);
         services.SetFriends(friends.get());
+        if (gog) gog->Attach(services);
         if (!web_probe_on) services.SetWebAccess(&web);
+        services.SetRecipeImports(recipe_imports);
         services.SetLocalLibrary(local_library);
         playden::steam::StoreDetailsService store_details(playden::homebrew::StoreFetch(paths.trust_store));
         services.SetStoreDetails(&store_details);
         services.SetSelfUpdate(&self_update);
         // Without a runtime here the installed games' recipes are unknown: nothing is collected.
-        if (community) services.SetCommunityRecipes(community.get(), community_keep, /*no_runtime_installs=*/false);
-        else services.SetCommunityRecipeCache(std::make_shared<playden::community::RecipeStore>(community_root));
+        services.SetCommunityRecipes(community.get(), community_keep, /*no_runtime_installs=*/false);
         services.SetSharing(sharing.get());
         // A game bought or added to the library elsewhere: Steam pushes the new license list.
         services.SetLicenseChanges([steam_cm] { return playden::steam::CmLicenseChanges(*steam_cm); });
@@ -1195,10 +1299,12 @@ int main() {
                 playden::steam::SetCmPersonaState(*steam_cm, invisible ? playden::steam::cm::kPersonaStateInvisible
                                                                        : playden::steam::cm::kPersonaStateOnline);
         });
-        services.SetStaySignedIn([&sessions](bool stay) {
+        // One setting for both stores.
+        services.SetStaySignedIn([&sessions, gog_services = gog.get()](bool stay) {
             const auto moved = sessions.SetPersist(stay);
             playden::app::AppendLogLine(log_root, "auth.log", std::string("stay signed in ") + (stay ? "on" : "off") +
                                                                   " moved=" + (moved.ok() ? "1" : "0"));
+            if (gog_services) gog_services->SetStaySignedIn(stay);
         });
 #endif
 #if PLAYDEN_UI_SIMULATION
@@ -1422,14 +1528,10 @@ int main() {
         if (copy_runner) copy_runner->SetChanged({});
         playden::app::AppendLogLine(log_root, "launch.log", "shutdown artwork start");
         artwork.Shutdown();
-        if (community) {
-            playden::app::AppendLogLine(log_root, "launch.log", "shutdown community recipes start");
-            community->Shutdown();
-        }
-        if (sharing) {
-            playden::app::AppendLogLine(log_root, "launch.log", "shutdown sharing start");
-            sharing->Shutdown();
-        }
+        playden::app::AppendLogLine(log_root, "launch.log", "shutdown community recipes start");
+        community->Shutdown();
+        playden::app::AppendLogLine(log_root, "launch.log", "shutdown sharing start");
+        sharing->Shutdown();
         playden::app::AppendLogLine(log_root, "launch.log", "shutdown self-update start");
         self_update.Shutdown();
         playden::app::AppendLogLine(log_root, "launch.log", "shutdown done");
@@ -1453,6 +1555,12 @@ int main() {
             playden::app::AppendLogLine(log_root, "update.log", std::string("self-update: quit ") +
                                                                     (swapped ? "with the new files in place" : "without changing the app"));
         }
+        // Uninstall Playden finished this run: what the services wrote while stopping (logs, preferences) goes
+        // too. Kept saves stay (a removal that deleted them left none to keep).
+        if (simulation.state().playden_removed && simulation.state().playden_removed_complete)
+            (void)playden::runtime::RemovePlaydenFiles(
+                playden::runtime::ConsoleRemovalPaths(), true,
+                [](const std::function<bool()>& work) { return playden::ps5::WithRoot(work); }, {});
 #endif
     }
     display.close();

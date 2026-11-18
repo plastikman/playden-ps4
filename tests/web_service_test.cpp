@@ -93,7 +93,7 @@ int main() {
   config.now = [] { return std::int64_t{1791601941}; };
   Service service(config);
   CHECK(service.Snapshot().state == ServiceSnapshot::State::kOff);
-  service.SetAccount({"Bob", 76561198000000002ull});
+  service.SetAccount({{{"steam", "Bob", "76561198000000002"}}});
   service.SetEnabled(true);
   const auto on = WaitFor(service, ServiceSnapshot::State::kOn);
   CHECK(on.port != 0 && on.error.empty());
@@ -104,6 +104,7 @@ int main() {
   auto answer = Get(on.port, "GET /");
   CHECK(answer.rfind("HTTP/1.1 200 OK\r\n", 0) == 0 && answer.find("Content-Type: text/html; charset=utf-8\r\n") != std::string::npos);
   CHECK(Body(answer).find("Download report (.zip)") != std::string::npos);
+  CHECK(Body(answer).find("Playden doesn't know where GOG games save.") != std::string::npos);  // the Files tab knows GOG
   CHECK(Body(answer).find("https://") == std::string::npos);  // works with no internet
   answer = Get(on.port, "GET /assets/barlow-regular.ttf");
   CHECK(answer.find("Content-Type: font/ttf\r\n") != std::string::npos && Body(answer).size() == 104068);

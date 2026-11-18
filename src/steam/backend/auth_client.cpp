@@ -188,7 +188,9 @@ AuthResult AuthClient::AuthenticateQr(const std::atomic<bool>& cancel,
     return Failure(AuthError::kProtocol);
   const auto started = hooks_.monotonic_ms();
   auth::BeginAuthSessionViaQrRequest begin;
-  begin.device_details.device_friendly_name = "Playden (" PLAYDEN_CONSOLE_NAME ")";
+  // Upstream's injectable device name, defaulting to the console this build runs on rather than a hardcoded PS5.
+  begin.device_details.device_friendly_name =
+      hooks_.device_name.empty() ? "Playden (" PLAYDEN_CONSOLE_NAME ")" : hooks_.device_name;
   if (hooks_.machine_id) begin.device_details.machine_id = hooks_.machine_id();
   std::vector<std::uint8_t> request, response;
   if (!auth::Encode(begin, &request).ok()) return Failure(AuthError::kProtocol);
@@ -290,7 +292,9 @@ AuthResult AuthClient::AuthenticateCredentials(Credentials& credentials, const s
   auth::GetPasswordRsaPublicKeyResponse key;
   if (!auth::Decode(response, &key).ok() || !key.timestamp) return Failure(AuthError::kProtocol);
   auth::BeginAuthSessionViaCredentialsRequest begin;
-  begin.device_details.device_friendly_name = "Playden (" PLAYDEN_CONSOLE_NAME ")";
+  // Upstream's injectable device name, defaulting to the console this build runs on rather than a hardcoded PS5.
+  begin.device_details.device_friendly_name =
+      hooks_.device_name.empty() ? "Playden (" PLAYDEN_CONSOLE_NAME ")" : hooks_.device_name;
   if (hooks_.machine_id) begin.device_details.machine_id = hooks_.machine_id();
   begin.account_name = credentials.account_name;
   begin.encryption_timestamp = key.timestamp;

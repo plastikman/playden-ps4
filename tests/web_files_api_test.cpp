@@ -70,6 +70,10 @@ std::string Encode(const std::string& text) {
 }  // namespace
 
 int main() {
+  // The page names each store by the kind: GOG games are "gog", games the player added "imported".
+  CHECK(std::string(FileGameKind(playden::Store::kSteam)) == "steam");
+  CHECK(std::string(FileGameKind(playden::Store::kGog)) == "gog");
+  CHECK(std::string(FileGameKind(playden::Store::kLocal)) == "imported");
   const auto base = fs::canonical(fs::temp_directory_path()) / ("playden-web-api-" + std::to_string(::getpid()));
   fs::remove_all(base);
   const auto bottle = base / "games/steam-12210/library/prefixes/game";
@@ -90,7 +94,21 @@ int main() {
   config.server.poll_interval_ms = 20;
   config.server.body_timeout_ms = 500;
   config.files.private_profile_paths = {"AppData/Local/Launcher"};
+  // Recipe files: what reached the controller's side, and its answer.
+  std::vector<std::pair<std::string, std::string>> recipes;
+  config.files.import_recipe = [&recipes](const std::string& game, std::string file) -> RecipeImportAnswer {
+    recipes.emplace_back(game, file);
+    if (file == "bad") return {422, "This file isn't a Playden recipe."};
+    return {200, "Darkwood now uses this recipe.", "steam-274520"};
+  };
   fs::create_directories(base / "logs");
+  // Exported recipes, in their own folder beside the logs: Darkwood has one, after a rename.
+  config.files.exported_recipes = (base / "exported-recipes").string();
+  Put(base / "exported-recipes/recipe-darkwood-steam-274520.json", "{\"recipe_id\": \"community-steam-274520\"}\n");
+  Put(base / "exported-recipes/recipe-other-steam-2745200.json", "other");
+  // Browsers paired with "Remember this browser" are kept here, as user data's web-access folder on the console.
+  config.files.pairing.store_root = (base / "web-access").string();
+  const auto restart_config = config;
   Service service(std::move(config));
   FileCatalog catalog;
   catalog.known = true;
@@ -147,13 +165,16 @@ int main() {
   // Unpaired: nothing about a game, nothing changes.
   CHECK(Body(get("/api/pair/status")).find("\"paired\":false") != std::string::npos);
   for (const std::string& target : std::vector<std::string>{"/api/files/games", "/api/files/game?game=steam-12210", "/api/files/list?" + game + "user", "/api/files/download?" + game + "game&path=game.exe",
-                                   "/api/files/zip?" + game + "game", "/api/files/text?" + game + "game&path=game.exe"})
+                                   "/api/files/zip?" + game + "game", "/api/files/text?" + game + "game&path=game.exe",
+                                   "/api/files/recipe/export?game=steam-274520"})
     CHECK(Status(get(target)) == 401);
-  for (const std::string& target : std::vector<std::string>{"/api/files/upload?" + game + "game&path=x", "/api/files/mkdir?" + game + "game&path=x", "/api/files/delete?" + game + "game&path=game.exe", "/api/files/restore?" + game + "game&path=x"}) {
+  for (const std::string& target : std::vector<std::string>{"/api/files/upload?" + game + "game&path=x", "/api/files/mkdir?" + game + "game&path=x", "/api/files/delete?" + game + "game&path=game.exe", "/api/files/restore?" + game + "game&path=x", "/api/files/recipe?game=steam-12210",
+                                   "/api/files/move?" + game + "game&path=game.exe&name=moved.exe"}) {
     CHECK(Status(post(target, "", "data")) == 401);
     CHECK(Status(post(target, "playden_files=0123456789", "data")) == 401);
   }
   CHECK(fs::exists(game_folder / "game.exe") && !fs::exists(game_folder / "x"));
+  CHECK(recipes.empty());
 
   // Pairing needs the header, a code the TV shows, and answers with a cookie the page's scripts can't read.
   CHECK(Status(post("/api/pair/start", "", "", "")) == 403);
@@ -170,8 +191,14 @@ int main() {
   CHECK(cookie_start != std::string::npos);
   const auto cookie_line = paired.substr(cookie_start, paired.find("\r\n", cookie_start) - cookie_start);
   CHECK(cookie_line.find("HttpOnly") != std::string::npos && cookie_line.find("SameSite=Strict") != std::string::npos);
+  // Not remembered (no remember=1): a session cookie, and a status that doesn't set it again.
+  CHECK(cookie_line.find("Max-Age") == std::string::npos);
+  CHECK(Body(paired).find("\"remembered\":false") != std::string::npos);
   const auto cookie = cookie_line.substr(12, cookie_line.find(';') - 12);
-  CHECK(Body(get("/api/pair/status", cookie)).find("\"paired\":true") != std::string::npos);
+  const auto status = get("/api/pair/status", cookie);
+  CHECK(Body(status).find("\"paired\":true") != std::string::npos && Body(status).find("\"remembered\":false") != std::string::npos);
+  CHECK(status.find("Set-Cookie") == std::string::npos);
+  CHECK(service.Snapshot().paired_browsers == 1);
   // Among other cookies, too.
   CHECK(Status(get("/api/files/games", "a=b; " + cookie + "; c=d")) == 200);
 
@@ -195,6 +222,15 @@ int main() {
   answer = get("/api/files/list?game=local-gone&root=game", cookie);
   CHECK(Status(answer) == 404 && Body(answer).find("Connect this game's drive") != std::string::npos);
   CHECK(Body(get("/api/files/game?game=local-gone", cookie)).find("\"id\":\"game\"") == std::string::npos);
+  // The game's exported recipe: named on its page, downloaded by the game's id alone.
+  CHECK(Body(get("/api/files/game?game=steam-274520", cookie)).find("\"exported_recipe\":\"recipe-darkwood-steam-274520.json\"") != std::string::npos);
+  CHECK(Body(get("/api/files/game?game=steam-12210", cookie)).find("\"exported_recipe\":\"\"") != std::string::npos);
+  answer = get("/api/files/recipe/export?game=steam-274520", cookie);
+  CHECK(Status(answer) == 200 && Body(answer) == "{\"recipe_id\": \"community-steam-274520\"}\n");
+  CHECK(answer.find("Content-Disposition: attachment; filename*=UTF-8''recipe-darkwood-steam-274520.json") != std::string::npos);
+  answer = get("/api/files/recipe/export?game=steam-12210", cookie);
+  CHECK(Status(answer) == 404 && Body(answer).find("no exported recipe") != std::string::npos);
+  CHECK(Status(get("/api/files/recipe/export?game=nope", cookie)) == 404);
 
   // Lists and paths.
   body = Body(get("/api/files/list?" + game + "user&path=" + Encode("Documents/Rockstar Games/GTA IV/Profiles/ABC"), cookie));
@@ -262,6 +298,30 @@ int main() {
   }
   CHECK(Status(post("/api/files/delete?" + game + "game&path=_Redist2", cookie)) == 200 && !fs::exists(game_folder / "_Redist2"));
   CHECK(Status(post("/api/files/delete?" + game + "user&path=Documents/new.sav", cookie)) == 200 && !fs::exists(profile / "Documents/new.sav"));
+  // Move and rename: in one root, across roots of the same game, and what a name already there answers.
+  {
+    Put(profile / "Documents/move/a.sav", "a");
+    Put(profile / "Documents/b.sav", "b");
+    CHECK(Status(post("/api/files/move?" + game + "user&path=Documents/b.sav&name=c.sav", cookie, "", "")) == 403 && fs::exists(profile / "Documents/b.sav"));
+    answer = post("/api/files/move?" + game + "user&path=Documents/b.sav&name=c.sav", cookie);
+    CHECK(Status(answer) == 200 && Body(answer).find("\"name\":\"c.sav\"") != std::string::npos && Text(profile / "Documents/c.sav") == "b");
+    answer = post("/api/files/move?" + game + "user&path=Documents/c.sav&to=Documents/move&name=a.sav", cookie);
+    CHECK(Status(answer) == 409 && Body(answer).find("\"clash\":true") != std::string::npos && Body(answer).find("\"folder\":false") != std::string::npos);
+    answer = post("/api/files/move?" + game + "user&path=Documents/c.sav&to=Documents/move&name=a.sav&clash=keep", cookie);
+    CHECK(Status(answer) == 200 && Body(answer).find("\"name\":\"a (2).sav\"") != std::string::npos && Text(profile / "Documents/move/a (2).sav") == "b");
+    // To the game folder, on another root: copied, then gone from the bottle.
+    answer = post("/api/files/move?" + game + "user&path=Documents/move&to_root=game&to=" + Encode("_Redist"), cookie);
+    CHECK(Status(answer) == 200 && Body(answer).find("\"files\":2") != std::string::npos);
+    CHECK(Text(game_folder / "_Redist/move/a.sav") == "a" && !fs::exists(profile / "Documents/move"));
+    CHECK(Status(post("/api/files/move?" + game + "game&path=_Redist/move&to_root=nope", cookie)) == 404);
+    CHECK(Status(post("/api/files/move?" + game + "game&path=_Redist/move&to_root=user&to=" + Encode("AppData/Local/Launcher"), cookie)) == 404);
+    CHECK(Status(post("/api/files/move?" + game + "game&path=_Redist/move&to=steam_settings", cookie)) == 403);
+    CHECK(Status(post("/api/files/move?" + game + "game&path=steam_settings&name=x", cookie)) == 403);
+    CHECK(Status(post("/api/files/move?" + game + "game&path=.playden-install.json&name=x", cookie)) == 404);
+    CHECK(Status(post("/api/files/move?game=steam-274520&root=user&path=Documents&to_root=game", cookie)) == 404);
+    CHECK(Status(post("/api/files/move?" + game + "game&path=_Redist/move&to_root=programdata&to=", cookie)) == 200);
+    CHECK(Text(bottle / "drive_c/ProgramData/move/a (2).sav") == "b" && !fs::exists(game_folder / "_Redist/move"));
+  }
   // A POST from another origin never reaches these.
   CHECK(Status(post("/api/files/mkdir?" + game + "game&path=evil", cookie, "", "X-Playden-Action: files\r\nOrigin: http://evil.example\r\n")) == 403);
   CHECK(!fs::exists(game_folder / "evil"));
@@ -310,6 +370,31 @@ int main() {
     CHECK(Status(get("/api/files/download?" + game + "game&path=game.exe", cookie)) == 200);
   }
 
+  // A recipe file for a game: the header, a known game, at most 16 KB; the controller's answer comes back.
+  {
+    CHECK(Status(post("/api/files/recipe?game=steam-274520", cookie, "{}", "")) == 403);
+    CHECK(Status(post("/api/files/recipe?game=nope", cookie, "{}")) == 404);
+    CHECK(Status(post("/api/files/recipe?game=steam-274520", cookie, std::string(kMaxRecipeUploadBytes + 1, ' '))) == 413);
+    CHECK(Status(Exchange(port, "POST /api/files/recipe?game=steam-274520 HTTP/1.1\r\n" + host + "X-Playden-Action: files\r\nCookie: " + cookie + "\r\n\r\n")) == 411);
+    CHECK(recipes.empty());
+    answer = post("/api/files/recipe?game=steam-274520", cookie, "{\"recipe_id\":\"x\"}");
+    CHECK(Status(answer) == 200 && Body(answer) == "{\"message\":\"Darkwood now uses this recipe.\",\"game\":\"steam-274520\"}");
+    CHECK(recipes.size() == 1 && recipes[0].first == "steam-274520" && recipes[0].second == "{\"recipe_id\":\"x\"}");
+    answer = post("/api/files/recipe?game=steam-274520", cookie, "bad");
+    CHECK(Status(answer) == 422 && Body(answer).find("isn't a Playden recipe") != std::string::npos);
+    // While Playden sets this game up, its recipe waits.
+    auto during = catalog;
+    for (auto& entry : during.games) entry.setting_up = entry.id == "steam-274520";
+    service.SetFileCatalog(during);
+    CHECK(Status(post("/api/files/recipe?game=steam-274520", cookie, "{}")) == 409);
+    service.SetFileCatalog(catalog);
+    CHECK(recipes.size() == 2);
+    // From the games list, no game named: the controller finds the game the recipe is for.
+    answer = post("/api/files/recipe", cookie, "{}");
+    CHECK(Status(answer) == 200 && Body(answer).find("\"game\":\"steam-274520\"") != std::string::npos);
+    CHECK(recipes.size() == 3 && recipes[2].first.empty());
+  }
+
   // A game's setup: file actions say so at once, and the game's page still opens without touching the disk.
   {
     auto during = catalog;
@@ -325,7 +410,59 @@ int main() {
     CHECK(Status(get("/api/files/list?" + game + "user", cookie)) == 200);
   }
 
+  // Remember this browser: a cookie that outlasts the browser session, kept by Playden across a restart.
+  std::string remembered;
+  {
+    CHECK(Status(post("/api/pair/start?new=1", "")) == 200);
+    answer = post("/api/pair/confirm?code=" + service.Snapshot().pairing_code + "&remember=1", "");
+    CHECK(Status(answer) == 200 && Body(answer).find("\"remembered\":true") != std::string::npos);
+    const auto start = answer.find("Set-Cookie: ");
+    const auto line = answer.substr(start, answer.find("\r\n", start) - start);
+    CHECK(line.find("HttpOnly") != std::string::npos && line.find("SameSite=Strict") != std::string::npos);
+    CHECK(line.find("; Max-Age=7776000") != std::string::npos);
+    remembered = line.substr(12, line.find(';') - 12);
+    CHECK(service.Snapshot().paired_browsers == 2);
+    // Each visit sets the cookie again, so the browser's 90 days start over with Playden's.
+    answer = get("/api/pair/status", remembered);
+    CHECK(Body(answer).find("\"remembered\":true") != std::string::npos);
+    CHECK(answer.find("Set-Cookie: " + remembered + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=7776000") != std::string::npos);
+    CHECK(Status(get("/api/files/games", remembered)) == 200);
+  }
   service.Shutdown();
+  {
+    // A restart: the remembered browser is still paired once the file is read; the session one isn't.
+    Service restarted(restart_config);
+    bool back = false;
+    for (int i = 0; i < 200 && !back; ++i) {
+      back = restarted.Snapshot().paired_browsers == 1;
+      if (!back) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(back);
+    restarted.SetEnabled(true);
+    ServiceSnapshot again;
+    for (int i = 0; i < 200 && again.state != ServiceSnapshot::State::kOn; ++i) {
+      again = restarted.Snapshot();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const std::string restarted_host = "Host: 127.0.0.1:" + std::to_string(again.port) + "\r\n";
+    const auto status_of = [&](const std::string& value) {
+      return Body(Exchange(again.port, "GET /api/pair/status HTTP/1.1\r\n" + restarted_host + "Cookie: " + value + "\r\n\r\n"));
+    };
+    CHECK(status_of(remembered).find("\"paired\":true") != std::string::npos);
+    CHECK(status_of(cookie).find("\"paired\":false") != std::string::npos);
+    // Turning web access off doesn't forget it; Forget all does, in the file too.
+    restarted.SetEnabled(false);
+    for (int i = 0; i < 200 && restarted.Snapshot().state != ServiceSnapshot::State::kOff; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(restarted.Snapshot().paired_browsers == 1);
+    restarted.ForgetBrowsers();
+    CHECK(restarted.Snapshot().paired_browsers == 0);
+    restarted.Shutdown();
+    Service forgotten(restart_config);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(forgotten.Snapshot().paired_browsers == 0);
+    forgotten.Shutdown();
+  }
   fs::remove_all(base);
   std::puts("web_files_api: ok");
 }

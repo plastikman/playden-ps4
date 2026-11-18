@@ -3004,6 +3004,7 @@ bool SteamQrAuth::start_auth(bool cached_only)
         library_service_ = std::make_unique<playden::LibraryService>(
             *entitled_library_, *repository_, library_cache_.get(),
             std::function<std::uint64_t()>{},
+            /*collections=*/nullptr,
             [](const char *step) { LogNetworkLine(std::string("library worker step=") + step); });
     }
     {

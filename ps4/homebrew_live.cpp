@@ -24,7 +24,9 @@
 #include "runtime/game_probe.h"
 #include "runtime/game_settings.h"
 #include "runtime/artifact_hash.h"
+#include "platform/ps5/title_allow_list.h"
 #include "runtime/private_directories.h"
+#include "web/service.h"
 #include "runtime/settings_storage.h"
 #include "runtime/steamworks.h"
 #include "runtime/title_root.h"
@@ -287,11 +289,49 @@ void probe_bottle_chain()
     }
 }
 
+// The web page's Playden and Package cards read these two files from the title's data root
+// (src/web/logs_source.cpp Facts). Nothing on the PS4 wrote them, so both cards stayed empty.
+// Written at every start so they follow the package actually running.
+void write_web_status_files(const std::filesystem::path &data)
+{
+    const auto put = [&data](const char *name, const std::string &text) {
+        if (text.empty()) return;
+        const auto path = (data / name).string();
+        FILE *file = std::fopen(path.c_str(), "w");
+        if (!file) return;
+        std::fwrite(text.data(), 1, text.size(), file);
+        std::fputc('\n', file);
+        std::fclose(file);
+    };
+    put("playden-version", PLAYDEN_VERSION);
+    // The package's own version, as the build wrote it into the bundled runtime manifest
+    // (scripts/build-ps4-runtime.sh): "version=03.36" -> "PLDN10001 03.36". Facts shows the last
+    // word, shortened to 12 characters.
+    std::string identity;
+    if (FILE *manifest = std::fopen("/app0/runtime-manifest.txt", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), manifest))
+            if (std::strncmp(line, "version=", 8) == 0) {
+                std::string value(line + 8);
+                while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) value.pop_back();
+                if (!value.empty()) identity = "PLDN10001 " + value;
+                break;
+            }
+        std::fclose(manifest);
+    }
+    put("playden-package.identity", identity);
+}
+
 void probe_directory_identity()
 {
     const uid_t uid = ::geteuid();
     log_line("identity probe: euid=" + std::to_string(uid) + " egid=" + std::to_string(::getegid()));
-    for (const char *path : {"/", "/data", "/data/PLDN10001", "/data/PLDN10001/games", "/data/PLDN10001/logs"}) {
+    // /mnt and /mnt/usb0: GoldHEN's FTP server reaches an attached drive, but the importer's
+    // lstat of /mnt/usb0 failed from inside the title (mode=- in install.log, 2026-11-18), so the
+    // drive may be outside this title's view entirely. ENOENT says the path is not in our
+    // namespace; EACCES says it is there and closed to us. The two want different answers.
+    for (const char *path : {"/", "/mnt", "/mnt/usb0", "/data", "/data/PLDN10001",
+                             "/data/PLDN10001/games", "/data/PLDN10001/logs"}) {
         struct stat named{}, opened{};
         const int lstat_rc = ::lstat(path, &named);
         const int fd = ::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -392,6 +432,8 @@ struct LiveServices::State {
     std::unique_ptr<playden::steam::HttpClient> sharing_http;
     std::unique_ptr<playden::homebrew::SharingService> sharing;
     std::unique_ptr<playden::homebrew::RuntimeHost> runtime_host;
+    // Web access: declared before the Controller so the service outlives the pointer it is given.
+    std::unique_ptr<playden::web::Service> web;
     std::unique_ptr<playden::homebrew::Controller> services;
     std::unique_ptr<playden::homebrew::HttpArtworkBackend> artwork_backend;
     std::unique_ptr<playden::homebrew::ProgramIconArtworkBackend> program_icons;
@@ -414,10 +456,10 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         (data / playden::app::kExperimentalFeaturesFileName).string(),
         playden::app::DefaultExperimentalFeatures(playden::update::CurrentVersion().nightly() || PLAYDEN_DEV_BUILD),
         nullptr);
-    simulation.SetCommunityRecipesEnabled(s.features.community_recipes);
     simulation.SetGameTestReportsEnabled(!s.features.game_test_reports_api.empty());
     playden::runtime::SetOnlineSteamEnabled(s.features.online_steam);
 
+    write_web_status_files(data);
     probe_directory_identity();
     probe_listing_methods();
     probe_durable_root();
@@ -652,7 +694,20 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     s.stores->Add(std::make_unique<playden::stores::SteamLibrarySource>(*s.library_service));
     s.stores->Add(std::make_unique<playden::stores::SteamDetailsSource>(*s.app_details));
     playden::stores::local::LocalLibraryConfig import_config;
-    import_config.volumes = {{playden::steam::InstallService::kPrimaryVolumeId, "/data", "playden-import", false}};
+    // The drop folder AND the external drives. ConsoleImportVolumes() returns both from
+    // ImportRoots() (scanner.cpp): /data/playden-import, then <mount>/playden/import for
+    // /mnt/ext0, /mnt/ext1 and /mnt/usb0..7, each marked require_mount_point so an empty
+    // /mnt/usb* -- which the console keeps whether or not a drive is attached -- is skipped.
+    // Only the drop folder was listed before, so a USB drive was invisible to the importer and
+    // every game had to be copied onto internal storage over FTP first.
+    //
+    // Importing COPIES into /data/PLDN10001/games (move_into_playden routes to Enqueue above),
+    // so a game taken from a drive lands owned by Playden on console storage and starts. Playing
+    // in place from the drive is a separate matter: a USB filesystem records no file owners
+    // (/mnt/usb0 reads uid -1), and runtime_host.cpp refuses a game root whose owners it cannot
+    // read unless the kit declares game-root-unowned -- which is kit-wide and must not be
+    // declared lightly (see scripts/ps4-kit-view.py).
+    import_config.volumes = playden::stores::local::ConsoleImportVolumes();
     import_config.log = [log_directory](const std::string &line) {
         playden::app::AppendLogLine(log_directory, "install.log", line);
     };
@@ -661,10 +716,19 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
                                           const std::string &volume_id, std::uint32_t runtime_number) {
         return runner->Enqueue(*service, entry, source, volume_id, runtime_number);
     };
+    // ⚠ Copy, not Move. A move is std::rename, which keeps the owner, and GoldHEN's FTP server
+    // writes /data/playden-import as root while Playden runs as another user. The game then sits in
+    // Playden's own library owned by someone else, and every start is refused with "The game's
+    // folder belongs to another user" (runtime_host.cpp: the check is on st_uid alone, so the 0777
+    // modes throughout /data do not help). Playden cannot chown it back: there is no root on this
+    // console. Copying writes each file as Playden, so the game ends up owned, and the drop folder
+    // is removed afterwards exactly as a copy from a drive would be. Measured with MDK, 2026-11-18:
+    // SHINY/ arrived uid 0 while the .playden-* records beside it were uid 1.
     import_config.move_into_playden = [service = s.installs.get(), runner = s.copy_runner.get()](
                                           const playden::stores::local::ImportEntry &entry, const std::string &source,
                                           std::uint32_t runtime_number) {
-        return runner->Move(*service, entry, source, runtime_number);
+        return runner->Enqueue(*service, entry, source,
+                               playden::installs::InstallService::kPrimaryVolumeId, runtime_number);
     };
     import_config.remove_copy_folder = [runner = s.copy_runner.get()](const std::string &root) {
         return runner->Remove(root).empty();
@@ -804,8 +868,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         *error = "too many redirects";
         return std::nullopt;
     };
-    runtime_config.community_recipe_bytes =
-        playden::homebrew::CommunityRecipeBytes(community_objects, s.features.community_recipes);
+    runtime_config.community_recipe_bytes = playden::homebrew::CommunityRecipeBytes(community_objects);
     runtime_config.log = [log_directory](const std::string &line) {
         if (line.rfind("startup ", 0) == 0 || line.find("unavailable") != std::string::npos ||
             line.find("directory") != std::string::npos || line.find("kit ") != std::string::npos)
@@ -896,6 +959,38 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
                                                                  s.installs.get(), s.cloud.get(), s.runtime_host.get(), auth_log);
     s.services->SetLocalLibrary(local);
     s.services->SetDownloadServers(s.servers.get());
+    {
+        // Settings > Web access. Without this the Controller's web_ stays null, TickWebAccess
+        // returns at once, no snapshot ever reaches the model, and the row reads "Starting..."
+        // for good -- which is what PS4 did until now, while the toggle only wrote the preference.
+        // The paths are the PS4 layout, not ps5.cpp's literals: titles live directly under
+        // kManagedTitleRoot and the kits under /data/playden, the same mismatch recorded for the
+        // sharing service below.
+        playden::web::ServiceConfig web_config;
+        web_config.paths = playden::web::LogsPaths{log_directory, playden::runtime::kManagedTitleRoot,
+                                                   "/data/playden/kits",
+                                                   playden::runtime::kManagedTitleRoot};
+        // The PS4 kit is bundled in the package, not installed under /data/playden/kits, so the
+        // Runtime kit card had nothing to read. The kit view carries the same fields a kit
+        // manifest does (scripts/ps4-kit-view.py): runtime.artifact_revision and capabilities.
+        web_config.paths.kit_manifest = playden::ps4::kKitView;
+        web_config.server.log = [log_directory](const std::string &line) {
+            playden::app::AppendLogLine(log_directory, "web.log", line);
+        };
+        // No address_fallback: ps5.cpp uses ConsoleAddress(), whose source is not in the PS4
+        // target (ps4/CMakeLists.txt links only some platform/ps5 sources). web::LocalAddress()
+        // still runs; if it finds nothing the page is reached by the console IP and port.
+        // Path work never runs while root is raised (effective_uid.cpp).
+        web_config.files.try_hold = [] { return playden::ps5::TryHoldEffectiveUid(); };
+        web_config.files.free_space = [](const std::string &path) -> std::optional<std::uint64_t> {
+            const auto space = playden::steam::QueryVolumeSpace(path, playden::steam::kConsoleSystemReserve);
+            return space ? std::optional<std::uint64_t>(space->free_bytes) : std::nullopt;
+        };
+        for (const auto &private_path : playden::runtime::PrivateProfilePaths())
+            web_config.files.private_profile_paths.push_back(private_path.generic_string());
+        s.web = std::make_unique<playden::web::Service>(std::move(web_config));
+        s.services->SetWebAccess(s.web.get());
+    }
     if (steam_cm_options.friends) {
         s.friends_cm = std::make_unique<playden::steam::CmClient>(kCaBundle, *s.library_storage);
         s.friends_cm->SetOwner("friends");
@@ -930,9 +1025,8 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         playden::app::AppendLogLine(log_directory, "launch.log", line);
     });
 
-    if (!s.features.community_recipes) {
-        s.services->SetCommunityRecipeCache(community_objects);
-    } else {
+    // Community recipes are part of every build since upstream 0.11.0-beta.4: the service always runs.
+    {
         playden::community::RecipeServiceConfig config;
         config.store_root = community_root.string();
         std::string endpoints_line;
@@ -989,7 +1083,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
 
     const auto snapshot = s.installs->Snapshot();
     log_line("services up: data " + data.string() + ", installed games " + std::to_string(snapshot.installed.size()) +
-             ", community recipes " + (s.features.community_recipes ? "on" : "off") + ", stay signed in " +
+             ", stay signed in " +
              (stay_signed_in ? "on" : "off"));
     return true;
 }

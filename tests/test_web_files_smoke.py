@@ -48,7 +48,7 @@ def run(port, server):
 
     # Unpaired.
     assert call("GET", "/api/files/games")[0] == 401
-    assert json.loads(call("GET", "/api/pair/status")[1]) == {"paired": False}
+    assert json.loads(call("GET", "/api/pair/status")[1]) == {"paired": False, "remembered": False}
 
     # Pair with the code the TV shows.
     ok(call("POST", "/api/pair/start"))
@@ -56,12 +56,22 @@ def run(port, server):
     result = call("POST", "/api/pair/confirm", code=code)
     ok(result)
     cookie["value"] = result[2]["Set-Cookie"].split(";")[0]
-    assert json.loads(call("GET", "/api/pair/status")[1]) == {"paired": True}
+    assert json.loads(call("GET", "/api/pair/status")[1]) == {"paired": True, "remembered": False}
 
     # The games.
     games = ok(call("GET", "/api/files/games"))["games"]
-    assert {game["id"] for game in games} == {"steam-12210", "local-3fa9c1", "steam-1091500", "steam-274520"}
+    assert {game["id"] for game in games} == {"steam-12210", "local-3fa9c1", "steam-1091500", "steam-274520", "gog-1351891846"}
     assert next(game for game in games if game["id"] == "steam-1091500")["running"] is True
+
+    # A GOG game: its own store kind, no Steam app ID, and its files reached by its gog-<id> key.
+    jazz = next(game for game in games if game["id"] == "gog-1351891846")
+    assert (jazz["kind"], jazz["app"]) == ("gog", 0)
+    jazz_game = ok(call("GET", "/api/files/game", game="gog-1351891846", redist=1))
+    assert {root["id"] for root in jazz_game["roots"]} >= {"game", "user"}
+    listing = ok(call("GET", "/api/files/list", game="gog-1351891846", root="game", path="save"))
+    assert [entry["name"] for entry in listing["entries"]] == ["slot1.lst"]
+    assert ok(call("GET", "/api/files/download", game="gog-1351891846", root="game", path="save/slot1.lst")) == b"slot"
+    assert ok(call("GET", "/api/files/download", game="gog-1351891846", root="user", path="Documents/Jazz2/config.ini")) == b"[video]\nfullscreen=1\n"
 
     # A game playing in place from USB: its redistributable folders, by Play's rules, and what it needs.
     wolverine = ok(call("GET", "/api/files/game", game="local-3fa9c1", redist=1))
@@ -140,6 +150,25 @@ def run(port, server):
     ok(call("POST", "/api/files/upload", body=b"msi", path="_Redist/PhysX_9.09.msi", **wolverine_place))
     wolverine = ok(call("GET", "/api/files/game", game="local-3fa9c1", redist=1))
     assert next(folder for folder in wolverine["redist"] if folder["path"] == "_Redist")["physx_installer"] == "_Redist/PhysX_9.09.msi"
+
+    # Rename a save folder, then move it out of the bottle into the game folder and back, asking at a name that's there.
+    profiles = "Documents/Rockstar Games/GTA IV/Profiles"
+    assert ok(call("POST", "/api/files/move", path=profiles + "/7A3C91F0", name="Backup", **place))["name"] == "Backup"
+    moved = ok(call("POST", "/api/files/move", path=profiles + "/Backup", to_root="game", to="", **place))
+    assert (moved["files"], moved["left"]) == (2, 0)
+    assert ok(call("GET", "/api/files/download", path="Backup/SGTA400", **game_place)) == original
+    assert call("GET", "/api/files/list", path=profiles + "/Backup", **place)[0] == 404
+    ok(call("POST", "/api/files/mkdir", path=profiles + "/Backup", **place))
+    ok(call("POST", "/api/files/upload", body=b"other", path=profiles + "/Backup/cfg.set", **place))
+    clash = call("POST", "/api/files/move", path="Backup", to_root="user", to=profiles, **game_place)
+    assert clash[0] == 409 and json.loads(clash[1])["clash"] is True and json.loads(clash[1])["folder"] is True
+    merged = ok(call("POST", "/api/files/move", path="Backup", to_root="user", to=profiles, clash="replace", **game_place))
+    assert merged["files"] == 2
+    entries = {e["name"]: e for e in ok(call("GET", "/api/files/list", path=profiles + "/Backup", **place))["entries"]}
+    assert set(entries) == {"cfg.set", "SGTA400"} and entries["cfg.set"]["previous"]["size"] == 5
+    assert call("GET", "/api/files/list", path="Backup", **game_place)[0] == 404
+    # A move that answered 202 is asked about by its job; one Playden doesn't know is 404.
+    assert call("GET", "/api/files/move/status", job="0-0")[0] == 404
 
 
 if __name__ == "__main__":

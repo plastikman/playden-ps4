@@ -135,7 +135,7 @@ AppDetails DetailsFromAppInfo(std::uint32_t id, const std::string& buffer,
   if (installed && any) {
     const std::set<std::uint32_t> refused_dlc = free_dlc_refused ? *free_dlc_refused : std::set<std::uint32_t>{};
     for (auto& offer : OfferedDlc(*app, dlc_apps, apps, depots_owned, selection, refused_dlc))
-      details.dlc.push_back({offer.app_id, std::move(offer.name), offer.download_bytes, offer.install_bytes, offer.free, {},
+      details.dlc.push_back({GameId::Steam(offer.app_id), std::move(offer.name), offer.download_bytes, offer.install_bytes, offer.free, {},
                              offer.optional});
   }
   if (!installed && any) {
@@ -180,7 +180,7 @@ AppDetails DetailsFromAppInfo(std::uint32_t id, const std::string& buffer,
         if (branch != "public" || choice != selection.language) compare(branch, choice);
     SortDlcOffers(&offers);
     for (auto& offer : offers)
-      details.dlc.push_back({offer.app_id, std::move(offer.name), offer.download_bytes, offer.install_bytes, offer.free,
+      details.dlc.push_back({GameId::Steam(offer.app_id), std::move(offer.name), offer.download_bytes, offer.install_bytes, offer.free,
                              std::move(other_sizes[offer.app_id]), offer.optional});
   }
   std::vector<AppLaunch> launches;
@@ -205,15 +205,7 @@ std::vector<AppInfo> CmAppDetailsSource::FetchDlcApps(CmClient& client, const St
   std::vector<AppInfo> dlc_apps;
   const auto app = ParseAppInfo(id, buffer);
   if (!app) return dlc_apps;
-  std::vector<std::uint32_t> dlc_ids;
-  for (const auto dlc : app->dlc_app_ids)
-    if (dlc != id && std::find(dlc_ids.begin(), dlc_ids.end(), dlc) == dlc_ids.end()) dlc_ids.push_back(dlc);
-  std::set<std::uint32_t> borrowed_sources;
-  for (const auto& depot : app->depots)
-    if (depot.depot_from_app && *depot.depot_from_app != id) borrowed_sources.insert(*depot.depot_from_app);
-  if (app->demo_of_app_id != 0) borrowed_sources.insert(app->demo_of_app_id);
-  for (const auto source : borrowed_sources)
-    if (source != id && std::find(dlc_ids.begin(), dlc_ids.end(), source) == dlc_ids.end()) dlc_ids.push_back(source);
+  const std::vector<std::uint32_t> dlc_ids = RelatedApps(*app);
   for (std::size_t start = 0; start < dlc_ids.size() && !cancel.load(); start += kMaxAppInfoBatch) {
     const std::vector<std::uint32_t> batch(
         dlc_ids.begin() + static_cast<std::ptrdiff_t>(start),
@@ -223,11 +215,7 @@ std::vector<AppInfo> CmAppDetailsSource::FetchDlcApps(CmClient& client, const St
     for (const auto dlc : batch)
       if (const auto found = dlc_info.buffers.find(dlc); found != dlc_info.buffers.end())
         if (auto parsed = ParseAppInfo(dlc, found->second)) {
-          if (borrowed_sources.count(dlc)) {
-            if (std::find(app->dlc_app_ids.begin(), app->dlc_app_ids.end(), dlc) != app->dlc_app_ids.end())
-              dlc_apps.push_back(*parsed);
-            KeepDepotsBorrowedBy(*app, &*parsed);
-          }
+          PrepareRelatedApp(*app, &*parsed);
           dlc_apps.push_back(std::move(*parsed));
         }
   }

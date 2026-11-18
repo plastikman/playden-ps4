@@ -135,11 +135,11 @@ private Windows environment and its own tile on the PS5 Home screen.
   Steam Guard email codes, Steam Mobile app codes and approval in the app are supported. The sign-in screen opens on
   the method you used last.
 - **Your whole Steam library.** Search, sort, favorites, collections, ratings and notes, with cover art and store
-  details. The library works offline from a cache.
+  details. The library works offline from a cache. Your Steam collections show under Steam in the Library, read-only.
 - **Downloads from Steam.** Queue games and watch progress. The Queue screen also lists the games being prepared, in
   the order they start; Prepare next moves a waiting game to the front.
-- **Storage at a glance.** Settings › Storage shows how much space is used and lists installed games by size or
-  last played. Select several games and uninstall them together; saves are kept unless you choose otherwise.
+- **Storage at a glance.** Settings › Downloads shows how much space is used, and Settings › Games › Manage installed
+  games lists installed games by size or last played. Select several games and uninstall them together; saves are kept unless you choose otherwise.
 - **Each game is its own PS5 app.** It gets a tile on the Home screen, so you can start it without Playden.
 - **A private Windows environment per game** ("bottle"), so games do not share settings or files.
 - **Steam Cloud saves.** Playden checks your Cloud saves before a game starts and syncs them after it ends. If the
@@ -159,6 +159,11 @@ private Windows environment and its own tile on the PS5 Home screen.
   co-op or split screen, through XInput and the HID gamepad APIs (runtime kit 0.18 or newer). Player 2 must sign in to the PS5 as another user (or a guest) with their own DualSense.
 - **Mouse and keyboard.** Plug a USB mouse and keyboard into the PS5, or use a controller preset: the left stick as a
   mouse, or the D-pad as the arrow keys.
+- **Online play (experimental).** Playden can run Valve's own Steam client beside a game, so the game reaches
+  Steam's servers, lobbies and friends as on a PC. You choose it per game. It is off by default and has risks of its
+  own. See [Online play](#online-play-experimental).
+- **GOG games (experimental).** Sign in to GOG from your phone, and your GOG games join the Library next to your
+  Steam games. They install, update and play like Steam games. See [GOG store](docs/gog-store.md).
 - **Import Windows games.** Add game folders you already have, from a USB drive, an M.2 SSD or over FTP. No Steam
   account is needed. See [Import Windows games](#import-windows-games).
 - **Install to internal or external disks.** Console storage, or an exFAT USB drive formatted on a Mac or PC. USB
@@ -169,7 +174,7 @@ See the [compatibility list](COMPATIBILITY.md) for the games we have tested.
 ### Planned
 
 - Steam game updates
-- Other stores (GOG, Epic)
+- Other stores (Epic)
 - Support for game launches (Rockstar, EA, Ubisoft)
 - Community recipes in the preset chooser
 
@@ -187,13 +192,17 @@ you sign in:
   signed in", then sign in again each time Playden starts.
 - **It replaces a game's Steam API.** When Playden prepares a game, it puts
   [gbe_fork](https://github.com/Detanup01/gbe_fork), a Steamworks emulator, in place of the game's `steam_api.dll` and
-  `steam_api64.dll`. The original files are kept next to them as `.orig`. gbe_fork is set to offline mode with its
-  networking turned off. The game then runs without the Steam client and without Steam's checks. This is the default
-  for most games; Game settings › Steam features › **Game's own files** puts the original files back. Replacing a
+  `steam_api64.dll`. The original files are kept next to them as `.orig`. gbe_fork never reaches Steam's servers.
+  The game then runs without the Steam client and without Steam's checks. This is the default
+  for most games; Game settings › Online › Steam features › **Game's own files** puts the original files back. For a
+  game that checks its own Steam files, **Offline emulation, game's library** keeps the original files and gives the
+  game gbe_fork as Steam's client library instead, in the game's bottle. Replacing a
   game's Steam API can be against the Steam Subscriber Agreement. In some countries, it can also count as getting
   around a protection measure. Decide for yourself if you accept this.
-- **No online play.** Online multiplayer does not work, and games with anti-cheat do not work. If you want to try
-  them anyway, use a separate Steam account.
+- **Online play is off by default, and experimental.** Without it, online multiplayer does not work. With it, Valve's
+  Steam client runs on the console, signed in as you, and a game with Valve Anti-Cheat could get your account banned
+  from that game. Games with any other anti-cheat do not work. Read [Online play](#online-play-experimental) first,
+  and consider a separate Steam account.
 - **It writes to your Steam Cloud saves.** Playden uploads saves after you play. A bug can overwrite good saves with
   older or broken ones. Back up saves you care about. When Playden shows a conflict, read it before you choose.
 - **It needs a jailbroken console with root-level helpers.** A running game can get elevated rights on the console.
@@ -235,6 +244,35 @@ Other versions can work, but these are the ones we know.
   environment and the per-game app shell. Playden checks that the installed kit is complete before it uses it.
 - **Microsoft's MFC library.** Wine doesn't include it. When a game needs it, Playden downloads Microsoft's Visual C++
   redistributable (about 25 MB, once per console) and installs only its MFC files into that game's Windows folder.
+
+## Online play (experimental)
+
+By default, games run offline: an emulator answers a game's Steam calls on the console, and it never reaches Valve.
+Official servers, Steam lobbies and Steam friends are out of reach.
+
+Online changes that for each game you choose it for:
+
+- **It runs Valve's own Steam client.** Playden downloads Valve's unmodified Steam client from Valve (about 64 MB)
+  and runs it next to the game, signed in as you. The game keeps its original Steam files and talks to that
+  client as on a Windows PC. Tickets, friends, lobbies, relays and game coordinators all come from Valve's code.
+- **It hands the game your Steam sign-in.** Playden puts your sign-in in a private file in the game's
+  Windows environment. The helper reads it once and deletes it.
+
+What can go wrong, in short:
+
+| Risk | How likely |
+| --- | --- |
+| An account ban, in a game without Valve Anti-Cheat | Unlikely |
+| A kick or a permanent ban from a game that uses Valve Anti-Cheat (VAC) | Unknown |
+| Someone on your home network takes your Steam sign-in from the console | Low |
+
+These are judgements, not measurements. Games with kernel-level anti-cheat, or any anti-cheat other than Valve's,
+are not supported.
+
+Choose Game settings › Online › Steam features › **Online (experimental)** to enable it for each game.
+
+**Read [docs/online-play.md](docs/online-play.md) if you'd like more information.** It explains how Steam online play works,
+what each risk means and what Playden does about it, and how to turn Online on.
 
 ## Install
 
@@ -283,21 +321,21 @@ ShadowMountPlus adds its tile to the Home screen.
 
 Since 0.3.0, Playden updates itself from this repository's GitHub releases:
 
-- **Check:** at startup, and with Settings › Updates › Playden updates › Check now. When a newer release is out,
+- **Check:** at startup, and with Settings › System › Playden updates › Check now. When a newer release is out,
   Playden offers it once, with its notes, its download size, and a QR code for its release page on GitHub.
 - **Download:** Download and install fetches the new app and, when the release has a new one, the runtime kit. You
   can follow the download on the Queue screen and keep using Playden meanwhile.
 - **Restart:** when the update is ready, Restart Playden closes Playden, puts the new version and kit in place, and
   opens Playden again. If it doesn't open by itself (the payload loader on port 9021 isn't running), open it from
-  the Home screen. On that first start Playden shows what's new in the version; Settings › Updates › Release notes
+  the Home screen. On that first start Playden shows what's new in the version; Settings › System › Release notes
   shows it again later.
 
-Settings › Updates › **Beta updates** opts into test versions before their stable release. It is off by default;
+Settings › System › **Beta updates** opts into test versions before their stable release. It is off by default;
 betas can have new bugs and use the same app and data. Turning it off keeps an installed beta until a newer stable
 version is available. Updates never downgrade Playden.
 
 The previous app and kit are kept until the next update, in `/data/playden/self-update/backup/` and
-`/data/playden/kits/.previous-*`. Settings › Updates › **Go back to Playden <version>** puts them back: Playden
+`/data/playden/kits/.previous-*`. Settings › System › **Go back to Playden <version>** puts them back: Playden
 closes, swaps the previous version and its kit in, and opens again. If the swap does not take and the previous
 version opens again, it says so and puts its kit back. If the new version itself fails to start, nothing can report it: reinstall Playden over FTP as
 described above (your games, sign-in and settings are kept), and, if the new kit is at fault, rename the previous
@@ -315,11 +353,11 @@ folders' modes right if they changed.
 The runtime kit is what runs Windows games: Wine, Mesa and DXVK. Playden
 downloads the kit its version was made for from this repository's releases, on its first start and whenever the
 installed kit isn't that one. It installs in the background, shows on the Queue screen, and games can be prepared
-as soon as it is in place. If you choose Later, or the download fails, Settings › About › Runtime kit starts
+as soon as it is in place. If you choose Later, or the download fails, Settings › System › Runtime kit starts
 it again.
 
 Games pick up a new kit when you press Play, or all at once: Playden offers this the first time you open it with a new
-kit, and Settings › Manage installed games › Runtimes does it whenever you want. Saves and settings are kept.
+kit, and Settings › Games › Manage installed games › Runtimes does it whenever you want. Saves and settings are kept.
 
 You can also install the kit by hand, with Python 3: download `playden-kit-<version>.zip` from the release, unzip it
 next to `playden-ps5-<version>`, and run this from the `playden-ps5-<version>` folder. A plain FTP copy does not
@@ -336,16 +374,18 @@ yet, so most people should use the release download.
 ### Saves and game configs
 
 Open Playden's web page from a phone or computer on the same network: Settings › Web access shows the address and a
-QR code. In the **Files** tab, pair the browser with the 6-digit code the TV shows. The pairing ends when Playden closes.
+QR code. In the **Game files** tab, pair the browser with the 6-digit code the TV shows. The pairing ends when Playden closes.
 
-Pick a game to download, upload, replace or delete its files. Playden answers only while it is open, and starting a
-game closes it.
+Pick a game to download, upload, replace, rename, move or delete its files. Playden answers only while it is open, and
+starting a game closes it.
 
 - **Saves and most configs** are in the game's Windows user folder (`Documents`, `AppData`, `Saved Games`). They are on
   the console even when the game plays from a USB drive, and they stay when you uninstall the game.
 - **The game folder** has mods and game-side configs. A game update can overwrite the game's own files, and
   uninstalling removes the folder with everything you added. `steam_settings` is read-only, because Playden writes it.
 - **Replacing a file** keeps the old one as its previous version, which you can download or restore.
+- **Moving** works between any folders of the same game. Between the game folder and the Windows folders, each file is
+  copied and then deleted, so a move that stops leaves each file whole in one place or both.
 - A game that is still running can overwrite what you change, so close it on the PS5 first. The page marks a game as
   Running when it can tell.
 - A save you upload can replace the one in Steam Cloud at the next sync.
@@ -360,22 +400,55 @@ Playden's web page uses plain HTTP, so use it only on a network you trust.
 
 For Half-Life 2 that is `steam-220`. Look in `AppData/Roaming`, `AppData/Local`, `Documents` and `Saved Games`.
 
-This needs a runtime kit with the `bottle-profile-shared` capability. Kit 0.18 doesn't have it and keeps the whole
-folder private, so FTP answers with a permission error. With the capability, you can read and write everything in
-`prospero`. The folders above it can be entered but not listed, so type the full path in your FTP client instead of
-browsing to it. New saves a game writes are private at first. Playden opens them to FTP when it starts, when a game
-it started ends, and before it starts a game.
+The runtime kit keeps the folder of a game that has a PS5 title private, so FTP answers with a permission error there.
+Use the web page above, or Maintenance › Back up saves: backups are in
+`/data/playden/games/steam-<Steam app ID>.saves/` and FTP can read and delete them.
 
-Without the capability, set `/data/playden/games/steam-<Steam app ID>` to `777`, recursive, to reach the folder.
-
-- **Never undo this with a recursive `chmod 700`.** FTP loses access to everything below the first folder it changes,
-  so the folders stay open, and files it already changed can become unreadable. Playden takes back the modes it needs
-  on its own.
-- **Files you upload belong to root**, so the game may not be able to use them. Run the recursive `777` again after
-  you upload saves. Otherwise the game can fail to load them, and Recreate bottle can't bring them back
-  ([#569](https://github.com/leolobato/playden-ps5/issues/569)).
-- **If Play fails afterwards**, use Maintenance › Repair, which may also fail, then press Play again
+- **Don't change the modes of a game's folder** in `/data/playden/games` (a recursive `chmod`). If you did and Play
+  fails, use Maintenance › Repair: Playden puts the modes back
   ([#568](https://github.com/leolobato/playden-ps5/issues/568)).
+- **Files you upload belong to root**, so the game may not be able to use them. Upload saves through the web page
+  instead ([#569](https://github.com/leolobato/playden-ps5/issues/569)).
+
+## Where Playden keeps data
+
+Everything Playden makes outside a game's private folder can be read and deleted over FTP or a file manager: its
+folders are `777` and its files `666`. Your Steam, GOG and web access sign-ins are files only Playden can read, but you
+can still delete them.
+
+| Folder | What is in it |
+|---|---|
+| `/data/playden` | Playden's own data: everything in the rows below that starts with it |
+| `/data/playden/user` | Sign-ins, preferences, game settings, shared recipes, paired browsers |
+| `/data/playden/logs` | Logs |
+| `/data/playden/runtime-state` | Which games are installed, their PS5 titles, removals in progress |
+| `/data/playden/art` | Game artwork |
+| `/data/playden/games` | Each game's Windows folder and saves. `<id>.kept`: saves kept after an uninstall. `<id>.saves`: backups |
+| `/data/playden/staging` | PS5 titles and game folders being built |
+| `/data/playden/steam-client` | Valve's Steam client, for games with Steam features set to Online |
+| `/data/playden/exported-recipes` | Recipes you exported as files |
+| `/data/playden/redist` | Microsoft runtimes Playden downloads for games (MFC, Visual C++) |
+| `/data/playden/title-remover` | Requests to remove a PS5 title |
+| `/data/playden/kits` | The runtime kit (belongs to root) |
+| `/data/playden/title-rule` | The list of PS5 titles Playden may start (belongs to root) |
+| `/data/playden/self-update` | Playden updates being installed (belongs to root) |
+| `/data/playden-games` | Game files on console storage |
+| `/data/playden-import` | Games you copy in to import. They are yours: removing Playden keeps them |
+| `/data/homebrew/FAKE78xxx` | One PS5 title for each game. Playden itself is `/data/homebrew/FAKE77031` |
+| `/mnt/<drive>/playden` | Game files (`games`) and games to import (`import`) on an M.2 SSD, extended storage or USB drive |
+
+### Uninstall Playden
+
+Settings › System › **Uninstall Playden** takes everything above off the console. Close any game first.
+
+1. Choose whether to keep your saves. Kept saves stay in `/data/playden/games/<id>.kept`, and a new install of Playden
+   gives them back when you install the game again.
+2. Playden removes every game's PS5 title, the game files on each connected drive, the runtime kit and its own data.
+   Games waiting in an `import` folder stay.
+3. Playden quits. Delete the Playden tile from the Home screen to finish.
+
+A drive that is not connected keeps its `playden` folder. Delete it over FTP, or connect the drive before you remove
+Playden.
 
 ## Import Windows games
 
@@ -390,7 +463,7 @@ The drive must be exFAT. The PS5 can't read NTFS, and FAT32 can't hold files ove
 
 **Add a game:**
 
-1. Open **Import games**: on the Startup screen, on Home when your library is empty, or in Settings › Library.
+1. Open **Import games**: on the Startup screen, on Home when your library is empty, or in Settings › Games.
 2. Choose **Look for games**. Playden lists the folders it finds, with their size.
 3. Pick a folder. When it holds one program besides installers and tools, Playden starts the game with it. Otherwise
    pick the program that starts the game; installers and tools are labelled as such. You can change it later in
@@ -478,9 +551,10 @@ build/homebrew-host/playden-homebrew --simulation --scenario signed-out
 ## Known issues
 
 - If you plug in or swap USB drives while Playden is open, restart Playden so it sees them.
-- Online multiplayer and games with anti-cheat do not work. See [Before you use it](#before-you-use-it).
+- Online multiplayer works only in games set to [Online](#online-play-experimental), and not in every game. Games
+  with anti-cheat other than Valve's do not work.
 - Uninstall games from Playden. Title folders belong to Playden; FTP and file managers can't delete them.
-  Leftover titles appear in Settings › Storage. Deleting a leftover removes its title folder and Home tile;
+  Leftover titles appear in Settings › Games. Deleting a leftover removes its title folder and Home tile;
   its saves and settings move to Kept game data, where you can delete them or get them back by installing the game
   again.
 - New games can stay at *Waiting for the PS5* after you quit Playden when ShadowMountPlus stops registering titles.
@@ -507,7 +581,7 @@ build/homebrew-host/playden-homebrew --simulation --scenario signed-out
   includes Mesa itself, so heavy ones can be slow.
 - After you update Playden, it can ask you to sign in to Steam again.
 - Steam can turn down a saved sign-in that worked before. Playden tries again the next time it starts; if it keeps
-  happening, use Settings › Account › **Sign in again**: it keeps your library, favorites and settings.
+  happening, use Settings › Accounts › **Sign in again**: it keeps your library, favorites and settings.
 - Godot games (Slay the Spire 2) need `--rendering-driver opengl3` in Game settings › Extra arguments. Playden picks
   Godot's Vulkan renderer, which did not work on this kit.
 - Some games start only after their own settings program has run once. On the game's page, use Options ›
@@ -531,11 +605,17 @@ See the [compatibility list](COMPATIBILITY.md) for what we know about each game.
 
 Every test helps, including games that work.
 
-**From Playden:** report prompts and uploads are disabled by default on PS4. To enable them, add a report API base
-URL to `/data/PLDN10001/features.txt`, for example `game-test-reports=https://reports.example.com`, then restart
-Playden. The endpoint must provide the Playden report API (`/v1/reports` and, for log attachments,
-`/v1/attachments`). No report is sent to the upstream Playden API unless you explicitly configure it as the endpoint.
-Reports include the game, settings and versions; problem reports can include redacted logs.
+**From Playden:** after you play a game, Playden asks how it ran (or choose **Share feedback…** in the game's
+actions). Choose whether it ran well or had problems, and Playden sends a test report for you: the game, its
+settings, your versions and, when it had problems, its logs with your Steam account name, IDs, PS5 user and home
+network addresses removed. The report is a public issue on this repository. With a community recipe in use, your
+answer is also its vote (unless **Recipe votes** is off). Settings › Accounts › **Ask how games ran** turns the
+question off; votes and **Share feedback…** still work.
+
+**On PS4, report prompts and uploads are off by default.** To turn them on, add a report API base URL to
+`/data/PLDN10001/features.txt`, for example `game-test-reports=https://reports.example.com`, then restart Playden. The
+endpoint must serve the Playden report API (`/v1/reports`, and `/v1/attachments` for log attachments). Nothing is sent
+to the upstream Playden API unless you name it as the endpoint yourself.
 
 **By hand**, for anything Playden can't send:
 

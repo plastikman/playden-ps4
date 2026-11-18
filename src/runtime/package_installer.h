@@ -167,6 +167,9 @@ class FilesystemPackageInstaller final : public PackageInstaller {
   // Unknown/active state never reaches this filesystem component.
   FilesystemPackageInstaller(VerifiedKitView kit, PackageInstallPaths paths,
                              PackageInstallerOperations operations);
+  // How many times a pass over the kit's whole file list ran (thousands of files in a real kit). The status questions every
+  // start asks of every title (TitleCurrent, QuickAdmission, TitleIconSource, SetupFromOtherKit) don't add to it.
+  std::size_t KitListPasses() const { return kit_list_passes_; }
 
   // The recipes Playden ships (runtime/recipes) besides the kit's own. A record
   // prepared with one of them resolves whatever recipe the kit carries.
@@ -189,6 +192,9 @@ class FilesystemPackageInstaller final : public PackageInstaller {
   // their way to the user profile 0711 and the profile open to FTP (0777/0666); titles of older
   // kits keep 0700 until Update. Reads always admit 0711.
   void ShareBottleProfiles(bool shared) { profile_shared_ = shared; }
+  // The kit has publication-open-modes: a title made from it admits Playden's data at any mode. The start check
+  // Playden runs (compiled from the pinned title shell) checks the older shell's modes for every other title.
+  void AdmitOpenModes(bool open) { open_modes_ = open; }
 
   PackageStatus Inspect(const RuntimeInstall& record) override;
   // The title's owner marker instead of its files and folder modes; the bottle,
@@ -231,6 +237,7 @@ class FilesystemPackageInstaller final : public PackageInstaller {
   bool RecipeAccepted(const RuntimeInstall& record) const;
   const KitTitleVariant* Variant(const RuntimeInstall& record) const;
   bool ValidView() const;
+  bool ViewConsistent();
   // Owner marker, exact file contents and modes, and published (0755) folders.
   bool TitleMatches(const RuntimeInstall& record, const ResolvedPaths& paths) const;
   // Owner marker only: the files and folders it names are not walked.
@@ -249,6 +256,9 @@ class FilesystemPackageInstaller final : public PackageInstaller {
   // The bottle's way to its profile is 0711 and the profile open: the kit has
   // bottle-profile-shared and the record's title was made from it (an older shell demands 0700).
   bool ProfileShared(const RuntimeInstall& record, const ResolvedPaths& paths) const;
+  // The title's shell admits Playden's data at any mode (publication-open-modes, and the title made from this kit).
+  bool OpenModes(const RuntimeInstall& record, const ResolvedPaths& paths) const;
+  bool OpenModes(const RuntimeInstall& record) const;
   bool ArtifactsMatch(const RuntimeInstall& record, const ResolvedPaths& paths) const;
   bool PublicationMatches(const RuntimeInstall& record, const ResolvedPaths& paths,
                           std::uint64_t* revision) const;
@@ -274,6 +284,10 @@ class FilesystemPackageInstaller final : public PackageInstaller {
   std::vector<std::string> shipped_recipe_ids_;
   std::function<bool(const RuntimeInstall&)> accept_recipe_;
   bool profile_shared_ = false;
+  bool open_modes_ = false;
+  // Full passes over the kit's file list (KitListPasses).
+  mutable std::size_t kit_list_passes_ = 0;
+  bool view_consistent_ = false;
 };
 
 }  // namespace playden::runtime

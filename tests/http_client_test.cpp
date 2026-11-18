@@ -28,6 +28,11 @@ std::string Text(const std::vector<std::uint8_t>& bytes) {
   return std::string(bytes.begin(), bytes.end());
 }
 
+// The fixture's streamed bodies: byte i is (i * 31 + 7) & 0xff.
+std::uint8_t PatternByte(std::uint64_t index) {
+  return static_cast<std::uint8_t>((index * 31 + 7) & 0xff);
+}
+
 std::string Header(const HttpResponse& response, const std::string& name) {
   for (const auto& header : response.headers)
     if (header.first == name) return header.second;
@@ -37,14 +42,24 @@ std::string Header(const HttpResponse& response, const std::string& name) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  Check(argc == 5, "expected BASE_URL CA_BUNDLE WRONG_CA_BUNDLE PLAIN_URL");
+  Check(argc == 6, "expected BASE_URL CA_BUNDLE WRONG_CA_BUNDLE PLAIN_URL TLS12_URL");
   const std::string base_url = argv[1];
   const std::string ca_bundle = argv[2];
   const std::string wrong_ca_bundle = argv[3];
   const std::string plain_url = argv[4];
+  const std::string tls12_url = argv[5];
   std::atomic<bool> cancel{false};
   HttpClient client(ca_bundle);
 
+  {
+    // A TLS 1.2-only server that signs its key exchange with RSA-PSS, as Alibaba Cloud storage does (#155).
+    HttpRequest request;
+    request.url = tls12_url + "/ok";
+    const auto response = client.Perform(request, cancel);
+    if (!response.ok()) std::cerr << "TLS 1.2 RSA-PSS GET: " << playden::steam::HttpFailureName(response) << '\n';
+    Check(response.ok() && Text(response.body) == "fixture-ok",
+          "TLS 1.2 server with an RSA-PSS key exchange signature should be accepted");
+  }
 
   {
     HttpClient persistent(ca_bundle);
@@ -229,6 +244,136 @@ int main(int argc, char** argv) {
   large_cap.max_response_bytes = playden::steam::kMaxHttpManifestResponseBytes + 1;
   response = client.Perform(large_cap, cancel);
   Check(response.error == HttpError::kInvalidRequest, "a depot manifest's cap has an upper bound");
+
+  {
+    // A body sink streams a 2xx body block by block and never buffers it.
+    HttpRequest stream;
+    stream.url = base_url + "/stream/5242880";
+    stream.max_response_bytes = 8 * 1024 * 1024;
+    stream.stall_timeout_ms = 5000;
+    std::uint64_t received = 0;
+    bool in_order = true;
+    stream.body_sink = [&](const std::uint8_t* data, std::size_t size) {
+      for (std::size_t index = 0; index < size; ++index)
+        in_order = in_order && data[index] == PatternByte(received + index);
+      received += size;
+      return true;
+    };
+    response = client.Perform(stream, cancel);
+    Check(response.ok() && response.status_code == 200, "a streamed GET succeeds");
+    Check(received == 5242880 && in_order, "the sink gets every byte in order");
+    Check(response.body.empty() && response.timing.body_bytes == 5242880,
+          "a streamed body is counted but not kept");
+
+    // A limit that is not a multiple of curl's block size: the sink never sees a byte past it.
+    received = 0;
+    stream.max_response_bytes = 1000 * 1000;
+    response = client.Perform(stream, cancel);
+    Check(response.error == HttpError::kResponseTooLarge, "a streamed body past its limit fails");
+    Check(received > 0 && received <= 1000 * 1000, "the sink got part of the body, and no more than the limit");
+    Check(response.body.empty() && response.status_code == 0, "a failed stream keeps no body");
+    stream.max_response_bytes = 8 * 1024 * 1024;
+
+    int refusals = 0;
+    stream.body_sink = [&](const std::uint8_t*, std::size_t) {
+      ++refusals;
+      return false;
+    };
+    response = client.Perform(stream, cancel);
+    Check(response.error == HttpError::kSinkFailed && refusals == 1, "a sink that refuses a block fails the request");
+    Check(std::string(playden::steam::HttpErrorName(HttpError::kSinkFailed)) == "sink_failed",
+          "the sink failure has a stable name");
+
+    // Cancel from inside the sink after the first block: no further block reaches it.
+    HttpRequest slow_stream = stream;
+    slow_stream.url = base_url + "/stream-slow";
+    int calls_after_cancel = 0;
+    slow_stream.body_sink = [&](const std::uint8_t*, std::size_t) {
+      if (cancel.load()) ++calls_after_cancel;
+      cancel.store(true);
+      return true;
+    };
+    started = std::chrono::steady_clock::now();
+    response = client.Perform(slow_stream, cancel);
+    Check(response.error == HttpError::kCanceled, "a stream cancels");
+    Check(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(500), "a stream cancels promptly");
+    Check(calls_after_cancel == 0, "the sink is not called after cancel");
+    cancel.store(false);
+
+    // No body byte for the stall limit fails, even with no total deadline.
+    HttpRequest stalled = stream;
+    stalled.url = base_url + "/stall";
+    stalled.stall_timeout_ms = 500;
+    stalled.timeout_ms = 0;
+    received = 0;
+    stalled.body_sink = [&](const std::uint8_t*, std::size_t size) {
+      received += size;
+      return true;
+    };
+    started = std::chrono::steady_clock::now();
+    response = client.Perform(stalled, cancel);
+    Check(response.error == HttpError::kTimeout && received > 0, "a stalled stream times out mid-body");
+    Check(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(1500),
+          "a stalled stream fails near its stall limit");
+
+    // A slow but steady body runs past 2 s: with timeout_ms 0 there is no total cap.
+    HttpRequest trickle = stalled;
+    trickle.url = base_url + "/trickle";
+    received = 0;
+    started = std::chrono::steady_clock::now();
+    response = client.Perform(trickle, cancel);
+    Check(response.ok() && response.status_code == 200 && received == 25 * 4096, "a steady trickle completes");
+    Check(std::chrono::steady_clock::now() - started > std::chrono::milliseconds(2000),
+          "the trickle ran longer than 2 s");
+
+    // An error status keeps its body for the caller and never reaches the sink.
+    HttpRequest missing = stalled;
+    missing.url = base_url + "/stream-404";
+    missing.stall_timeout_ms = 5000;
+    int sink_calls = 0;
+    missing.body_sink = [&](const std::uint8_t*, std::size_t) {
+      ++sink_calls;
+      return true;
+    };
+    response = client.Perform(missing, cancel);
+    Check(response.ok() && response.status_code == 404 && sink_calls == 0, "an error status skips the sink");
+    Check(Text(response.body) == "{\"error\":\"not_found\"}", "an error status keeps its body");
+
+    // An error body longer than max_response_bytes (sized for the 2xx body) still reads as its status: a refused
+    // link to a 68-byte chunk must not look like an overlong chunk.
+    HttpRequest refused = missing;
+    refused.url = base_url + "/stream-403/500";
+    refused.max_response_bytes = 69;
+    sink_calls = 0;
+    response = client.Perform(refused, cancel);
+    Check(response.ok() && response.status_code == 403 && sink_calls == 0 && response.body.size() == 500,
+          "an error body over max_response_bytes keeps its status and body");
+    refused.url = base_url + "/stream-403/" + std::to_string(playden::steam::kMaxHttpStreamErrorBodyBytes + 3 * 4096);
+    response = client.Perform(refused, cancel);
+    Check(response.ok() && response.status_code == 403 && sink_calls == 0 &&
+              response.body.size() == playden::steam::kMaxHttpStreamErrorBodyBytes,
+          "an error body over the cap is cut there and keeps its status");
+    Check(Text(client.Perform(missing, cancel).body) == "{\"error\":\"not_found\"}", "the client works after a cut");
+
+    HttpRequest invalid_stream = missing;
+    invalid_stream.method = HttpMethod::kPost;
+    Check(client.Perform(invalid_stream, cancel).error == HttpError::kInvalidRequest, "a sink is GET only");
+    invalid_stream = missing;
+    invalid_stream.stall_timeout_ms = 0;
+    Check(client.Perform(invalid_stream, cancel).error == HttpError::kInvalidRequest, "a sink needs a stall limit");
+    invalid_stream.stall_timeout_ms = playden::steam::kMaxHttpStallTimeoutMs + 1;
+    Check(client.Perform(invalid_stream, cancel).error == HttpError::kInvalidRequest, "a stall limit has a cap");
+    invalid_stream = missing;
+    invalid_stream.max_response_bytes = playden::steam::kMaxHttpStreamResponseBytes + 1;
+    Check(client.Perform(invalid_stream, cancel).error == HttpError::kInvalidRequest, "a stream's size has a cap");
+    invalid_stream = missing;
+    invalid_stream.depot_manifest = true;
+    Check(client.Perform(invalid_stream, cancel).error == HttpError::kInvalidRequest,
+          "the manifest opt-in does not apply to a stream");
+    invalid_stream = missing;
+    invalid_stream.timeout_ms = playden::steam::kMaxHttpStreamTimeoutMs + 1;
+    Check(client.Perform(invalid_stream, cancel).error == HttpError::kInvalidRequest, "a stream's deadline has a cap");
+  }
 
   HttpRequest invalid_get_body = get;
   invalid_get_body.body = {'x'};

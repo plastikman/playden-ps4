@@ -17,7 +17,7 @@ These are compiled into Playden's PS5 package (`FAKE77031`) or copied into it.
 | ps5-payload-sdk | v0.43 (v0.42 for the root helper) | GPL-3.0 | [ps5-payload-dev/sdk](https://github.com/ps5-payload-dev/sdk) |
 | PS5-Lapy-JB-Daemon (root helper, `lapy.elf`) | fork `66ab4f1` | MIT, Copyright (c) 2026 Arksama (Team PHU) | [mpereiraesaa/PS5-Lapy-JB-Daemon](https://github.com/mpereiraesaa/PS5-Lapy-JB-Daemon), my fork in `third_party/PS5-Lapy-JB-Daemon` |
 | curl | 8.22.0, with a PS5 non-blocking patch | curl license (MIT-style) | [curl.se](https://curl.se/) |
-| Mbed TLS | 3.6.6 | Apache-2.0 | [Mbed-TLS/mbedtls](https://github.com/Mbed-TLS/mbedtls) |
+| Mbed TLS | 3.6.7 | Apache-2.0 | [Mbed-TLS/mbedtls](https://github.com/Mbed-TLS/mbedtls) |
 | CA certificate bundle (`trust/cacert.pem`) | 2026-09-25 | MPL-2.0 | Mozilla's root store, as extracted by [curl](https://curl.se/docs/caextract.html) |
 | SQLite | 3.53.1 | Public domain | [sqlite.org](https://sqlite.org/) |
 | zstd (decompression) | 1.5.6 | BSD-3-Clause | [facebook/zstd](https://github.com/facebook/zstd) |
@@ -37,7 +37,7 @@ Barlow faces from inside the app, with the license at `/assets/barlow-OFL.txt`.
 
 | Component | License | Source |
 | --- | --- | --- |
-| gbe_fork (`runtime/steamworks/steam_api.dll`, `steam_api64.dll`) | LGPL-3.0 ([text](runtime/steamworks/LICENSE)) | [Detanup01/gbe_fork](https://github.com/Detanup01/gbe_fork). Built from upstream with two changes, whose source is linked in the README below. Playden does not link against it: it replaces a game's own Steam API when the game is prepared. See [`runtime/steamworks/README.md`](runtime/steamworks/README.md). |
+| gbe_fork (`runtime/steamworks/steam_api.dll`, `steam_api64.dll`, `steamclient.dll`, `steamclient64.dll`) | LGPL-3.0 ([text](runtime/steamworks/LICENSE)) | [Detanup01/gbe_fork](https://github.com/Detanup01/gbe_fork). Built from upstream with two changes, and the client libraries with a third, whose source is linked in the README below. Playden does not link against it: it replaces a game's own Steam API when the game is prepared, or, for Steam features = Offline emulation, game's library, goes in the game's bottle as Steam's client library. See [`runtime/steamworks/README.md`](runtime/steamworks/README.md). |
 
 ## In the runtime kit
 
@@ -69,6 +69,15 @@ revisions it was built from and includes their license texts in `LICENSES/`, and
 | FreeType | 2.13.3 | FreeType License (FTL) or GPL-2.0 | [freetype.org](https://freetype.org/) |
 | CA certificate bundle (for schannel) | — | MPL-2.0 | Mozilla's root store |
 | PS5-Lapy-JB-Daemon (root helper in the app shell) | fork `66ab4f1` | MIT | See above |
+
+## Protocol references
+
+Playden's GOG client (`src/gog/`) speaks GOG's sign-in and content protocol as these projects document it in their
+code. It was written from that reading: no code is copied from them, and they are not built into Playden.
+
+| Project | License | Source |
+| --- | --- | --- |
+| gogdl (`9c593fd`) | GPL-3.0 | [Heroic-Games-Launcher/heroic-gogdl](https://github.com/Heroic-Games-Launcher/heroic-gogdl) |
 
 ## Your rights
 

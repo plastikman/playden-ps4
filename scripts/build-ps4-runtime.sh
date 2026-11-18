@@ -5,7 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 ORBIS_WIN_ROOT="${ORBIS_WIN_ROOT:?set ORBIS_WIN_ROOT to the hardware-tested orbis-win checkout}"
 ORBIS_WIN_RELEASE="${ORBIS_WIN_RELEASE:?set ORBIS_WIN_RELEASE to the selected Orbis-Win release stage}"
 ORBIS_WIN_STAGE="${ORBIS_WIN_STAGE:-$ORBIS_WIN_RELEASE/app/pkg-stage}"
-DXVK_262_DIR="${DXVK_262_DIR:?set DXVK_262_DIR to DXVK 2.6.2 x32 DLLs}"
+# DXVK_DIR is the x32 DLL directory; DXVK_262_DIR is the old name and still works.
+# The version is read back out of the DLLs for the manifest, never assumed: a build
+# with DXVK 3.1.1 in it used to still record dxvk=2.6.2, because nothing checked.
+DXVK_DIR="${DXVK_DIR:-${DXVK_262_DIR:-}}"
+[[ -n "$DXVK_DIR" ]] || { echo "build-ps4-runtime: set DXVK_DIR to the DXVK x32 DLLs" >&2; exit 1; }
+DXVK_262_DIR="$DXVK_DIR"
 # 64-bit games load D3D from system32, so the template needs DXVK's x64 DLLs there too.
 DXVK_262_X64_DIR="${DXVK_262_X64_DIR:-$(dirname "$DXVK_262_DIR")/x64}"
 PW="$ORBIS_WIN_ROOT/prospero-win"
@@ -71,6 +76,12 @@ expected_wine_prx="$(awk '$1 == "sha256" && $3 == "sce_module/relocated_wine_app
 actual_wine_prx="$(sha256sum "$ORBIS_WIN_STAGE/sce_module/relocated_wine_app.prx" | awk '{print $1}')"
 [[ "$actual_wine_prx" == "$expected_wine_prx" ]] ||
     die "released Wine PRX hash $actual_wine_prx does not match release manifest $expected_wine_prx"
+# Read DXVK's version out of the DLL that is actually being shipped.
+dxvk_version() {
+    local v
+    v=$(strings -a "$1/d3d11.dll" 2>/dev/null | grep -oE "^v[0-9]+\.[0-9]+(\.[0-9]+)?\+?[A-Za-z0-9.]*$" | head -1)
+    printf '%s' "${v:-unknown}"
+}
 DXVK_DLLS="d3d8 d3d9 d3d10core d3d11 dxgi"
 pe_machine() {
     python3 -c 'import struct,sys
@@ -79,8 +90,8 @@ o=struct.unpack_from("<I",d,0x3c)[0]
 print(hex(struct.unpack_from("<H",d,o+4)[0]) if d[:2]==b"MZ" and d[o:o+4]==b"PE\0\0" else "none")' "$1"
 }
 for dll in $DXVK_DLLS; do
-    [[ -f "$DXVK_262_DIR/$dll.dll" ]] || die "DXVK 2.6.2 x32 $dll.dll missing from $DXVK_262_DIR"
-    [[ -f "$DXVK_262_X64_DIR/$dll.dll" ]] || die "DXVK 2.6.2 x64 $dll.dll missing from $DXVK_262_X64_DIR"
+    [[ -f "$DXVK_262_DIR/$dll.dll" ]] || die "DXVK x32 $dll.dll missing from $DXVK_262_DIR"
+    [[ -f "$DXVK_262_X64_DIR/$dll.dll" ]] || die "DXVK x64 $dll.dll missing from $DXVK_262_X64_DIR"
     [[ "$(pe_machine "$DXVK_262_DIR/$dll.dll")" == 0x14c ]] || die "$DXVK_262_DIR/$dll.dll is not 32-bit"
     [[ "$(pe_machine "$DXVK_262_X64_DIR/$dll.dll")" == 0x8664 ]] || die "$DXVK_262_X64_DIR/$dll.dll is not 64-bit"
 done
@@ -334,15 +345,25 @@ cp "$FIXTURE_FONTS"/*.txt "$ROOT/assets/fonts/NotoSans-OFL.txt" "$STAGE/homebrew
 cp -r "$ROOT/runtime" "$STAGE/homebrew/assets/runtime"
 cp "$FIXTURE_CATALOG" "$ROOT/fixtures/ui-comparison/scenarios.json" "$STAGE/homebrew/fixtures/"
 cp "$ROOT/scripts/network-deps/.deps/ps4/cacert.pem" "$STAGE/assets/cacert.pem"
-KIT_ID="orbis-win-ps4-${PW_SOURCE_COMMIT:0:12}-${TEMPLATE_STAMP:0:12}"
+# The kit's identity, not its contents. It must NOT move with the runtime: a marker's kit_id is
+# part of a bottle's identity (RespinIdentity in src/runtime/package_installer.cpp), while
+# files_sha256, runtime_revision, runtime_path and variant_id are deliberately excluded from it so
+# they can change. Minting "orbis-win-ps4-<commit>-<template>" meant every runtime build orphaned
+# every installed game: "installed title and bottle are not this install's from a compatible kit",
+# and Update runtime kit refused with the message it was supposed to fix, leaving Recreate bottle
+# -- which discards the prefix -- as the only path. What actually changed still reaches the console
+# through the kit view: runtime.artifact_revision carries $PW_SOURCE_COMMIT, files_sha256 covers
+# the template, and capabilities say what the runtime can do.
+KIT_ID="orbis-win-ps4"
 python3 "$ROOT/scripts/ps4-kit-view.py" "$STAGE" "$KIT_ID" \
     "$PW_SOURCE_COMMIT" "$WINE_VERSION"
 cp "$STEAMWORKS_DIR/steam_api.dll" "$STEAMWORKS_DIR/steam_api64.dll" \
     "$STEAMWORKS_DIR/steam.dll" "$STEAMWORKS_DIR/LICENSE" "$STEAMWORKS_DIR/README.md" \
     "$STAGE/runtime/steamworks/"
-printf 'title=PLDN10001\nversion=%s\norbis_win_root_commit=%s\nprospero_win_abi4_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_commit=%s\nmesa_libvulkan_sha256=%s\ndxvk=2.6.2-x32+x64\nprefix_template_stamp=%s\nsteamworks_emulator=gbe_fork-ca45922c\n' \
+printf 'title=PLDN10001\nversion=%s\norbis_win_root_commit=%s\nprospero_win_abi4_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_commit=%s\nmesa_libvulkan_sha256=%s\ndxvk=%s-x32+x64\ndxvk_d3d11_sha256=%s\nprefix_template_stamp=%s\nsteamworks_emulator=gbe_fork-ca45922c\n' \
     "$PKG_VERSION" "$manifest_root_commit" "$PW_SOURCE_COMMIT" "$manifest_diff" "${WINE_VERSION#wine-}" \
-    "$MESA_COMMIT" "$MESA_SHA256" "$TEMPLATE_STAMP" >"$STAGE/runtime-manifest.txt"
+    "$MESA_COMMIT" "$MESA_SHA256" "$(dxvk_version "$DXVK_262_DIR")" \
+    "$(sha256sum "$DXVK_262_X64_DIR/d3d11.dll" | cut -d" " -f1)" "$TEMPLATE_STAMP" >"$STAGE/runtime-manifest.txt"
 cmp -s "$ORBIS_WIN_STAGE/sce_module/libvulkan.prx" "$STAGE/sce_module/libvulkan.prx" || die "packaged Mesa PRX mismatch"
 cmp -s "$STAGE/sce_module/libvulkan.prx" "$STAGE/win/wine/lib/wine/x86_64-unix/libvulkan.prx" ||
     die "Wine's Vulkan loader and system Vulkan module differ"

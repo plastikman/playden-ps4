@@ -26,6 +26,14 @@ bool EnsurePrivateDirectories(const std::filesystem::path& boundary,
                               const std::filesystem::path& directory,
                               std::string* error,
                               const PrivateTraversal& traversal = {});
+// EnsurePrivateDirectories for Playden's open data (#868): from open_root down every folder must be
+// the effective user's, at any mode, and the ones it creates are 0777, so the console owner can
+// delete them over FTP (root has no permission bypass on /data). Missing folders between boundary
+// and open_root are created 0777 too. An existing folder is never chmodded here (self-heal opens them).
+bool EnsureOpenDirectories(const std::filesystem::path& boundary,
+                           const std::filesystem::path& open_root,
+                           const std::filesystem::path& directory,
+                           std::string* error);
 bool IsPrivateDirectoryTree(const std::filesystem::path& private_root,
                             const std::filesystem::path& directory,
                             const PrivateTraversal& traversal = {});
@@ -59,6 +67,15 @@ bool IsPrivateProfilePath(const std::filesystem::path& relative,
 // before_open runs before each entry opens (race tests).
 struct SharedTreeOptions {
   std::vector<std::filesystem::path> private_paths = PrivateProfilePaths();
+  // Folders on private_paths are 0777 too (their files stay 0600): FTP can delete a sign-in without
+  // reading it (#868). Off: they are 0700, as a live bottle's open profile keeps them.
+  bool open_private_folders = false;
+  // Files left exactly as they are (relative to the walked root), whatever private_paths says: a secret whose
+  // mode only Playden sets, or a title's game-launch.json, which the title shell wants 0600.
+  std::function<bool(const std::filesystem::path&)> keep_file;
+  // When set, a regular file (as the listing says) is opened and changed only when this says so (relative to the
+  // walked root): folders alone decide what FTP can delete, so a tree of many files is walked by its folders.
+  std::function<bool(const std::filesystem::path&)> visit_file;
   std::function<void(const std::filesystem::path&)> before_open;
 };
 SharedTreeResult OpenTreeToEveryone(const std::filesystem::path& root, const SharedTreeOptions& options = {});

@@ -342,6 +342,71 @@ void Share() {
   CHECK(BuildEffectiveSettings(filled.recipe, nullptr, {{"resolution", "1280x720"}}, kit, &after, &error));
   const auto kept = BuildSettingsOnlyRecipe(base, before, after, playden::GameRef::Steam(274520), "Darkwood");
   CHECK(kept.recipe.graphics.empty() && !Has(SerializeCommunityRecipe(kept), "\"graphics\""));
+  // Online is shared; the sign-in and invites stay each player's own; Offline emulation and its Steam network value
+  // are shared.
+  SetOnlineSteamEnabled(true);
+  kit.helper_process = true;  // Online runs Steam beside the game
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, {}, kit, &before, &error));
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, {{"unlock.steam_features", "on"}, {"steam_features", "online"},
+                                                        {"steam_sign_in", "kept"}, {"game_invites", "off"}}, kit, &after,
+                               &error));
+  CHECK(ChosenValue(after.values.at("steam_features")) == "online" && ChosenValue(after.values.at("steam_sign_in")) == "kept");
+  CHECK(ChosenValue(after.values.at("game_invites")) == "off");
+  const auto online = BuildSettingsOnlyRecipe(base, before, after, playden::GameRef::Steam(274520), "Darkwood");
+  CHECK(online.recipe.defaults.at("steam_features") == "online" && !online.recipe.defaults.count("steam_sign_in") &&
+        !online.recipe.defaults.count("game_invites"));
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, {{"unlock.steam_features", "on"}, {"steam_features", "emulate"},
+                                                        {"steam_network", "offline"}}, kit, &after, &error));
+  const auto offline = BuildSettingsOnlyRecipe(base, before, after, playden::GameRef::Steam(274520), "Darkwood");
+  CHECK(offline.recipe.defaults.count("steam_network") && offline.recipe.defaults.at("steam_network") == "offline");
+  SetOnlineSteamEnabled(false);
+  // The performance overlay is the player's own: a recipe fixes the game.
+  kit.dxvk_config = true;
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, {}, kit, &before, &error));
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, {{"performance_overlay", "on"}, {"overlay_detail", "full"}}, kit,
+                               &after, &error));
+  CHECK(after.values.at("performance_overlay").value == "on" && after.values.at("overlay_detail").available);
+  const auto overlay = BuildSettingsOnlyRecipe(base, before, after, playden::GameRef::Steam(274520), "Darkwood");
+  CHECK(!overlay.recipe.defaults.count("performance_overlay") && !overlay.recipe.defaults.count("overlay_detail"));
+  // Nor from a base shared before the overlay became the player's own.
+  auto old_base = base;
+  old_base.recipe.defaults["performance_overlay"] = "on";
+  old_base.recipe.defaults["overlay_detail"] = "full";
+  const auto from_old = BuildSettingsOnlyRecipe(old_base, before, before, playden::GameRef::Steam(274520), "Darkwood");
+  CHECK(!from_old.recipe.defaults.count("performance_overlay") && !from_old.recipe.defaults.count("overlay_detail"));
+  // Steam library folder: a game this Playden installed shows in Steam's folder by its own default
+  // ("default.steam_library_path"), which is no change: it stays out of the share, also against a base built without
+  // it. The player's choice goes in.
+  kit.steam_library_path = true;
+  const std::map<std::string, std::string> installed_here = {{"default.steam_library_path", "steam"}};
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, installed_here, kit, &before, &error));
+  auto changed = installed_here;
+  changed["resolution"] = "1280x720";
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, changed, kit, &after, &error));
+  CHECK(ChosenValue(after.values.at("steam_library_path")) == "steam");
+  auto library = BuildSettingsOnlyRecipe(base, before, after, playden::GameRef::Steam(274520), "Darkwood");
+  CHECK(!library.recipe.defaults.count("steam_library_path") && library.recipe.defaults.at("resolution") == "1280x720");
+  EffectiveSettings plain;
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, {}, kit, &plain, &error));
+  library = BuildSettingsOnlyRecipe(base, plain, after, playden::GameRef::Steam(274520), "Darkwood");
+  CHECK(!library.recipe.defaults.count("steam_library_path"));
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, {{"steam_library_path", "steam"}}, kit, &after, &error));
+  library = BuildSettingsOnlyRecipe(base, plain, after, playden::GameRef::Steam(274520), "Darkwood");
+  CHECK(library.recipe.defaults.at("steam_library_path") == "steam");
+  {
+    // A recipe that sets the row reads back and passes the community rules.
+    auto shared_row = library;
+    shared_row.recipe.id = "community-steam-274520-shared";
+    shared_row.title = "Shared";
+    CommunityRecipe reread_row;
+    std::string why;
+    CHECK(ParseCommunityRecipe(SerializeCommunityRecipe(shared_row), &reread_row, &why) &&
+          reread_row.recipe.defaults.at("steam_library_path") == "steam" && CommunityRecipeRefusals(reread_row).empty());
+  }
+  changed["steam_library_path"] = "playden";
+  CHECK(BuildEffectiveSettings(filled.recipe, nullptr, changed, kit, &after, &error));
+  library = BuildSettingsOnlyRecipe(base, before, after, playden::GameRef::Steam(274520), "Darkwood");
+  CHECK(library.recipe.defaults.at("steam_library_path") == "playden");
 }
 
 }  // namespace

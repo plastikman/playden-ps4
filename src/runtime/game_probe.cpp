@@ -1,5 +1,7 @@
 #include "runtime/game_probe.h"
 
+#include "platform/console_name.h"
+
 #include "runtime/prospero_profile.h"
 #include "runtime/steam_stub.h"
 
@@ -17,7 +19,6 @@
 
 #include <fcntl.h>
 #include <unistd.h>
-#include "platform/console_name.h"
 
 namespace playden::runtime {
 namespace {
@@ -79,6 +80,7 @@ struct Section {
   std::uint32_t address = 0;
   std::uint32_t size = 0;
   std::uint32_t raw = 0;
+  std::uint32_t raw_size = 0;  // bytes the file holds for it (SizeOfRawData)
   std::uint32_t flags = 0;
 };
 
@@ -93,7 +95,7 @@ struct PeFacts {
   // A writable section shared between processes that doesn't fill whole console pages.
   bool unaligned_shared = false;
   bool pe64 = false;                 // PE32+ (x64), otherwise PE32 (x86)
-  bool watcom = false;               // linked by Watcom (its BEGTEXT or DGROUP section)
+  bool watcom = false;               // linked by Watcom (its BEGTEXT or DGROUP section, or its banner at the entry)
   std::uint64_t resource_offset = 0;  // file offset of the resource directory, 0 when there is none
   std::uint32_t resource_size = 0;
   std::vector<std::string> imports;  // lower case
@@ -137,6 +139,7 @@ PeFacts ReadPe(const std::string& path, bool delay_imports = false) {
     section.address = U32(row + 12);
     section.size = std::max(U32(row + 8), U32(row + 16));
     section.raw = U32(row + 20);
+    section.raw_size = U32(row + 16);
     section.flags = U32(row + 36);
     const auto mapped = (U32(row + 8) + 0xfffu) & ~0xfffu;
     if ((section.flags & kSharedWritable) == kSharedWritable &&
@@ -153,6 +156,19 @@ PeFacts ReadPe(const std::string& path, bool delay_imports = false) {
   };
   for (const auto& section : list)
     if (entry >= section.address && entry - section.address < section.size) facts.entry_section = section.name;
+  // Watcom's startup jumps over its banner, so a program linked with other section names (NFS3's Modern Patch has
+  // .code and .data) still carries "WATCOM C/C++32 Run-Time system" a few bytes after its entry point.
+  // Only the entry section's own file bytes count: past them is another section, or memory the file doesn't hold.
+  for (const auto& section : list) {
+    if (facts.watcom || !entry || entry < section.address || entry - section.address >= section.raw_size) continue;
+    static constexpr std::string_view kBanner = "WATCOM C/C++32 Run-Time system";
+    unsigned char near_entry[64] = {};
+    const auto left = section.raw_size - (entry - section.address);
+    const auto count = program.ReadSome(static_cast<std::uint64_t>(section.raw) + (entry - section.address), near_entry,
+                                        std::min<std::size_t>(sizeof(near_entry), left));
+    const std::string_view window(reinterpret_cast<const char*>(near_entry), count);
+    facts.watcom = window.find(kBanner) != std::string_view::npos;
+  }
   facts.valid = true;
   if (const auto resource_rva = directory(2))
     if (const auto at = file_offset(resource_rva)) {
@@ -255,8 +271,11 @@ void AddImports(const PeFacts& facts, std::set<std::string>* apis) {
   }
 }
 
-// Engines known only by a name inside the program: SIL (FTL) reads SIL_WINDOWS_* settings. XNA games name its Game
-// assembly or Graphics namespace/manager; the framework name alone also appears in launchers (Borderlands 2).
+// Engines known only by a name inside the program: SIL (FTL) reads SIL_WINDOWS_* settings.
+// An XNA game names XNA's game or graphics parts: the Microsoft.Xna.Framework.Game assembly, the
+// Microsoft.Xna.Framework.Graphics namespace or GraphicsDeviceManager (FEZ, built on FNA, names the last two). Wine
+// Mono runs it on FNA, which draws through SDL and OpenGL (Celeste). The framework's name alone is not a game:
+// Borderlands 2's 2K launcher reads the pad through Microsoft.Xna.Framework.Input and draws nothing with XNA.
 constexpr std::pair<const char*, const char*> kEngineMarks[] = {{"sil_windows_use_", "sil"},
                                                                 {"microsoft.xna.framework.game", "xna"},
                                                                 {"microsoft.xna.framework.graphics", "xna"},
@@ -423,6 +442,30 @@ std::string LowerStem(const std::string& lower_file) {
   return EndsWith(lower_file, ".exe") ? lower_file.substr(0, lower_file.size() - 4) : lower_file;
 }
 
+// The Unity player beside a program that isn't one: a player needs its <stem>_Data folder, so a program beside
+// UnityPlayer.dll without one is a bootstrap or launcher (SUPERHOT.exe in front of SH.exe). It starts the player as a
+// child process, which the console cannot do. The one program here with a <stem>_Data folder, relative to root as
+// spelled on disk; empty when the program is a player, when no UnityPlayer.dll is here, or when there isn't exactly one.
+// A candidate counts only when it loads UnityPlayer.dll itself, so an unrelated tool with a <name>_Data folder doesn't.
+std::string UnityPlayerBeside(const fs::path& directory_path, const std::vector<std::pair<std::string, bool>>& here,
+                              const std::string& folder, const std::string& lower_file) {
+  if (!EndsWith(lower_file, ".exe") || Find(here, LowerStem(lower_file) + "_data", true) ||
+      !Find(here, "unityplayer.dll", false))
+    return {};
+  std::vector<std::string> players;
+  for (const auto& [name, directory] : here) {
+    const auto lower = Lower(name);
+    if (directory || !EndsWith(lower, ".exe") || !Find(here, LowerStem(lower) + "_data", true)) continue;
+    const auto facts = ReadPe((directory_path / name).string(), true);
+    const auto loads = [](const std::vector<std::string>& list) {
+      return std::find(list.begin(), list.end(), "unityplayer.dll") != list.end();
+    };
+    if (facts.valid && (loads(facts.imports) || loads(facts.delay_imports))) players.push_back(name);
+  }
+  if (players.size() != 1) return {};
+  return folder.empty() ? players.front() : folder + "/" + players.front();
+}
+
 // Microsoft's MFC library, which Wine doesn't provide: mfc140.dll, mfc140u.dll, mfcm140.dll, mfcm140u.dll (and
 // whatever later 140 builds add).
 bool MfcLibrary(const std::string& lower) {
@@ -473,42 +516,6 @@ MfcImports FindMfcImports(const std::string& install_root) {
   return out;
 }
 
-std::string UnrealGameProgram(const std::string& install_root, const std::string& executable) {
-  const fs::path root(install_root);
-  const auto slash = executable.rfind('/');
-  const std::string folder = slash == std::string::npos ? std::string() : executable.substr(0, slash);
-  const auto file = slash == std::string::npos ? executable : executable.substr(slash + 1);
-  const auto lower_file = Lower(file);
-  const auto here = Entries(root / folder);
-  // As ProbeGame decides: a Unity program beside an Engine folder is Unity's.
-  if (Find(here, "unityplayer.dll", false) || Find(here, LowerStem(lower_file) + "_data", true)) return {};
-  if (!UnrealLauncher(here, lower_file)) return {};
-  return FindShipping(root, folder, LowerStem(lower_file));
-}
-
-namespace {
-
-std::string UnityPlayerBeside(const fs::path& directory_path, const std::vector<std::pair<std::string, bool>>& here,
-                              const std::string& folder, const std::string& lower_file) {
-  if (!EndsWith(lower_file, ".exe") || Find(here, LowerStem(lower_file) + "_data", true) ||
-      !Find(here, "unityplayer.dll", false))
-    return {};
-  std::vector<std::string> players;
-  for (const auto& [name, directory] : here) {
-    const auto lower = Lower(name);
-    if (directory || !EndsWith(lower, ".exe") || !Find(here, LowerStem(lower) + "_data", true)) continue;
-    const auto facts = ReadPe((directory_path / name).string(), true);
-    const auto loads = [](const std::vector<std::string>& list) {
-      return std::find(list.begin(), list.end(), "unityplayer.dll") != list.end();
-    };
-    if (facts.valid && (loads(facts.imports) || loads(facts.delay_imports))) players.push_back(name);
-  }
-  if (players.size() != 1) return {};
-  return folder.empty() ? players.front() : folder + "/" + players.front();
-}
-
-}  // namespace
-
 std::string UnityGameProgram(const std::string& install_root, const std::string& executable) {
   const auto slash = executable.rfind('/');
   const std::string folder = slash == std::string::npos ? std::string() : executable.substr(0, slash);
@@ -520,6 +527,19 @@ std::string UnityGameProgram(const std::string& install_root, const std::string&
 std::string GameProgramInstead(const std::string& install_root, const std::string& executable) {
   auto program = UnrealGameProgram(install_root, executable);
   return program.empty() ? UnityGameProgram(install_root, executable) : program;
+}
+
+std::string UnrealGameProgram(const std::string& install_root, const std::string& executable) {
+  const fs::path root(install_root);
+  const auto slash = executable.rfind('/');
+  const std::string folder = slash == std::string::npos ? std::string() : executable.substr(0, slash);
+  const auto file = slash == std::string::npos ? executable : executable.substr(slash + 1);
+  const auto lower_file = Lower(file);
+  const auto here = Entries(root / folder);
+  // As ProbeGame decides: a Unity program beside an Engine folder is Unity's.
+  if (Find(here, "unityplayer.dll", false) || Find(here, LowerStem(lower_file) + "_data", true)) return {};
+  if (!UnrealLauncher(here, lower_file)) return {};
+  return FindShipping(root, folder, LowerStem(lower_file));
 }
 
 bool ProgramUsesPhysx(const std::string& install_root, const std::string& executable) {
@@ -736,7 +756,7 @@ bool WatcomProgram(const std::string& path) {
 int DefaultsRevision(std::string_view engine) {
   engine = engine.substr(0, engine.find_first_of(", "));
   if (engine == "nwjs") return 2;  // 1: low-end device mode and a larger V8 heap. 2: low-end device mode gone
-  if (engine == "xna") return 1;   // 1: XNA's name alone no longer makes a .NET launcher the game
+  if (engine == "xna") return 1;   // 1: XNA's name alone no longer makes a .NET launcher the game (Borderlands 2)
   return 0;
 }
 

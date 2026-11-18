@@ -23,6 +23,7 @@
 #include "community/recipe_service.h"
 #include "community/recipe_store.h"
 #include "homebrew/sharing_service.hpp"
+#include "homebrew/web_recipe_imports.hpp"
 #include <chrono>
 #include <map>
 #include <mutex>
@@ -50,14 +51,9 @@ std::function<std::optional<std::set<std::string>>()> CommunityKeepCallback(std:
 std::optional<std::set<std::string>> CommunityKeepRevisions(const Simulation& model, const RuntimeSnapshot* runtime,
                                                            bool has_runtime, bool no_runtime_installs);
 // RuntimeHostConfig::community_recipe_bytes over that store: a full revision's object, or the object a
-// 32-hex prefix names (RecipeStore::FindObjectByPrefix). Runs on the runtime worker. create: the store's folders are
-// made when missing (community recipes on); else only a cache already there is read (RecipeStore::OpenExisting).
-std::function<std::optional<std::string>(std::string_view)> CommunityRecipeBytes(std::shared_ptr<community::RecipeStore> objects,
-                                                                                 bool create = true);
-// Simulation::SetCommunityRecipeLoader over a cache that is already there (community recipes off): reads and checks
-// a stored object as the service does, and never makes the store's folders (RecipeStore::OpenExisting).
-std::function<std::optional<runtime::CommunityRecipe>(const std::string&)> CommunityRecipeCacheLoader(
-    std::shared_ptr<community::RecipeStore> cache);
+// 32-hex prefix names (RecipeStore::FindObjectByPrefix). Runs on the runtime worker; the store's folders are made
+// when missing.
+std::function<std::optional<std::string>(std::string_view)> CommunityRecipeBytes(std::shared_ptr<community::RecipeStore> objects);
 // What the "Store name in PS5 titles" setting adds to a game's title name: " (Steam)"; imported games
 // have no store to name.
 std::string TitleStoreSuffix(Store store);
@@ -98,6 +94,12 @@ class Controller {
   // Settings › Web access turns it on and off (once the saved preferences are read); the signed-in account's
   // name and SteamID go to it for redaction. Shutdown stops it.
   void SetWebAccess(web::Service* web) { web_ = web; }
+  // GOG's phone sign-in (web access serves its page): a sign-in from the TV opens it with a one-time token, and the
+  // QR code the model shows is web access's address with that token after "gog#".
+  void SetGogRelay(std::shared_ptr<web::GogRelay> relay) { gog_relay_ = std::move(relay); }
+  // Recipe files a paired browser sends: each tick the controller makes their games use them and answers the page.
+  // Shutdown closes it, so no server worker waits on a controller that is gone.
+  void SetRecipeImports(std::shared_ptr<WebRecipeImports> imports) { recipe_imports_ = std::move(imports); }
   // Community recipes: the catalog reaches the chooser, the Install sheet and a periodic tick ask for
   // a refresh (the service limits itself to one a day), and keep receives what the cache must keep.
   // The service must outlive the controller. no_runtime_installs: this build never has a runtime (the
@@ -105,9 +107,6 @@ class Controller {
   // means its installs are unknown and nothing is collected.
   void SetCommunityRecipes(community::CommunityRecipeService* service, std::shared_ptr<CommunityKeepSet> keep,
                            bool no_runtime_installs = false);
-  // Community recipes off (features.txt): no service. The model still loads the recipes games already chose from the
-  // cache that is there, without making its folders, so their settings resolve and show as before.
-  void SetCommunityRecipeCache(std::shared_ptr<community::RecipeStore> cache);
   // Sharing recipes and votes: the model's requests go to the service's worker, its answers and vote
   // memory come back. The service must outlive the controller.
   void SetSharing(SharingService* sharing) { sharing_ = sharing; sharing_memory_revision_ = ~0ull; }
@@ -143,6 +142,12 @@ class Controller {
   // model's import requests (look for games, add, remove) go to it, and removing an imported game
   // removes its PS5 title first, keeping its bottle as kept data. Set before the first Tick.
   void SetLocalLibrary(stores::local::LocalLibrarySource* local) { local_ = local; }
+  // The sign-in generation of another store's account: starts at 1 and goes up at each sign-in, offline start,
+  // sign-out and expiry, so work asked for under an older one can be dropped. 0 for Steam (its own is the model's
+  // account generation) and for a store with no account registered.
+  std::uint64_t StoreGeneration(Store store) const;
+  // Tests: whether the game's launch options, from its store's details, are known.
+  bool KnowsLaunchOptions(const GameId& id) const { return launch_options_.count(id) != 0; }
   // Tests: how long a Play or preparation waits for a drop-folder game's files to be opened.
   void SetDropFolderOpenTimeout(std::chrono::milliseconds timeout) { drop_folder_open_timeout_ = timeout; }
   Controller(const Controller&) = delete;
@@ -166,10 +171,52 @@ class Controller {
   void BeginOrganizationClear();
   void AdvanceOrganizationClear();
   void Apply(const steam::SteamEvent& event);
+  // Every other store's account (GOG): restored at startup next to Steam's, signed out from its own row, and
+  // its library loaded for the account that signs in. Steam's sign-in is untouched by it.
+  struct OtherAccount {
+    stores::StoreAccount* account = nullptr;
+    std::uint64_t request = 0;     // the restore or sign-in waiting for its answer; 0 for none
+    std::uint64_t generation = 1;  // StoreGeneration
+    std::uint64_t account_key = 0;  // the signed-in account's (0: none)
+    AuthState state = AuthState::SignedOut;        // as the model last got it
+    AuthState established = AuthState::SignedOut;  // SignedIn or Offline while an account is signed in
+    bool signing_out = false;      // SignOut asked: only its answer (or a failure) counts until it comes
+    bool signing_in = false;       // request is a sign-in the player started (BeginSignIn), not a restore
+  };
+  std::vector<OtherAccount> other_accounts_;
+  OtherAccount* FindOtherAccount(Store store);
+  void OtherAccountAction(OtherAccount& other, ServiceAction action);
+  void Apply(OtherAccount& other, stores::AccountEvent& event);
+  void UpdateOther(OtherAccount& other, AccountUpdate update);
+  // GOG's sign-in from the TV: the relay's QR address follows its token and web access's address.
+  std::shared_ptr<web::GogRelay> gog_relay_;
+  void BeginGogSignIn(OtherAccount& other);
+  void CancelGogSignIn(OtherAccount& other);
+  void TickGogRelay();
+  // web access's page address + "gog#" + token; empty while web access is off or has no address.
+  std::string GogChallengeUrl(const std::string& token) const;
   void Update(AuthState state, const std::string& error = {}, bool clear = false,
               const std::string& challenge = {}, SignInStep step = SignInStep::Qr,
               const steam::SteamEvent* prompt = nullptr, bool storage_full = false, bool restoring = false);
   void TickAppDetails();
+  // Every other store's details (GOG): asked for when one of its games' pages opens while the store can answer,
+  // and dropped when they are from an earlier sign-in. A store whose source checks updates (GOG) runs its own
+  // update check and measures its updates' sizes, on its own sign-in generation, not Steam's.
+  void TickOtherDetails();
+  struct OtherDetails {
+    std::uint64_t generation = 0;  // StoreGeneration (1 for a store without accounts) the source last had
+    std::optional<GameId> requested;
+    std::map<GameId, DetailsAsked> pages;  // what each visited page's details were last asked with
+    bool checking = false;  // the store's installed-games update check runs on its source
+  };
+  std::map<Store, OtherDetails> other_details_;
+  // One store's details answer, for its own account: the game's sizes and versions in the model, and its launch
+  // options for the next preparation. check_waits: Steam's update check still waits for the licenses, so the answer
+  // leaves the saved update list alone.
+  void ApplyGameDetails(const stores::GameDetails& details, bool check_waits);
+  // The store's installed games whose update has no size yet, each sent to its store's details source; one that
+  // can't take it (no source, a full queue) leaves the size unknown.
+  void MeasureUpdates(Store store, std::uint64_t generation);
   void TickStoreDetails();
   steam::StoreDetailsService* store_details_ = nullptr;
   std::optional<GameId> requested_store_detail_;
@@ -179,6 +226,9 @@ class Controller {
   steam::DownloadServerService* download_servers_ = nullptr;
   web::Service* web_ = nullptr;
   void TickWebAccess();
+  void TickRecipeImports();
+  std::shared_ptr<WebRecipeImports> recipe_imports_;
+  std::set<std::string> web_setting_up_;  // the FileGame ids being set up, as TickWebFiles last reported them
   // Reports what the page's Files tab offers, about once a second, and keeps the running games current while it is in use.
   void TickWebFiles();
   std::chrono::steady_clock::time_point web_files_next_{};
@@ -214,6 +264,11 @@ class Controller {
   void TickCommunity();
   void TickSharing();
   SharingService* sharing_ = nullptr;
+  // The signed-in accounts web access and shared reports redact, by store label ("steam"): one store's sign-out
+  // leaves the others'.
+  std::map<std::string, web::RedactedAccount> redacted_accounts_;
+  // Keeps one store's account (removed when it has no name and no ID) and hands them all to web access and sharing.
+  void SetRedactedAccount(web::RedactedAccount account);
   std::uint64_t sharing_memory_revision_ = ~0ull;
   community::CommunityRecipeService* community_ = nullptr;
   std::shared_ptr<CommunityKeepSet> community_keep_;
@@ -227,6 +282,8 @@ class Controller {
   stores::Registry& stores_;
   stores::DetailsSource* app_details_ = nullptr;  // Steam's
   steam::InstallService* installs_ = nullptr;
+  // The install registry was checked against the PS5 titles' records once this session (InstallService::Recover).
+  bool registry_reconciled_ = false;
   std::uint64_t install_revision_ = 0;
   std::uint64_t install_generation_ = 0;
   steam::CloudService* cloud_ = nullptr;
@@ -294,6 +351,10 @@ class Controller {
   // Steam's folder name for each game (installdir), from app details: a preparation records it for the title.
   std::map<GameId, std::string> steam_install_dirs_;
   std::map<GameId, std::string> launch_options_reason_;
+  // The programs an installed game's own files name (GOG's play tasks), from its install record: Prepare uses them
+  // signed out and offline. Refilled from every install snapshot; no sign-in or sign-out touches them.
+  std::map<GameId, std::vector<stores::LaunchOption>> record_launches_;
+  std::optional<std::uint64_t> record_launches_revision_;  // the install snapshot they were read from
   std::set<GameId> prepare_after_details_;
   // announce: tell the player when this preparation leaves the game ready to play
   // (waiting for the PS5 to register it); the startup check does not.
@@ -332,7 +393,8 @@ class Controller {
   std::set<GameId> downloading_;
   std::set<GameId> updating_;  // the install jobs that are updates of installed games
   std::set<GameId> moving_;    // the install jobs that move installed games to another drive
-  // Installed games whose update finished: their Steam details (launch options, update state) are asked again.
+  // Installed games whose update finished: their store's details (launch options, update state) are asked again,
+  // Steam's by TickAppDetails while signed in to Steam, other stores' by TickOtherDetails.
   std::set<GameId> refresh_details_;
   std::uint64_t licenses_read_ = 0;  // app::LibraryController::LicensesRead last seen
   std::vector<GameId> auto_prepare_;  // in the order their downloads (copies, imports) finished
@@ -367,6 +429,7 @@ class Controller {
     std::chrono::steady_clock::time_point submitted_at{};
   };
   std::map<GameId, Recreate> recreate_;
+  std::uint64_t playden_removals_seen_ = 0;  // RuntimeSnapshot::playden_removals_handled already shown
   std::map<GameId, std::pair<bool, std::string>> recreate_results_;
   // Maintenance › Update runtime: the preparation Play runs first for a title on an older kit's runtime (RunPrepare's
   // update, with its settings republish), without starting the game. Results stay for the maintenance sheet.
@@ -448,8 +511,7 @@ class Controller {
   bool SessionActive(GameId id) const;
   std::chrono::steady_clock::time_point volume_refreshed_at_{};
   std::optional<std::chrono::steady_clock::time_point> licenses_notice_at_;  // when a license check starts showing
-  std::optional<GameId> requested_detail_;
-  std::map<GameId, DetailsAsked> details_asked_;  // what each visited page's details were last asked with
+  DetailsPageAsks details_pages_;
   std::uint64_t requested_generation_ = 0;
   bool update_check_running_ = false;  // an installed-games update check the details service runs
   std::vector<GameId> update_check_ids_;  // its games, to start it again after a language change

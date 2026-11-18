@@ -70,6 +70,9 @@ struct KitCapabilities {
   bool steam_library_path_needs_update = false;
   bool game_root_unowned = false;  // games start from drives that record no file owners (exFAT)
   bool bottle_profile_shared = false;  // the bottle's 4 folders to its user profile may be 0711
+  // The title's start check admits Playden's folders and files at any mode of its user's (#868). Counts only for a
+  // title made from this kit: an older title shell still wants them owner-only.
+  bool publication_open_modes = false;
   bool opengl_zink = false;        // OpenGL games draw through Mesa's Zink, not the PS5 OpenGL SDK
   bool wine_mono = false;          // .NET programs start on the kit's Wine Mono
   bool vkd3d_proton = false;       // the kit's runtime carries vkd3d-proton's Direct3D 12 DLLs
@@ -255,7 +258,9 @@ struct GameRecipe {
   // Files Playden ships in runtime/recipes/files/<recipe id>, placed at these paths in the game folder when its files
   // are prepared, for a game that can't run on the console without them (runtime/recipe_files.h). Shipped recipes only.
   std::vector<std::string> game_files;
-  // Files an earlier recipe placed with game_files, and their shipped SHA-256; remove only Playden's unchanged copy.
+  // Files an earlier version of this recipe placed with game_files, and the SHA-256 (64 lowercase hex) of each as it
+  // was shipped: removed from the game folder when its files are prepared, if the file there still has those bytes
+  // (runtime/recipe_files.h). Shipped recipes only.
   std::vector<std::pair<std::string, std::string>> retired_game_files;
   // What the kit's template bottle must provide ("audio": "ps5"); see UnmetRecipeRequirements.
   std::map<std::string, std::string> requirements;
@@ -414,6 +419,8 @@ struct EffectiveSettings {
   // needs it.
   bool helper_process = false;
   bool helper_process_needs_update = false;
+  // The title's runtime reads the profile's [environment] section (KitCapabilities::environment).
+  bool environment_section = false;
 };
 
 // The launch entry id of a program the player chose from the game folder.
@@ -501,6 +508,12 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
 // dxvk.conf for the game folder; empty when no DXVK option differs from DXVK's default.
 std::string RenderDxvkConfig(const EffectiveSettings& settings);
 
+// One runtime log line's worth of the settings a launch runs with: whether the performance overlay is on (and its
+// detail), then every row the player or the chosen preset set, as id=value ("chosen=-" when none). Text rows (Extra
+// arguments, a program, environment variables) may hold anything the player typed, so only their id is named
+// (id=set). A row that can't apply here says so: id=value(unavailable).
+std::string SettingsLogSummary(const EffectiveSettings& settings);
+
 // Writes what the next launch reads: <prospero_root>/profiles/<id>.profile (listed in
 // profiles.lst) and <install_root>/dxvk.conf. An empty config removes Playden's dxvk.conf.
 // A dxvk.conf Playden did not write (no Playden header) is never replaced or removed; the
@@ -539,15 +552,20 @@ bool UsesGeneratedLaunch(const GameRecipe& recipe);
 // locks nothing. With graphics "dxvk", BuildEffectiveSettings adds kDxvkOverrides.
 // A Steam game's generated recipe id, "steam-<app id>-auto" (playden::GeneratedRecipeId).
 std::string GeneratedRecipeId(std::uint32_t app_id);
-// "steam-<app id>-auto" or "local-<uuid>-auto".
+// "steam-<app id>-auto", "gog-<product id>-auto" or "local-<uuid>-auto"; the GOG and Local ones name a valid game.
 bool IsGeneratedRecipeId(std::string_view id);
 // A generated recipe set up with older defaults for its engine (DefaultsRevision) takes the current ones from its
 // program's files: arguments, graphics and what those imply. Its id, version and programs stay, and what the player
 // changed is kept apart from the recipe, so it still wins. False when nothing changed, also when the program can't be
 // read now (a drive not plugged in): the next Play tries again. A 32-bit recipe set up before Watcom programs got
-// Translator takes only that default when its program is one (WatcomProgram). A generated recipe whose first program
-// is Steam's and only starts the game can be refreshed to put the game's own program first.
+// Translator takes only that default when its program is one (WatcomProgram). A recipe whose first program is a
+// Unity bootstrap beside the player (UnityGameProgram) starts the player instead. One whose first program is Steam's and
+// now only starts the game is made again, as a new setup makes it, when that finds the game's own program.
 bool RefreshRecipeDefaults(const std::string& install_root, const KitCapabilities& kit, GameRecipe* recipe);
+// Sets each launch entry's working folder to its spelling on disk under install_root. Windows ignores case, so Steam
+// and recipes made on it may name System/ as "system" (Unreal Tournament, #844); the console's disk doesn't. A folder
+// that isn't there is left as named. True when an entry changed.
+bool MatchWorkingFoldersToDisk(const std::string& install_root, GameRecipe* recipe);
 // A community recipe (docs/community-recipes.md): community-<store>-<key>-<slug>, or community-<store>-<key> as Export
 // as recipe writes it before the author picks a slug (CommunityRecipeRefusals refuses that form). Only the shape is
 // checked (^community-(steam|epic|gog|imported)-[a-z0-9]+(-[a-z0-9]+)*$, at most 128 bytes): an id is only compared
@@ -792,7 +810,9 @@ CommunityRecipe BuildSettingsOnlyRecipe(const CommunityRecipe& base, const Effec
 // The rows that choose the program or how it starts, which a settings-only recipe takes from Playden's recipe: a
 // player's change to one makes a share name its program.
 bool IsProgramRow(std::string_view id);
-// Player-specific rows are not included in community recipes or counted as share changes.
+// The player's own rows, which no community recipe carries and a share doesn't count as a change: Extra arguments,
+// Known problems, Logging, the performance overlay, and the Steam sign-in and invites (they hand over the player's
+// Steam account). A recipe fixes the game.
 bool IsPersonalSettingRow(std::string_view id);
 // A community recipe as the recipe of one installed game: recipe.app_id its runtime number, recipe.game the game.
 void BindCommunityRecipe(CommunityRecipe* community, const GameId& game, std::uint32_t runtime_number);
@@ -839,6 +859,10 @@ inline constexpr const char* kKitGameRootUnowned = "game-root-unowned";
 // Runtime ability: launch admission accepts 0711 as well as 0700 for the bottle's way to its user
 // profile (games/<id>, library, library/prefixes, library/prefixes/game), so FTP can reach the saves.
 inline constexpr const char* kKitBottleProfileShared = "bottle-profile-shared";
+// Runtime ability: launch admission accepts the bottle folders, the control folder, the lock, the receipt, the
+// profiles, the input presets, user.reg and game-launch.json at any mode, as long as they are the app user's, have
+// one link and are not links; the title makes its session folders 0777 (#868).
+inline constexpr const char* kKitPublicationOpenModes = "publication-open-modes";
 // Runtime ability: OpenGL games draw through Mesa's WGL/Zink on Vulkan (prospero-win upstream #463-#465)
 // instead of the PS5 OpenGL SDK, which had the 120 Hz output and the OpenGL worker thread.
 inline constexpr const char* kKitOpenGLZink = "opengl-zink";
@@ -883,7 +907,7 @@ inline constexpr const char* kKitDisplayFpsCounter = "display-fps-counter";
 // program, and the touchpad hold that swaps them. Runtimes without it refuse a profile with the section.
 inline constexpr const char* kKitLauncherMode = "launcher-mode";
 // The title reads [launcher] chain = off: no exec chain, the game starts on [input], and holding the touchpad swaps to
-// the [launcher] lines and back (Touchpad hold). Runtimes without it refuse the profile key.
+// the [launcher] lines and back (Touchpad hold). Runtimes without it refuse a profile with the key.
 inline constexpr const char* kKitTouchpadSwitch = "touchpad-switch";
 // The title takes [input] mode = playstation: the game's Wine finds the DualSense as a wired DualShock 4 on its HID
 // bus, with the controller's own reports, and XInput reports no controller. Runtimes without it refuse the value.
@@ -915,8 +939,8 @@ KitCapabilities KitCapabilitiesFromManifest(const std::vector<std::string>& capa
 // The installed kit's capabilities for one game's title. A prepared title keeps its own copy of the runtime until
 // Update, so a capability that adds profile keys counts only when the title runs this kit's runtime
 // (title_runtime_current: the title's owner markers name this kit, PackageInstaller::TitleCurrent). Otherwise
-// display_120hz, profile_version_2, input_rumble, display_framegen, display_fps_counter, input_playstation,
-// touchpad_switch and title_notify are off and their _needs_update say why.
+// display_120hz, profile_version_2, input_rumble, display_framegen, display_fps_counter, input_playstation and
+// title_notify are off and their _needs_update say why.
 KitCapabilities KitForTitleRuntime(KitCapabilities kit, bool title_runtime_current);
 // Whether any capability the kit has counts only for a title on its runtime: whether KitForTitleRuntime would turn
 // something off for an older title. Reading the title's markers is worth it only then.
@@ -963,19 +987,21 @@ bool BuildSettingsLaunchPlan(const SettingsLaunchInput& input, SettingsLaunchPla
 bool ApplySettingsFiles(const SettingsLaunchPlan& plan, const std::string& install_root, const std::string& prefix_dir,
                         std::int64_t unix_time, std::string* reason);
 
-// A file in the private settings folder (game-settings-private/, settings_storage.h): a regular file owned by the
-// effective user, 0600 or 0644, in a folder opened with DirectoryPolicy::kPrivate. A missing folder or file is
+// A file in the settings folder (game-settings-private/, settings_storage.h; the name is from when it was owner-only):
+// a regular file owned by the effective user at any mode, in a folder of the app user's at any mode
+// (DirectoryPolicy::kOpenTree, #868: written 0666, and a recursive chmod over FTP may leave anything). A missing folder or file is
 // kMissing; anything else that can't be read safely (another owner or mode, a symlink, over 1 MiB) is kError.
 enum class PrivateSettingsRead { kMissing, kPresent, kError };
 PrivateSettingsRead ReadPrivateSettingsFile(const std::string& path, std::string* text);
-// Replaces it atomically (a synced temporary file renamed over it), mode 0600. Refuses one it could not read back.
+// Replaces it atomically (a synced temporary file renamed over it), mode 0666. Refuses one it could not read back.
 bool WritePrivateSettingsFile(const std::string& path, const std::string& text);
 // Renames it to aside_name in the same folder; never replaces a file already named so (false, EEXIST).
 bool SetPrivateSettingsFileAside(const std::string& path, const std::string& aside_name);
 
 // Per-game records in one small JSON file ({"version":1,"games":{"<key>":record}}), keyed by
-// ToKey: a Steam game's app ID, "local-<uuid>" for an imported game. A missing file loads as no
-// records. Saving replaces the file atomically.
+// ToKey: a Steam game's app ID, "gog-<id>" for a GOG game, "local-<uuid>" for an imported game. A
+// record under a key this build can't read is skipped. A missing file loads as no records. Saving
+// replaces the file atomically.
 bool LoadGameSettingsFile(const std::string& path, std::map<GameId, GameSettingsRecord>* records,
                           std::string* reason);
 bool SaveGameSettingsFile(const std::string& path, const std::map<GameId, GameSettingsRecord>& records,

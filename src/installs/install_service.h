@@ -33,9 +33,9 @@ struct InstallRequest {
   std::string program;
 };
 // Development request file (dev/install-request.txt), one command per line, in order, at most 64:
-//   <game>                              Steam: install; Local: prepare (set up) the imported game
-//   uninstall <game>                    Steam: uninstall; Local: remove from the library (files stay)
-//   cancel <app id>                     Steam only: cancel the download
+//   <game>                              Steam, GOG: install; Local: prepare (set up) the imported game
+//   uninstall <game>                    Steam, GOG: uninstall; Local: remove from the library (files stay)
+//   cancel <game>                       Steam, GOG: cancel the download
 //   copy <local game> [volume]          copy an imported game playing in place into Playden (volume:
 //                                       an install volume id; default: the default volume)
 //   move <local game>                   move an imported game from the drop folder into Playden
@@ -43,7 +43,7 @@ struct InstallRequest {
 //   import <volume> <folder> <program>  add a game playing in place (volume: internal, m2, extended,
 //                                       usb0 to usb7; folder: a name in that drive's import folder, or a
 //                                       path from the drive's root; program: inside the folder)
-// <game> is a Steam app ID (strict decimal) or "local-<uuid>". Words are separated by spaces or tabs;
+// <game> is a Steam app ID (strict decimal), "gog-<product id>" (strict decimal) or "local-<uuid>". Words are separated by spaces or tabs;
 // a word with spaces goes in double quotes ("Old School Rally"), which can't hold a quote themselves.
 // A line that doesn't parse is skipped.
 std::vector<InstallRequest> ParseInstallRequests(const std::string& text);
@@ -53,7 +53,8 @@ std::vector<InstallRequest> ParseInstallRequests(const std::string& text);
 struct InstallOptions {
   std::string language;  // a Steam content language code ("german")
   std::string branch;    // a Steam branch name
-  std::vector<std::uint32_t> excluded_dlc;  // DLC the player turned off, sorted: not claimed, downloaded or reported
+  // DLC the player turned off, sorted, each in the game's own store: not claimed, downloaded or reported
+  std::vector<GameId> excluded_dlc;
   // An update that changes the game's DLC (Manage DLC): `excluded_dlc` is the whole choice and replaces what the
   // install record left out, so DLC can be turned on again. Otherwise an update leaves out the record's DLC too.
   bool dlc_choice = false;
@@ -325,6 +326,15 @@ class InstallService {
   // (or was already); false when the game has a job or files being deleted, its store no runner, or
   // the record is missing.
   bool Adopt(GameId id, const std::string& volume_id, std::uint64_t install_bytes);
+  // Lists again complete installs that the registry lost (it was damaged by a crash or power loss), each named by
+  // its game and the folder its PS5 title starts it from. A game is listed only when that folder is its folder on
+  // an available volume (`<games root>/<key>`) and holds its install record, and it isn't listed already, has no
+  // job and no files being deleted. An update found on disk comes back as Scan brings it back (locked while it puts
+  // its files in place). The registry is saved once. Returns how many were listed.
+  std::size_t Recover(const std::vector<std::pair<GameId, std::string>>& titles);
+  // Receives one line about the registry the service started from (how many games it named, or that it was
+  // missing), at once, and one per game Recover lists again.
+  void SetLog(std::function<void(const std::string&)> log);
   // Chooses the volume for installs queued from now on; ignored unless it names an available volume.
   void SetDefaultVolume(const std::string& volume_id);
   // Takes a finished download, or every one, off the Completed list in Downloads.
@@ -391,8 +401,11 @@ class InstallService {
   void QueueRemoval(Removal removal);
   Job* Find(GameId id);
   void Publish();
-  // False when it wasn't saved. sync: the file and its folder are on the storage before it returns.
-  bool SaveRegistry(bool sync = false);
+  // False when it wasn't saved. The file and its folder are on the storage before it returns: a crash or power
+  // loss leaves the old registry or the new one, never an empty file (that would forget every installed game).
+  bool SaveRegistry();
+  // Under the lock: lists a complete install from its folder on an available volume (Adopt, Recover).
+  bool AdoptLocked(GameId id, const std::string& volume_id, std::uint64_t install_bytes, bool publish);
   void SaveDefaultVolume();
   void SaveDismissed();
   void Dismiss(GameId id);
@@ -429,6 +442,8 @@ class InstallService {
   std::atomic<bool> active_cancel_{false};
   std::uint64_t revision_ = 0;
   bool stopping_ = false;
+  std::string scan_summary_;  // what Scan found in the registry, for SetLog
+  std::function<void(const std::string&)> log_;  // guarded by mutex_
   std::thread worker_;
 };
 

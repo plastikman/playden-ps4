@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -55,6 +56,7 @@ std::vector<std::uint8_t> LogonResponseBody(std::int32_t eresult, std::int32_t h
 struct Script {
   std::mutex mutex;
   int failing_connects = 0;
+  HttpError connect_error = HttpError::kConnectionFailed;  // what a failing connect reports
   int connects = 0;
   bool closed = false;
   std::vector<cm::Frame> sent;
@@ -68,6 +70,8 @@ struct Script {
   std::chrono::milliseconds pics_delay{0};
   // When set, answers each PICS request instead of on_pics.
   std::function<std::vector<std::uint8_t>(const cm::Frame&)> pics_reply;
+  // When set, answers each request (emsg or service call) instead of on_emsg and on_service.
+  std::function<std::vector<std::uint8_t>(const cm::Frame&)> reply;
 
   void Queue(std::vector<std::uint8_t> frame, std::chrono::milliseconds delay = 0ms) {
     inbox.emplace_back(std::chrono::steady_clock::now() + delay, std::move(frame));
@@ -81,7 +85,7 @@ class FakeTransport final : public MessageTransport {
     std::lock_guard<std::mutex> lock(script_->mutex);
     assert(url.rfind("wss://", 0) == 0 && url.find("/cmsocket/") != std::string::npos);
     ++script_->connects;
-    if (script_->failing_connects-- > 0) return HttpError::kConnectionFailed;
+    if (script_->failing_connects-- > 0) return script_->connect_error;
     return HttpError::kNone;
   }
   HttpError Send(const std::vector<std::uint8_t>& message, std::uint32_t,
@@ -95,10 +99,14 @@ class FakeTransport final : public MessageTransport {
       script_->Queue(script_->pics_reply(frame), script_->pics_delay);
     else if (frame.emsg == cm::kEMsgClientPICSProductInfoRequest)
       for (const auto& reply : script_->on_pics) script_->Queue(reply, script_->pics_delay);
-    if (frame.emsg == cm::kEMsgServiceMethodCallFromClient)
-      for (const auto& reply : script_->on_service) script_->Queue(reply);
-    if (const auto found = script_->on_emsg.find(frame.emsg); found != script_->on_emsg.end())
-      for (const auto& reply : found->second) script_->Queue(reply);
+    if (script_->reply && frame.emsg != cm::kEMsgClientLogon) {
+      if (auto answer = script_->reply(frame); !answer.empty()) script_->Queue(std::move(answer));
+    } else {
+      if (frame.emsg == cm::kEMsgServiceMethodCallFromClient)
+        for (const auto& reply : script_->on_service) script_->Queue(reply);
+      if (const auto found = script_->on_emsg.find(frame.emsg); found != script_->on_emsg.end())
+        for (const auto& reply : found->second) script_->Queue(reply);
+    }
     script_->raw_sent.push_back(message);
     script_->sent.push_back(std::move(frame));
     return HttpError::kNone;
@@ -816,6 +824,294 @@ void SharedSessionCountsLicenseChanges() {
   assert(CountSent(script, cm::kEMsgClientLogon) == 2);
 }
 
+constexpr std::uint64_t kMara = 0x0110000100000001ull;
+constexpr std::uint64_t kRui = 0x0110000100000002ull;
+constexpr std::uint64_t kJun = 0x0110000100000003ull;
+constexpr std::uint64_t kClan = 0x0170000000000004ull;
+
+std::vector<std::uint8_t> FriendsListFrame(bool incremental, const std::vector<std::pair<std::uint64_t, std::uint32_t>>& friends) {
+  proto::Writer body;
+  body.AddVarint(1, incremental ? 1 : 0);
+  for (const auto& [id, relationship] : friends) {
+    proto::Writer entry;
+    entry.AddFixed64(1, id);
+    entry.AddVarint(2, relationship);
+    body.AddMessage(2, entry);
+  }
+  return ServerFrame(cm::kEMsgClientFriendsList, body.bytes());
+}
+
+std::vector<std::uint8_t> PersonaFrame(std::uint32_t flags, const std::vector<proto::Writer>& entries) {
+  proto::Writer body;
+  body.AddVarint(1, flags);
+  for (const auto& entry : entries) body.AddMessage(2, entry);
+  return ServerFrame(cm::kEMsgClientPersonaState, body.bytes());
+}
+
+std::vector<std::uint8_t> AvatarBytes() {
+  std::vector<std::uint8_t> avatar(20);
+  for (std::size_t i = 0; i < avatar.size(); ++i) avatar[i] = static_cast<std::uint8_t>(0xa0 + i);
+  return avatar;
+}
+
+proto::Writer MaraPlaying() {
+  proto::Writer entry;
+  entry.AddFixed64(1, kMara);
+  entry.AddVarint(2, 1);
+  entry.AddVarint(3, 440);
+  entry.AddString(15, "Mara");
+  entry.AddBytes(31, AvatarBytes());
+  entry.AddFixed64(56, 440);
+  entry.AddFixed64(73, 0x0186000000000009ull);
+  return entry;
+}
+
+const CmFriend* FindFriend(const CmFriends& friends, std::uint64_t id) {
+  for (const auto& person : friends.friends)
+    if (person.steam_id == id) return &person;
+  return nullptr;
+}
+
+template <typename Ready>
+bool WaitUntil(Ready ready) {
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!ready() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
+  return ready();
+}
+
+// Without online-steam the session ignores the friends list Steam pushes and never asks for persona states.
+void FriendsOffSendsNoFriendRequest() {
+  auto script = std::make_shared<Script>();
+  script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9)),
+                      FriendsListFrame(false, {{kMara, 3}, {kRui, 3}})};
+  script->on_service = {ServerFrame(cm::kEMsgServiceMethodResponse, {}, std::nullopt, 1)};
+  auto shared = MakeCmSharedSession();
+  SetCmPersonaState(*shared, cm::kPersonaStateOnline);  // needs friends on as well
+  auto client = MakeClient(script);
+  client.SetSharedSession(shared);
+  std::atomic<bool> cancel{false};
+  assert(Ping(client, cancel) == CmError::kNone);
+  {
+    std::lock_guard<std::mutex> lock(script->mutex);
+    script->Queue(PersonaFrame(cm::kFriendDataRequested, {MaraPlaying()}));
+  }
+  std::this_thread::sleep_for(400ms);
+  assert(CountSent(script, cm::kEMsgClientRequestFriendData) == 0);
+  assert(CountSent(script, cm::kEMsgClientChangeStatus) == 0);
+  assert(CmFriendChanges(*shared) == 0 && CmFriendsOf(*shared).friends.empty() && CmFriendsOf(*shared).account == 0);
+}
+
+// With online-steam: the pushed list asks once for the friends' persona states, the states Steam then pushes
+// are kept by the bridge's rule, and a new logon asks again. Nothing is asked on a timer.
+void FriendsOnRequestsPersonaStatesAfterTheList() {
+  LogCapture log;
+  auto script = std::make_shared<Script>();
+  script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9)),
+                      FriendsListFrame(false, {{kMara, 3}, {kRui, 3}, {kJun, 2}, {kClan, 3}})};
+  script->on_service = {ServerFrame(cm::kEMsgServiceMethodResponse, {}, std::nullopt, 1)};
+  CmSessionOptions options;
+  options.friends = true;
+  auto shared = MakeCmSharedSession(options);
+  auto client = MakeClient(script);
+  client.SetSharedSession(shared);
+  std::atomic<bool> cancel{false};
+  assert(!CmSharedSessionLoggedOn(*shared));
+  assert(Ping(client, cancel) == CmError::kNone);
+  assert(CmSharedSessionLoggedOn(*shared));
+  assert(WaitUntil([&] { return CountSent(script, cm::kEMsgClientRequestFriendData) == 1; }));
+  {
+    std::lock_guard<std::mutex> lock(script->mutex);
+    const auto& sent = *std::find_if(script->sent.begin(), script->sent.end(), [](const cm::Frame& frame) {
+      return frame.emsg == cm::kEMsgClientRequestFriendData;
+    });
+    // Friends only: not the pending request (2) or the clan.
+    assert(sent.body == cm::EncodeRequestFriendData(cm::kFriendDataRequested, {kMara, kRui}));
+    assert(sent.header.steam_id == kAccountSteamId && sent.header.session_id == 77);
+  }
+  assert(WaitUntil([&] { return CmFriendsOf(*shared).friends.size() == 2; }));
+  assert(CmFriendsOf(*shared).account == kAccountSteamId);
+
+  // A friend in a game and a lobby, and this account's own entry, which is not a friend.
+  proto::Writer self;
+  self.AddFixed64(1, kAccountSteamId);
+  self.AddString(15, "Me");
+  auto changes = CmFriendChanges(*shared);
+  {
+    std::lock_guard<std::mutex> lock(script->mutex);
+    script->Queue(PersonaFrame(cm::kFriendDataRequested, {MaraPlaying(), self}));
+  }
+  assert(WaitUntil([&] { return CmFriendChanges(*shared) > changes; }));
+  auto friends = CmFriendsOf(*shared);
+  assert(friends.friends.size() == 2 && !FindFriend(friends, kAccountSteamId));
+  const auto* mara = FindFriend(friends, kMara);
+  assert(mara && mara->name == "Mara" && mara->persona_state == 1 && mara->app_id == 440 && mara->game_id == 440);
+  assert(mara->lobby_id == 0x0186000000000009ull && mara->avatar_hash == "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3");
+
+  // Only the status: the name, game and lobby stay.
+  proto::Writer away;
+  away.AddFixed64(1, kMara);
+  away.AddVarint(2, 3);
+  changes = CmFriendChanges(*shared);
+  {
+    std::lock_guard<std::mutex> lock(script->mutex);
+    script->Queue(PersonaFrame(cm::kPersonaFlagStatus, {away}));
+  }
+  assert(WaitUntil([&] { return CmFriendChanges(*shared) > changes; }));
+  friends = CmFriendsOf(*shared);
+  mara = FindFriend(friends, kMara);
+  assert(mara->persona_state == 3 && mara->name == "Mara" && mara->lobby_id != 0 && mara->app_id == 440);
+  assert(!mara->avatar_hash.empty());
+
+  // Presence and game info without a game: the game and lobby are cleared, and so is the avatar it did not carry.
+  proto::Writer stopped;
+  stopped.AddFixed64(1, kMara);
+  changes = CmFriendChanges(*shared);
+  {
+    std::lock_guard<std::mutex> lock(script->mutex);
+    script->Queue(PersonaFrame(cm::kPersonaFlagPresence | cm::kPersonaFlagGameExtraInfo, {stopped}));
+  }
+  assert(WaitUntil([&] { return CmFriendChanges(*shared) > changes; }));
+  friends = CmFriendsOf(*shared);
+  mara = FindFriend(friends, kMara);
+  assert(mara->app_id == 0 && mara->lobby_id == 0 && mara->game_id == 0 && mara->avatar_hash.empty());
+  assert(mara->persona_state == 3 && mara->name == "Mara");
+
+  // An accepted friend request arrives incrementally: only the new friend is asked for. A removed one goes.
+  {
+    std::lock_guard<std::mutex> lock(script->mutex);
+    script->Queue(FriendsListFrame(true, {{kJun, 3}, {kRui, 0}}));
+  }
+  assert(WaitUntil([&] { return CountSent(script, cm::kEMsgClientRequestFriendData) == 2; }));
+  {
+    std::lock_guard<std::mutex> lock(script->mutex);
+    assert(script->sent.back().emsg == cm::kEMsgClientRequestFriendData);
+    assert(script->sent.back().body == cm::EncodeRequestFriendData(cm::kFriendDataRequested, {kJun}));
+  }
+  assert(WaitUntil([&] {
+    const auto now = CmFriendsOf(*shared);
+    return now.friends.size() == 2 && FindFriend(now, kJun) && !FindFriend(now, kRui);
+  }));
+
+  // Idle for a while: nothing more is asked.
+  std::this_thread::sleep_for(300ms);
+  assert(CountSent(script, cm::kEMsgClientRequestFriendData) == 2);
+
+  // A new logon (here a rotated token) gets the list again and asks again.
+  auto rotated = Session();
+  rotated.refresh_token = "synthetic.rotated.token";
+  assert(client.WithServiceSession(rotated, 3000, cancel, [](const CmClient::ServiceCall& call, std::uint64_t) {
+    std::vector<std::uint8_t> reply;
+    return call("Cloud.Ping#1", {}, &reply, nullptr);
+  }) == CmError::kNone);
+  assert(WaitUntil([&] { return CountSent(script, cm::kEMsgClientRequestFriendData) == 3; }));
+  // Each logon shows the account online again, so Steam keeps sending friends' online states.
+  assert(CountSent(script, cm::kEMsgClientChangeStatus) == 2);
+
+  // The log counts; it never names a friend or their SteamID.
+  const auto lines = log.Take();
+  assert(HasLine(lines, "owner=shared friends list friends=2 incremental=0"));
+  assert(HasLine(lines, "owner=shared friends request ids=2 result=none"));
+  bool persona_line = false;
+  for (const auto& line : lines) {
+    assert(line.find("Mara") == std::string::npos && line.find(std::to_string(kMara)) == std::string::npos);
+    if (line.rfind("owner=shared friends persona messages=1 entries=2 name=2 state=1 app=1 lobby=1 avatar=1", 0) == 0)
+      persona_line = true;
+  }
+  assert(persona_line);
+}
+
+// With friends on, the shared session shows the account online after each logon without being asked: Steam sends
+// friends' online states only to an online session (on the console every friend showed offline without it).
+void ShowOnlineSendsChangeStatusAfterLogon() {
+  auto script = std::make_shared<Script>();
+  script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9))};
+  script->on_service = {ServerFrame(cm::kEMsgServiceMethodResponse, {}, std::nullopt, 1)};
+  CmSessionOptions options;
+  options.friends = true;
+  auto shared = MakeCmSharedSession(options);
+  auto client = MakeClient(script);
+  client.SetSharedSession(shared);
+  std::atomic<bool> cancel{false};
+  assert(Ping(client, cancel) == CmError::kNone);
+  assert(CountSent(script, cm::kEMsgClientChangeStatus) == 1);
+  std::lock_guard<std::mutex> lock(script->mutex);
+  const auto& sent = *std::find_if(script->sent.begin(), script->sent.end(), [](const cm::Frame& frame) {
+    return frame.emsg == cm::kEMsgClientChangeStatus;
+  });
+  assert(sent.body == cm::EncodeChangeStatus(cm::kPersonaStateOnline));
+}
+
+// State 0 still sends nothing.
+void ShowOnlineCanBeTurnedOff() {
+  auto script = std::make_shared<Script>();
+  script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9))};
+  script->on_service = {ServerFrame(cm::kEMsgServiceMethodResponse, {}, std::nullopt, 1)};
+  CmSessionOptions options;
+  options.friends = true;
+  auto shared = MakeCmSharedSession(options);
+  SetCmPersonaState(*shared, 0);
+  auto client = MakeClient(script);
+  client.SetSharedSession(shared);
+  std::atomic<bool> cancel{false};
+  assert(Ping(client, cancel) == CmError::kNone);
+  assert(CountSent(script, cm::kEMsgClientChangeStatus) == 0);
+}
+
+std::vector<std::vector<std::uint8_t>> ChangeStatusBodies(const std::shared_ptr<Script>& script) {
+  std::lock_guard<std::mutex> lock(script->mutex);
+  std::vector<std::vector<std::uint8_t>> bodies;
+  for (const auto& frame : script->sent)
+    if (frame.emsg == cm::kEMsgClientChangeStatus) bodies.push_back(frame.body);
+  return bodies;
+}
+
+// Invisible (Friends tab › Appear invisible): the status after the logon is Invisible, which friends see as offline.
+void InvisibleSendsInvisibleAfterLogon() {
+  auto script = std::make_shared<Script>();
+  script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9))};
+  script->on_service = {ServerFrame(cm::kEMsgServiceMethodResponse, {}, std::nullopt, 1)};
+  CmSessionOptions options;
+  options.friends = true;
+  auto shared = MakeCmSharedSession(options);
+  SetCmPersonaState(*shared, cm::kPersonaStateInvisible);
+  auto client = MakeClient(script);
+  client.SetSharedSession(shared);
+  std::atomic<bool> cancel{false};
+  assert(Ping(client, cancel) == CmError::kNone);
+  const auto bodies = ChangeStatusBodies(script);
+  assert(bodies.size() == 1 && bodies[0] == cm::EncodeChangeStatus(cm::kPersonaStateInvisible));
+  assert(cm::EncodeChangeStatus(cm::kPersonaStateInvisible) == (std::vector<std::uint8_t>{0x08, 0x07}));
+}
+
+// A change while the session is logged on goes out on the same session, without a new logon and without a call: the
+// idle session sends it on its next turn. Back to Online sends Online again; 0 sends nothing more.
+void PersonaChangeWhileLoggedOnIsSent() {
+  auto script = std::make_shared<Script>();
+  script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9))};
+  script->on_service = {ServerFrame(cm::kEMsgServiceMethodResponse, {}, std::nullopt, 1)};
+  CmSessionOptions options;
+  options.friends = true;
+  auto shared = MakeCmSharedSession(options);
+  auto client = MakeClient(script);
+  client.SetSharedSession(shared);
+  std::atomic<bool> cancel{false};
+  assert(Ping(client, cancel) == CmError::kNone);
+  assert(ChangeStatusBodies(script).size() == 1);
+  SetCmPersonaState(*shared, cm::kPersonaStateInvisible);
+  assert(WaitUntil([&] { return ChangeStatusBodies(script).size() == 2; }));
+  assert(ChangeStatusBodies(script)[1] == cm::EncodeChangeStatus(cm::kPersonaStateInvisible));
+  assert(CountSent(script, cm::kEMsgClientLogon) == 1);
+  // Sent once: the next turns don't send it again.
+  std::this_thread::sleep_for(300ms);
+  assert(ChangeStatusBodies(script).size() == 2 && CountSent(script, cm::kEMsgClientLogon) == 1);
+  SetCmPersonaState(*shared, cm::kPersonaStateOnline);
+  assert(WaitUntil([&] { return ChangeStatusBodies(script).size() == 3; }));
+  assert(ChangeStatusBodies(script)[2] == cm::EncodeChangeStatus(cm::kPersonaStateOnline));
+  SetCmPersonaState(*shared, 0);
+  std::this_thread::sleep_for(300ms);
+  assert(ChangeStatusBodies(script).size() == 3 && CountSent(script, cm::kEMsgClientLogon) == 1);
+}
+
 // A call waiting while another holds the shared session (a long library license scan, issue #47)
 // can be canceled, and its deadline starts only once it has the session.
 void WaitingForTheSharedSessionIsCancelableAndUntimed() {
@@ -921,6 +1217,92 @@ void BusyLogonBacksOffEveryClient() {
   SetCmLog(nullptr);
   ResetCmBackoff();
   assert(!CmBackoffActive());
+}
+
+// A call that never reached Steam names where it stopped (#822), in last_failure() and steam-cm.log: a name
+// the console's DNS server won't resolve, at the CM directory or at every CM, and Steam's pause. Never an
+// endpoint or address.
+void FailedOpenNamesItsStage() {
+  ResetCmBackoff();
+  std::vector<std::string> lines;
+  std::mutex lines_mutex;
+  SetCmLog([&](const std::string& line) {
+    std::lock_guard<std::mutex> lock(lines_mutex);
+    lines.push_back(line);
+  });
+  std::atomic<bool> cancel{false};
+  {
+    auto script = HappyScript();
+    CmClientHooks hooks;
+    hooks.directory = [](const HttpRequest&, const std::atomic<bool>&) {
+      HttpResponse response;
+      response.error = HttpError::kNameResolutionFailed;
+      response.transport_code = 6;
+      response.address = "0.0.0.0";
+      return response;
+    };
+    hooks.transport = [script] { return std::make_unique<FakeTransport>(script); };
+    hooks.deadline_ms = 3000;
+    CmClient client(hooks, MakeDeviceIdentity(kSeed));
+    client.SetOwner("cloud");
+    assert(client.FetchAppInfo(Session(), {10}, cancel).error == CmError::kNetwork);
+    const auto failure = client.last_failure();
+    assert(failure.stage == CmStage::kDirectory && failure.transport == HttpError::kNameResolutionFailed &&
+           failure.transport_code == 6);
+    assert(CmFailureText(failure) == "stage=directory transport=name_resolution_failed curl=6");
+    assert(!CmBackoffActive());  // the network, not Steam turning us away
+  }
+  {
+    auto script = HappyScript();
+    script->failing_connects = 2;
+    script->connect_error = HttpError::kNameResolutionFailed;
+    auto client = MakeClient(script);
+    client.SetOwner("cloud");
+    assert(client.FetchAppInfo(Session(), {10}, cancel).error == CmError::kNetwork);
+    const auto failure = client.last_failure();
+    assert(failure.stage == CmStage::kConnect && failure.transport == HttpError::kNameResolutionFailed);
+  }
+  {
+    auto script = std::make_shared<Script>();
+    script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(84, 9))};
+    auto client = MakeClient(script);
+    assert(client.FetchAppInfo(Session(), {10}, cancel).error == CmError::kNetwork);
+    assert(client.last_failure().stage == CmStage::kLogon && client.last_failure().eresult == 84 &&
+           client.last_failure().refused);
+    assert(client.FetchAppInfo(Session(), {10}, cancel).error == CmError::kNetwork);
+    assert(client.last_failure().stage == CmStage::kBackoff);
+    // A call refused before it starts doesn't keep the previous call's failure.
+    assert(client.FetchAppInfo(Session(), {}, cancel).error == CmError::kProtocol);
+    assert(client.last_failure().stage == CmStage::kNone);
+    ResetCmBackoff();
+  }
+  {
+    // The CM directory turning us away (HTTP 429) starts the pause as well.
+    auto script = HappyScript();
+    CmClientHooks hooks;
+    hooks.directory = [](const HttpRequest&, const std::atomic<bool>&) {
+      HttpResponse response;
+      response.status_code = 429;
+      return response;
+    };
+    hooks.transport = [script] { return std::make_unique<FakeTransport>(script); };
+    hooks.deadline_ms = 3000;
+    CmClient client(hooks, MakeDeviceIdentity(kSeed));
+    assert(client.FetchAppInfo(Session(), {10}, cancel).error == CmError::kNetwork);
+    assert(client.last_failure().stage == CmStage::kDirectory && client.last_failure().refused);
+  }
+  {
+    std::lock_guard<std::mutex> lock(lines_mutex);
+    assert(lines.size() >= 4);
+    assert(lines[0] == "owner=cloud step=directory error=network http=0 transport=name_resolution_failed curl=6");
+    assert(lines[1] == "owner=cloud step=connect error=network transport=name_resolution_failed endpoints=2");
+    for (const auto& line : lines) {
+      assert(line.find("0.0.0.0") == std::string::npos && line.find("example.invalid") == std::string::npos);
+      assert(line.find("synthetic") == std::string::npos);
+    }
+  }
+  SetCmLog(nullptr);
+  ResetCmBackoff();
 }
 
 void LogOffInsteadOfLogonResponseBacksOff() {
@@ -1319,6 +1701,79 @@ void DepotAccessAsksEachDepotUnderItsOwnApp() {
   assert(named);
 }
 
+// A borrowed depot is asked for under the app it comes from, and again under the game when Steam refuses it there; a
+// refusal of its manifest request code skips it like a refused key. install.log gets each depot's answers.
+void BorrowedDepotIsAskedAgainUnderTheGame() {
+  LogCapture log;
+  std::atomic<bool> cancel{false};
+  // key_ok: the apps Steam gives the key under; code_ok: the apps it gives a request code under.
+  const auto serve = [](std::set<std::uint32_t> key_ok, std::set<std::uint32_t> code_ok) {
+    auto script = std::make_shared<Script>();
+    script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9))};
+    script->reply = [key_ok, code_ok](const cm::Frame& frame) {
+      const auto job = frame.header.jobid_source;
+      if (frame.emsg == cm::kEMsgClientGetDepotDecryptionKey) {
+        const bool ok = std::any_of(key_ok.begin(), key_ok.end(), [&](std::uint32_t app) {
+          return frame.body == cm::EncodeDepotKeyRequest(441, app);
+        });
+        proto::Writer key;
+        key.AddVarint(1, static_cast<std::uint32_t>(ok ? cm::kEResultOk : cm::kEResultAccessDenied));
+        key.AddVarint(2, 441);
+        key.AddBytes(3, std::vector<std::uint8_t>(32, 0x5a));
+        return ServerFrame(cm::kEMsgClientGetDepotDecryptionKeyResponse, key.bytes(), std::nullopt, job);
+      }
+      if (frame.emsg == cm::kEMsgServiceMethodCallFromClient) {
+        const bool ok = std::any_of(code_ok.begin(), code_ok.end(), [&](std::uint32_t app) {
+          return frame.body == cm::EncodeManifestRequestCodeRequest(app, 441, 11);
+        });
+        if (!ok) return ServerFrame(cm::kEMsgServiceMethodResponse, {}, cm::kEResultAccessDenied, job);
+        proto::Writer code;
+        code.AddVarint(1, 77);
+        return ServerFrame(cm::kEMsgServiceMethodResponse, code.bytes(), std::nullopt, job);
+      }
+      return std::vector<std::uint8_t>{};
+    };
+    return script;
+  };
+  DepotRequest borrowed{441, 11, true, 5001};
+  // Refused under the app it comes from, granted under the game.
+  auto client = MakeClient(serve({440}, {440}));
+  const auto retried = client.FetchDepotAccess(Session(), 440, {borrowed}, cancel);
+  assert(retried.ok() && retried.grants.size() == 1 && retried.skipped.empty());
+  assert(retried.answers.size() == 1 && retried.answers[0].first == 441);
+  assert(retried.answers[0].second == "app=5001 key=refused eresult=15 then app=440 key=ok code=ok");
+  // Refused under both: skipped, and the game installs without it.
+  auto refused = MakeClient(serve({}, {}));
+  const auto skipped = refused.FetchDepotAccess(Session(), 440, {borrowed}, cancel);
+  assert(skipped.ok() && skipped.grants.empty() && skipped.skipped == std::vector<std::uint32_t>{441});
+  assert(skipped.answers[0].second == "app=5001 key=refused eresult=15 then app=440 key=refused eresult=15 skipped");
+  // The key granted but the request code refused under both: skipped too.
+  auto no_code = MakeClient(serve({5001, 440}, {}));
+  const auto code_refused = no_code.FetchDepotAccess(Session(), 440, {borrowed}, cancel);
+  assert(code_refused.ok() && code_refused.skipped == std::vector<std::uint32_t>{441});
+  assert(code_refused.answers[0].second ==
+         "app=5001 key=ok code error=rejected eresult=15 then app=440 key=ok code error=rejected eresult=15 skipped");
+  // Granted where it comes from: asked once.
+  auto direct = MakeClient(serve({5001}, {5001}));
+  const auto granted = direct.FetchDepotAccess(Session(), 440, {borrowed}, cancel);
+  assert(granted.ok() && granted.grants.size() == 1 && granted.answers[0].second == "app=5001 key=ok code=ok");
+  // Any other refusal says nothing about the licence: it stops the call, so an update doesn't delete the depot's files.
+  auto failing = MakeClient(DepotScript(cm::kEResultFail, 1));
+  const auto failed = failing.FetchDepotAccess(Session(), 440, {borrowed}, cancel);
+  assert(failed.error == CmError::kRejected && failed.skipped.empty());
+  assert(failed.answers.size() == 1 && failed.answers[0].second == "app=5001 key=refused eresult=2");
+  // The game's own depot refused still stops the call, and its answer is kept for install.log.
+  auto own = MakeClient(serve({}, {}));
+  const auto stopped = own.FetchDepotAccess(Session(), 440, {{441, 11}}, cancel);
+  assert(stopped.error == CmError::kRejected && stopped.answers.size() == 1 &&
+         stopped.answers[0].second == "app=440 key=refused eresult=15");
+  std::vector<std::string> lines;
+  for (auto& line : log.Take())
+    if (line.find("step=depot_key") != std::string::npos) lines.push_back(std::move(line));
+  assert(lines.size() >= 2 && lines[0] == "owner=cm step=depot_key app=5001 depot=441 result=refused eresult=15" &&
+         lines[1] == "owner=cm step=depot_key app=440 depot=441 result=ok");
+}
+
 void DeviceSeedPersistsPerInstall() {
   const auto root = std::filesystem::temp_directory_path() / "playden-cm-seed-test";
   std::filesystem::remove_all(root);
@@ -1385,6 +1840,7 @@ int main(int argc, char** argv) {
   DepotAccessReturnsKeysAndManifestCodes();
   ResetCmBackoff();
   DepotAccessAsksEachDepotUnderItsOwnApp();
+  BorrowedDepotIsAskedAgainUnderTheGame();
   DepotAccessNamesTheBranch();
   ResetCmBackoff();
   FreeLicenseGrantWaitsForTheNewLicenseList();
@@ -1398,6 +1854,15 @@ int main(int argc, char** argv) {
   SharedSessionLogsOnAgainForNewCredentials();
   SharedSessionCountsLicenseChanges();
   ResetCmBackoff();
+  FriendsOffSendsNoFriendRequest();
+  ResetCmBackoff();
+  FriendsOnRequestsPersonaStatesAfterTheList();
+  ResetCmBackoff();
+  ShowOnlineSendsChangeStatusAfterLogon();
+  ShowOnlineCanBeTurnedOff();
+  InvisibleSendsInvisibleAfterLogon();
+  PersonaChangeWhileLoggedOnIsSent();
+  ResetCmBackoff();
   WaitingForTheSharedSessionIsCancelableAndUntimed();
   ResetCmBackoff();
   WithoutKeepAliveEachCallLogsOnAgain();
@@ -1409,4 +1874,6 @@ int main(int argc, char** argv) {
   DirectoryErrorBacksOff();
   ResetCmBackoff();
   LogOffInsteadOfLogonResponseBacksOff();
+  ResetCmBackoff();
+  FailedOpenNamesItsStage();
 }

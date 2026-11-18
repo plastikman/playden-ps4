@@ -3,11 +3,14 @@
 #include "runtime/pe_architecture.h"
 
 #include <array>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <string>
 #include <unistd.h>
+
+namespace {
 
 void Check(bool okay, const char* message) {
   if (okay) return;
@@ -15,29 +18,55 @@ void Check(bool okay, const char* message) {
   std::exit(1);
 }
 
+}  // namespace
+
 int main() {
+  using playden::runtime::ExecutableArchitecture;
+  using playden::runtime::LaunchArchitecture;
   const std::string path = "pe_architecture_test.exe";
+  const std::string link = "pe_architecture_test_link.exe";
   std::array<unsigned char, 128> pe{};
   pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 64;
   pe[64] = 'P'; pe[65] = 'E';
-  const int file = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
-  Check(file >= 0, "could not create PE fixture");
-  const auto check = [&](unsigned char machine_lo, unsigned char machine_hi,
-                         unsigned char magic_lo, unsigned char magic_hi,
-                         const char* expected) {
+  const auto write = [&](std::size_t size) {
+    const int file = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    Check(file >= 0, "could not create the PE fixture");
+    Check(::write(file, pe.data(), size) == static_cast<ssize_t>(size), "could not write the PE fixture");
+    ::close(file);
+  };
+  const auto check = [&](unsigned char machine_lo, unsigned char machine_hi, unsigned char magic_lo,
+                         unsigned char magic_hi, const char* expected, const char* message) {
     pe[68] = machine_lo; pe[69] = machine_hi;
     pe[88] = magic_lo; pe[89] = magic_hi;
-    Check(::pwrite(file, pe.data(), pe.size(), 0) == static_cast<ssize_t>(pe.size()),
-          "could not write PE fixture");
-    Check(playden::runtime::ExecutableArchitecture(path) == expected, "PE architecture mismatch");
-    if (expected[0]) Check(playden::runtime::LaunchArchitecture(path, "32") == expected,
-                           "PE architecture must override Steam's hint");
+    write(pe.size());
+    Check(ExecutableArchitecture(path) == expected, message);
   };
-  check(0x4c, 0x01, 0x0b, 0x01, "pe32");
-  check(0x64, 0x86, 0x0b, 0x02, "pe64");
-  check(0x64, 0x86, 0x0b, 0x01, "");
-  Check(playden::runtime::LaunchArchitecture("", "64") == "pe64", "Steam 64-bit hint ignored");
-  Check(playden::runtime::LaunchArchitecture("", "32") == "pe32", "Steam 32-bit hint ignored");
-  ::close(file);
+  check(0x4c, 0x01, 0x0b, 0x01, "pe32", "i386 with a PE32 optional header is pe32");
+  check(0x64, 0x86, 0x0b, 0x02, "pe64", "x86-64 with a PE32+ optional header is pe64");
+  check(0x64, 0x86, 0x0b, 0x01, "", "x86-64 with a PE32 optional header is neither");
+  check(0x4c, 0x01, 0x0b, 0x02, "", "i386 with a PE32+ optional header is neither");
+  write(80);
+  Check(ExecutableArchitecture(path).empty(), "a header cut short is neither");
+  pe[0x3c] = 200;
+  write(pe.size());
+  Check(ExecutableArchitecture(path).empty(), "a PE offset past the end is neither");
+  pe[0x3c] = 64;
+  check(0x4c, 0x01, 0x0b, 0x01, "pe32", "fixture restored");
+  // PS4 (not upstream): LaunchArchitecture prefers the PE header and falls back to Steam's os_arch hint.
+  // The fixture is pe32 here, so Steam's 64-bit hint must lose to the header on disk.
+  Check(LaunchArchitecture(path, "64") == "pe32", "the PE header must override Steam's hint");
+  Check(LaunchArchitecture("", "64") == "pe64", "Steam's 64-bit hint must be used when no program is installed");
+  Check(LaunchArchitecture("", "32") == "pe32", "Steam's 32-bit hint must be used when no program is installed");
+  std::remove(link.c_str());
+  Check(::symlink(path.c_str(), link.c_str()) == 0, "could not create the link");
+  Check(ExecutableArchitecture(link).empty(), "a symbolic link is not followed");
+  Check(ExecutableArchitecture("pe_architecture_test_missing.exe").empty(), "a missing file is neither");
+  const std::string fifo = "pe_architecture_test_fifo.exe";
+  std::remove(fifo.c_str());
+  Check(::mkfifo(fifo.c_str(), 0600) == 0, "could not create the FIFO");
+  Check(ExecutableArchitecture(fifo).empty(), "a FIFO is refused without waiting for a writer");
+  std::remove(fifo.c_str());
+  Check(ExecutableArchitecture(".").empty(), "a folder is neither");
+  std::remove(link.c_str());
   std::remove(path.c_str());
 }

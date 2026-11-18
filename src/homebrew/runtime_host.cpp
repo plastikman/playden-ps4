@@ -7,6 +7,9 @@
 #endif
 
 #include "homebrew/gog_icon.hpp"
+#include "gog/dependencies.h"
+#include "gog/install_script.h"
+#include "gog/installer.h"
 #include "pw_app_profile.h"
 #include "platform/usb_mount.h"
 #include "installs/install_record.h"
@@ -17,6 +20,7 @@
 #include "runtime/community_rules.h"
 #include "runtime/kit_version.h"
 #include "runtime/private_directories.h"
+#include "runtime/playden_removal.h"
 #include "runtime/recipe_choice.h"
 #include "runtime/prospero_profile.h"
 #include "runtime/settings_publication_journal.h"
@@ -59,6 +63,7 @@
 #include <set>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include "platform/console_name.h"
 
@@ -113,7 +118,8 @@ GameId GameOf(const rt::RuntimeInstall& record) { return GameOf(record.game, rec
 GameId GameOf(const RuntimePrepareRequest& request) { return GameOf(request.game, request.runtime_number); }
 // Where a title that reads [steam] shows a Steam game in steamapps\common: Steam's folder name for it, or its app ID
 // for a game prepared before Playden recorded the name (a game that looks for steamapps\common in its path finds it
-// either way). Empty for another store's game, or a title whose runtime does not read [steam].
+// either way). Empty for another store's game, or a title whose runtime does not read [steam]. The profile names it
+// only while the game's Steam library folder row is Steam's folder (RenderProsperoProfile).
 std::string SteamLibraryFolder(const rt::KitCapabilities& kit, const rt::RuntimeInstall& record) {
   if (!kit.steam_library_path || GameOf(record).store != Store::kSteam || !record.runtime_number) return {};
   return record.steam_install_dir.empty() ? std::to_string(record.runtime_number) : record.steam_install_dir;
@@ -273,8 +279,8 @@ std::vector<std::filesystem::path> Folders(const std::filesystem::path& folder) 
 // The newest session report of a game's bottle, followed by the newest log its engine wrote:
 // Unity's AppData/LocalLow/<company>/<product>/Player.log or Unreal's
 // AppData/Local/<project>/Saved/Logs/*.log in the bottle, or Unity 5's
-// <program>_Data/output_log.txt beside the program. Those name the crash when the report
-// stops short.
+// <program>_Data/output_log.txt beside the program, or an SCS game's Documents/<game>/game.log.txt
+// (and its game.crash.txt). Those name the crash when the report stops short.
 std::optional<std::string> NewestSessionLog(const std::filesystem::path& data_root,
                                             const std::filesystem::path& program) {
   namespace fs = std::filesystem;
@@ -283,7 +289,8 @@ std::optional<std::string> NewestSessionLog(const std::filesystem::path& data_ro
          &newest, &newest_time);
   if (newest.empty()) return std::nullopt;
   std::string text = "== " + newest.filename().string() + "\n" + FileTail(newest, 128 * 1024, 32 * 1024);
-  // Every report in the folder, newest first, and the start of the one before the newest: a run
+  std::optional<fs::file_time_type> crash_after;
+  // Every report in the folder, newest first, and the start and end of the one before the newest: a run
   // that wrote little, or a rotated report, still shows which runs there were and how they began.
   {
     std::vector<std::pair<fs::file_time_type, fs::path>> reports;
@@ -300,7 +307,21 @@ std::optional<std::string> NewestSessionLog(const std::filesystem::path& data_ro
       text += "\n" + path.filename().string() + " bytes=" + std::to_string(fs::file_size(path, size_error)) +
               " time=" + std::to_string(seconds);
     }
-    if (reports.size() > 1) text += "\n== " + reports[1].second.filename().string() + " (start)\n" + FileTail(reports[1].second, 0, 32 * 1024);
+    // One file per run: a long run also leaves session-N.previous.log, its older chunk, beside its report.
+    std::vector<std::pair<fs::file_time_type, fs::path>> runs;
+    for (const auto& report : reports) {
+      const auto name = report.second.filename().string();
+      constexpr std::string_view kChunk = ".previous.log";
+      if (name.size() < kChunk.size() || name.compare(name.size() - kChunk.size(), kChunk.size(), kChunk) != 0)
+        runs.push_back(report);
+    }
+    // The run before the newest, its end too: when the player starts the game again after it closed, and opens
+    // Playden to send a report, the newest run is a short one and the run that closed is this one.
+    if (runs.size() > 1)
+      text += "\n== " + runs[1].second.filename().string() + " (start and end)\n" +
+              FileTail(runs[1].second, 64 * 1024, 32 * 1024);
+    // The end of the run before that: an engine's crash file written before it is from an older run.
+    if (runs.size() > 2) crash_after = runs[2].first;
   }
   const auto user = data_root / "library/prefixes/game" / playden::steam::cloud::kPrefixUserFolder / "AppData";
   fs::path engine; fs::file_time_type engine_time{};
@@ -314,10 +335,31 @@ std::optional<std::string> NewestSessionLog(const std::filesystem::path& data_ro
   if (!program.empty())
     Newest(program.parent_path() / (program.stem().string() + "_Data"),
            [](const std::string& name) { return name == "output_log.txt"; }, &engine, &engine_time);
-  if (!engine.empty()) {
-    const auto shown = engine.lexically_relative(data_root);
-    text += "\n== " + (shown.empty() || *shown.begin() == ".." ? engine.parent_path().filename() / engine.filename() : shown).string() + "\n" +
-            FileTail(engine, 64 * 1024);
+  // SCS games (Euro Truck Simulator 2, American Truck Simulator) write game.log.txt in Documents/<game>, and on a
+  // crash game.crash.txt beside it, which names the fault.
+  const auto documents = data_root / "library/prefixes/game" / playden::steam::cloud::kPrefixUserFolder / "Documents";
+  fs::path scs_crash; fs::file_time_type scs_crash_time{};
+  for (const auto& game : Folders(documents)) {
+    Newest(game, [](const std::string& name) { return name == "game.log.txt"; }, &engine, &engine_time);
+    Newest(game, [](const std::string& name) { return name == "game.crash.txt"; }, &scs_crash, &scs_crash_time);
+  }
+  const auto shown_name = [&](const fs::path& path) {
+    const auto shown = path.lexically_relative(data_root);
+    return (shown.empty() || *shown.begin() == ".." ? path.parent_path().filename() / path.filename() : shown).string();
+  };
+  if (!engine.empty()) text += "\n== " + shown_name(engine) + "\n" + FileTail(engine, 64 * 1024);
+  // Only a crash file from the last two runs: one left from an older crash would name the wrong fault.
+  if (!scs_crash.empty() && (!crash_after || scs_crash_time >= *crash_after))
+    text += "\n== " + shown_name(scs_crash) + "\n" + FileTail(scs_crash, 32 * 1024, 16 * 1024);
+  // Steam features = Online (runtime/steam_host.h): the Steam host's own log in the bottle, which never holds a token,
+  // and Wine's messages from its process, which the title writes beside the reports' folder (its start too: that is
+  // where the host's libraries load).
+  for (const auto& [name, path, head] : {std::tuple<const char*, fs::path, off_t>{
+                                             "steam-host.log", data_root / "library/prefixes/game/drive_c/playden/steam-host.log", 0},
+                                         {"helper-wine.log", data_root / "library/helper-wine.log", 32 * 1024}}) {
+    std::error_code error;
+    if (!fs::is_symlink(path, error) && fs::is_regular_file(path, error))
+      text += std::string("\n== ") + name + "\n" + FileTail(path, 32 * 1024, head);
   }
   // Steam features = Online (runtime/steam_host.h): the Steam host's own log in the bottle, which never holds a token,
   // and Wine's messages from its process, which the title writes beside the reports' folder (its start too: that is
@@ -351,7 +393,7 @@ using NativeCoordinatorImpl = ps5::Ps5NativeCoordinator;
 
 struct RuntimeHost::Composition {
   explicit Composition(const RuntimeHostConfig& config)
-      : storage(config.state_root.string()),
+      : storage(playden::Storage(config.state_root.string()).OpenTree()),
         repository(storage, "installs.json",
                    [this](const std::string& title) {
                      return coordinator ? coordinator->Availability(title) : rt::NativeTitleAvailability{};
@@ -629,11 +671,12 @@ void RuntimeHost::SavePreparedHistory() {
     text += std::to_string(entry.runtime_number) + "\t" + std::to_string(entry.finished_at) + "\n";
   const auto path = config_.state_root / kPreparedHistory;
   const auto temporary = path.string() + ".playden-partial";
-  const int out = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+  const int out = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0666);
   if (out < 0) {
     Log("prepared history not saved: " + std::string(std::strerror(errno)));
     return;
   }
+  (void)fchmod(out, 0666);  // open to FTP whatever the umask (#868)
   std::size_t written = 0;
   while (written < text.size()) {
     const auto count = write(out, text.data() + written, text.size() - written);
@@ -683,6 +726,17 @@ void RuntimeHost::HoldPreparations(bool hold) {
   wake_.notify_all();
 }
 
+void RuntimeHost::PausePreparations(bool pause) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (prepares_paused_ == pause) return;
+    prepares_paused_ = pause;
+    ++snapshot_.revision;
+  }
+  published_.notify_all();
+  wake_.notify_all();
+}
+
 void RuntimeHost::Play(std::uint32_t app_id, std::string setup_program, rt::OnlineLaunch online) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -697,6 +751,16 @@ void RuntimeHost::Remove(std::uint32_t app_id, bool delete_saves) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_) return;
     remove_requests_.push_back({app_id, delete_saves, std::nullopt, ++next_work_order_});
+  }
+  wake_.notify_all();
+}
+
+void RuntimeHost::RemovePlayden(bool keep_saves) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) return;
+    playden_removal_request_ = keep_saves;
+    snapshot_.playden_removal.reset();
   }
   wake_.notify_all();
 }
@@ -892,6 +956,21 @@ std::string RuntimeHost::SteamStubStep(const GameFiles& files) {
         (unpacked.ok ? std::string() : " failed=" + unpacked.message));
   }
   return unpacked.ok ? std::string() : unpacked.message;
+}
+
+void RuntimeHost::LogPlaySettings(Composition& c, const rt::RuntimeInstall& record) {
+  const auto* recipe = RecipeOf(c, record);
+  if (!recipe) return;
+  auto saved = config_.settings_record ? config_.settings_record(GameOf(record)) : std::nullopt;
+  const auto resolved = saved ? RecordPreset(c, &*saved) : std::nullopt;
+  static const std::map<std::string, std::string> none;
+  rt::EffectiveSettings settings;
+  rt::SettingsError error;
+  const bool built = rt::BuildEffectiveSettings(*recipe, resolved ? &*resolved : nullptr, saved ? saved->overrides : none,
+                                                TitleKit(c, record), &settings, &error);
+  Log("play settings app=" + std::to_string(record.runtime_number) + " revision=" +
+      std::to_string(saved ? saved->revision : 0) + " preset=" + (resolved ? resolved->id : std::string("-")) + " " +
+      (built ? rt::SettingsLogSummary(settings) : std::string("unreadable")));
 }
 
 RuntimeHost::OnlineHandoff RuntimeHost::OnlineHandoffFor(Composition& c, const rt::RuntimeInstall& record,
@@ -1130,12 +1209,32 @@ std::string RuntimeHost::SteamworksStep(const GameFiles& files, bool steam_accou
   // (runtime/steam_host.h). Online is only chosen on a title that runs it (BuildEffectiveSettings falls back otherwise).
   const bool steam_host = features == "online" && files.settings.helper_process && steam_app.app_id != 0;
   const bool emulate = features == "emulate" && steam_app.app_id != 0;
+  // Offline emulation, game's library: the game keeps its own Steam library, and gbe_fork answers it as the Steam client
+  // library in the bottle (runtime/steamworks.h kSteamClientFeature).
+  const bool client = features == rt::kSteamClientFeature && steam_app.app_id != 0;
   rt::SteamworksResult result;
+  rt::SteamworksResult provided;
+  std::uint64_t client_steam_id = 0;  // the account the client's registry values name
   // The emulator's files name the signed-in account; before it is known they keep what Play wrote.
-  const bool emulator_waits = emulate && !steam_account_known;
+  const bool emulator_waits = (emulate || client) && !steam_account_known;
+  // Valve's library reads steam_appid.txt from the working folder: each program's own, and the one the chosen program
+  // starts in.
+  const auto start_folders = [&] {
+    std::vector<std::string> folders;
+    for (const auto& program : files.programs) folders.push_back(std::filesystem::path(program).parent_path().generic_string());
+    if (!record.launch_working_directory.empty()) {
+      auto working = record.launch_working_directory;
+      std::replace(working.begin(), working.end(), '\\', '/');
+      folders.push_back(working);
+    } else if (record.launch_in_install_root) {
+      folders.emplace_back();
+    }
+    return folders;
+  };
   if (emulator_waits) {
-    Log("steamworks app=" + std::to_string(record.runtime_number) + " mode=emulate waits: the Steam account is not known yet");
-  } else if (emulate) {
+    Log("steamworks app=" + std::to_string(record.runtime_number) + " mode=" + (client ? "steamclient" : "emulate") +
+        " waits: the Steam account is not known yet");
+  } else if (emulate || client) {
     rt::SteamworksIdentity identity;
     identity.app_id = steam_app.app_id;
     {
@@ -1185,9 +1284,17 @@ std::string RuntimeHost::SteamworksStep(const GameFiles& files, bool steam_accou
                                                  apps_changed ? identity.owned_apps_account : saved_account,
                                                  identity.save_folders);
       const std::string failed = kept ? "" : " facts=write-failed";
-      if (!added_dlc.empty())
+      if (!added_dlc.empty()) {
+        // Which DLC, so a report shows whether the one the player misses reached the emulator. A game with hundreds of
+        // DLC keeps the line short.
+        constexpr std::size_t kLoggedDlc = 32;
+        std::string ids;
+        for (std::size_t i = 0; i < added_dlc.size() && i < kLoggedDlc; ++i)
+          ids += (i ? "," : "") + std::to_string(added_dlc[i]);
+        if (added_dlc.size() > kLoggedDlc) ids += ",...";
         Log("steamworks app=" + std::to_string(record.runtime_number) + " owned dlc added=" + std::to_string(added_dlc.size()) +
-            " total=" + std::to_string(identity.owned_dlc.size()) + failed);
+            " total=" + std::to_string(identity.owned_dlc.size()) + " ids=" + ids + failed);
+      }
       if (apps_changed) {
         std::string ids;
         for (const auto app : identity.owned_apps) ids += (ids.empty() ? "" : ",") + std::to_string(app);
@@ -1219,24 +1326,48 @@ std::string RuntimeHost::SteamworksStep(const GameFiles& files, bool steam_accou
           std::to_string(lost_actions.size()) + " " + lost + (lost_actions.size() > 4 ? ",..." : ""));
     }
     identity.network = files.settings.values.at("steam_network").value != "offline";
-    result = rt::EmulateSteamworks(root.string(), emulator, identity);
+    if (emulate) {
+      result = rt::EmulateSteamworks(root.string(), emulator, identity);
+    } else {
+      // The game's own library goes back in its place; the client and its settings go in the bottle.
+      result = rt::RestoreSteamworks(root.string(), rt::RetiredSteamApiSha256(), *files.steam_api_copies);
+      client_steam_id = identity.steam_id;
+      if (result.ok) provided = rt::ProvideSteamClient(files.prefix, emulator, identity);
+      if (result.ok && !provided.ok) {
+        result.ok = false;
+        result.message = provided.message;
+      }
+      // A game from another store has no Steam app of its own to name.
+      if (result.ok && !other_store &&
+          !rt::WriteSteamAppIdBeside(root.string(), result.found, start_folders(), steam_app.app_id))
+        Log("steamworks app=" + std::to_string(record.runtime_number) + " steam_appid.txt could not be written");
+    }
   } else {
     result = rt::RestoreSteamworks(root.string(), rt::RetiredSteamApiSha256(), *files.steam_api_copies);
     // A game from another store has no Steam app of its own to name.
-    // Valve's library reads steam_appid.txt from the working folder: each program's own, and the one the chosen
-    // program starts in.
-    std::vector<std::string> start_folders;
-    for (const auto& program : files.programs) start_folders.push_back(std::filesystem::path(program).parent_path().generic_string());
-    if (!record.launch_working_directory.empty()) {
-      auto working = record.launch_working_directory;
-      std::replace(working.begin(), working.end(), '\\', '/');
-      start_folders.push_back(working);
-    } else if (record.launch_in_install_root) {
-      start_folders.emplace_back();
-    }
     if (steam_host && result.ok && !other_store &&
-        !rt::WriteSteamAppIdBeside(root.string(), result.found, start_folders, steam_app.app_id))
+        !rt::WriteSteamAppIdBeside(root.string(), result.found, start_folders(), steam_app.app_id))
       Log("steamworks app=" + std::to_string(record.runtime_number) + " steam_appid.txt could not be written");
+  }
+  // Valve's library finds the client through the registry values a running Steam writes. In this mode they name the
+  // client in the bottle; in any other they go, or Valve's library would still load it (the Steam host writes its own
+  // only once it has a session). A bottle that has no user.reg yet gets them on the next preparation.
+  struct stat hive {};
+  if (!emulator_waits && result.ok && ::lstat((files.prefix + "/user.reg").c_str(), &hive) == 0) {
+    const auto found = client ? std::optional<std::vector<rt::RegistryValue>>(rt::SteamClientRegistryValues(client_steam_id))
+                              : rt::SteamClientRegistryRemovalIn(files.prefix);
+    const auto values = found.value_or(std::vector<rt::RegistryValue>{});
+    std::string reason;
+    if (!found) {
+      result.ok = false;
+      result.message = "Playden could not read the game's registry to check its Steam values.";
+    } else if (!values.empty() && !rt::ApplyBottleRegistryValues(values, files.prefix, config_.unix_time(), "user.reg", &reason)) {
+      result.ok = false;
+      result.message = "Playden could not write the game's Steam registry values: " + reason + ".";
+    } else if (!client && !values.empty()) {
+      Log("steamworks app=" + std::to_string(record.runtime_number) + " steamclient registry removed=" +
+          std::to_string(values.size()));
+    }
   }
   if (!emulator_waits) {
     std::string changed;
@@ -1244,9 +1375,10 @@ std::string RuntimeHost::SteamworksStep(const GameFiles& files, bool steam_accou
     std::string skipped;
     for (const auto& path : result.skipped) skipped += (skipped.empty() ? "" : ",") + path;
     Log("steamworks app=" + std::to_string(record.runtime_number) + " mode=" +
-        (steam_host ? "steam-host" : emulate ? "emulate" : "game") +
-        (emulate && files.settings.values.at("steam_network").value == "offline" ? " network=offline" : "") +
+        (steam_host ? "steam-host" : emulate ? "emulate" : client ? "steamclient" : "game") +
+        ((emulate || client) && files.settings.values.at("steam_network").value == "offline" ? " network=offline" : "") +
         " found=" + std::to_string(result.found.size()) + " changed=" + (changed.empty() ? "-" : changed) +
+        (client ? " client=" + std::string(provided.changed.empty() ? "kept" : "written") : std::string()) +
         (skipped.empty() ? std::string() : " copies_skipped=" + skipped) + (result.ok ? std::string() : " failed=" + result.message));
     if (!result.ok) return result.message;
   }
@@ -1324,7 +1456,9 @@ void RuntimeHost::VcRuntimeStep(const GameFiles& files) {
         (ok ? std::string(" version=") + rt::kVcRuntimeVersion : " failed=" + reason));
 }
 
-// Steam's Windows client makes Cloud save folders before launching the game. Some games watch them at startup.
+// Steam-file step: the folders of the game's Steam Cloud saves in the Windows user folder, which its download recorded
+// (SteamworksIdentity::save_folders), are made in the bottle when missing, as Steam makes them on Windows before a game
+// starts: Leaf It Alone watches its Saves folder at start-up and stops when it isn't there. Logged, never a refusal.
 void RuntimeHost::SaveFoldersStep(Composition& c, const GameFiles& files) {
   if (!c.installer) return;
   rt::SteamworksIdentity identity;
@@ -1381,20 +1515,23 @@ std::string RuntimeHost::InstallScriptsStep(const GameFiles& files) {
   // A package being installed shows on the game's page as the rest of its setup does: words and a percentage.
   const auto number = record.runtime_number;
   bool shown = false;
-  const auto redist = rt::InstallRedistributables(
-      files.root.string(), *install_dir, files.prefix, config_.unix_time(), uses_physx,
-      [&](const std::string& name, std::size_t done, std::size_t total) {
-        if (!shown) {
-          shown = true;
-          const bool physx = rt::RedistIsPhysx(name);
-          Publish([&](RuntimeSnapshot& s) { s.play_progress[number] = physx ? kPlayInstallingPhysx : kPlayInstallingComponent; });
-        }
-        ReportWork(done, total);
-      });
-  if (shown) {
+  const auto progress = [&](const std::string& name, std::size_t done, std::size_t total) {
+    if (!shown) {
+      shown = true;
+      const bool physx = rt::RedistIsPhysx(name);
+      Publish([&](RuntimeSnapshot& s) { s.play_progress[number] = physx ? kPlayInstallingPhysx : kPlayInstallingComponent; });
+    }
+    ReportWork(done, total);
+  };
+  const auto progress_done = [&] {
+    if (!shown) return;
+    shown = false;
     ClearWork();
     Publish([&](RuntimeSnapshot& s) { s.play_progress.erase(number); });
-  }
+  };
+  const auto redist = rt::InstallRedistributables(files.root.string(), *install_dir, files.prefix, config_.unix_time(),
+                                                  uses_physx, progress);
+  progress_done();
   if (redist.physx_missing) Log("redist app=" + std::to_string(record.runtime_number) + " physx needed, no package in the game folder");
   // Still without the engine the game was built for, and a package added to its folder would be found: say which.
   std::optional<std::string> physx_needed;
@@ -1416,12 +1553,134 @@ std::string RuntimeHost::InstallScriptsStep(const GameFiles& files) {
       if (static_cast<unsigned char>(value) < 0x20 || value == 0x7f) value = '?';
     return text;
   };
-  for (const auto& outcome : redist.outcomes)
-    if (outcome.result != "already" && outcome.result != "covered")
-      Log("redist app=" + std::to_string(record.runtime_number) + " script=" + field(outcome.script) + " name=" +
-          field(outcome.name) + " result=" + outcome.result + " detail=" + field(outcome.detail) +
-          (outcome.files ? " files=" + std::to_string(outcome.files) : std::string()));
+  const auto log_outcomes = [&](const rt::RedistInstallResult& installed) {
+    for (const auto& outcome : installed.outcomes)
+      if (outcome.result != "already" && outcome.result != "covered")
+        Log("redist app=" + std::to_string(record.runtime_number) + " script=" + field(outcome.script) + " name=" +
+            field(outcome.name) + " result=" + outcome.result + " detail=" + field(outcome.detail) +
+            (outcome.files ? " files=" + std::to_string(outcome.files) : std::string()));
+  };
+  log_outcomes(redist);
+  if (GameOf(record).store == Store::kGog) GogRedistStep(files, *install_dir, progress, log_outcomes);
+  progress_done();
   return {};
+}
+
+// GOG step: the setRegistry values of each installed product's goggame-<id>.script, written into the bottle before
+// every start, as Galaxy writes them at install: `{app}` is the game folder as Wine sees it, so a move is followed.
+// HKLM Software keys go to both registry views, as for Steam's scripts. It runs after RecipeRegistryStep: a value the
+// recipe sets (user.reg) is the recipe's and is left alone, and a value an earlier recipe set and RecipeRegistryStep
+// just removed gets the script's again in the same start. An unchanged hive is not written, and a hive the bottle
+// doesn't have yet gets its values on the next start. A hive that can't be written refuses the start, as for Steam's
+// scripts.
+std::string RuntimeHost::GogRegistryStep(const GameFiles& files) {
+  const auto& record = files.record;
+  if (GameOf(record).store != Store::kGog) return {};
+  const auto windows_app = rt::ProsperoWindowsPath(record.install_path);
+  if (!windows_app) return {};
+  const auto& install_dir = *windows_app;
+  const auto installed = installs::ReadInstallRecord((files.root / installs::kInstallRecordName).string());
+  if (!installed || !installed->gog) return {};  // GogScriptStep says so
+  const auto root = files.root.string();
+  std::vector<rt::RegistryValue> machine, user;
+  std::size_t scripts = 0, values = 0, skipped = 0, recipe = 0;
+  for (const auto product : installed->gog->products) {
+    const auto path = gog::FindScriptFile(root, product);
+    const auto script = path ? gog::ReadScript(*path) : std::nullopt;  // an unreadable one: GogScriptStep says so
+    if (!script) continue;
+    gog::ScriptContext context;
+    context.game_root = root;
+    context.product = std::to_string(product);
+    context.gog_language = installed->gog->language;
+    context.windows_app = install_dir;
+    std::size_t left_out = 0;
+    const auto settings = gog::PlanRegistry(*script, context, &left_out);
+    if (settings.empty() && left_out == 0) continue;
+    ++scripts;
+    skipped += left_out;
+    // Registry names match ignoring ASCII case.
+    const auto same = [](const std::string& a, const std::string& b) {
+      const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
+      return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [&](char x, char y) { return lower(x) == lower(y); });
+    };
+    for (const auto& setting : settings) {
+      const auto owned_by_recipe = [&](const std::string& key) {
+        if (setting.machine || !files.recipe) return false;
+        return std::any_of(files.recipe->registry.begin(), files.recipe->registry.end(), [&](const rt::RegistryValue& value) {
+          return value.default_value == setting.default_value && same(value.key, key) && same(value.name, setting.name);
+        });
+      };
+      std::string data;
+      if (setting.type == gog::RegistrySetting::Type::kDword) {
+        char text[16];
+        std::snprintf(text, sizeof(text), "dword:%08lx", std::strtoul(setting.data.c_str(), nullptr, 10));
+        data = text;
+      } else {
+        data = rt::RegistryString(setting.data);
+      }
+      bool counted = false;
+      for (const auto& key : rt::InstallScriptKeys(setting.machine, setting.key)) {
+        if (owned_by_recipe(key)) {
+          if (!counted) ++recipe;
+          counted = true;
+          continue;
+        }
+        // A later action's value replaces an earlier one's, across products too.
+        rt::SetRegistryValue(setting.machine ? &machine : &user, {key, setting.name, data, setting.default_value});
+      }
+      if (!counted) ++values;
+    }
+  }
+  if (scripts == 0) return {};
+  std::string failure;
+  for (const auto& [hive, list] : {std::pair<const char*, const std::vector<rt::RegistryValue>*>{"system.reg", &machine},
+                                   std::pair<const char*, const std::vector<rt::RegistryValue>*>{"user.reg", &user}}) {
+    struct stat info {};
+    if (list->empty() || ::lstat((files.prefix + "/" + hive).c_str(), &info) != 0) continue;
+    std::string reason;
+    if (!rt::ApplyBottleRegistryValues(*list, files.prefix, config_.unix_time(), hive, &reason)) {
+      failure = reason;
+      break;
+    }
+  }
+  Log("gog registry app=" + std::to_string(record.runtime_number) + " values=" + std::to_string(values) +
+      " skipped=" + std::to_string(skipped) + (recipe ? " recipe=" + std::to_string(recipe) : std::string()) +
+      (failure.empty() ? std::string() : " failed=" + failure));
+  if (!failure.empty()) return "The game's install script could not be applied: " + failure + ".";
+  return {};
+}
+
+// GOG step: the redistributables a GOG build names, downloaded into .playden-gog/redist/ with the game (its
+// redist.list says which program runs each, with which arguments). Installed into the bottle as a Steam script's are,
+// and a Burn bundle's Windows Installer packages too (.NET desktop runtimes); what Wine provides is skipped. Only the
+// game folder is read, so it works signed out and offline. A package that fails is logged and the game still starts.
+void RuntimeHost::GogRedistStep(const GameFiles& files, const std::string& install_dir, const rt::RedistProgress& progress,
+                                const std::function<void(const rt::RedistInstallResult&)>& log) {
+  const auto list = gog::ReadRedistList(files.root.string());
+  // No list is an install with no redistributables (or one from before Playden downloaded them): nothing to say.
+  if (list.status == gog::RedistList::Status::kMissing) return;
+  if (list.status != gog::RedistList::Status::kOk) {
+    Log("gog redist app=" + std::to_string(files.record.runtime_number) + " list=refused");
+    return;
+  }
+  auto base = install_dir;
+  while (!base.empty() && base.back() == '\\') base.pop_back();
+  // What the list says Play can't run (no package, no program, unusable arguments) is logged as not run.
+  rt::RedistInstallResult skipped;
+  std::vector<rt::RedistEntry> entries;
+  for (const auto& entry : list.entries) {
+    if (!entry.package) {
+      skipped.outcomes.push_back({"gog", entry.id, "not-run", gog::RedistSkipName(entry.skip), 0});
+      continue;
+    }
+    auto program = entry.program;
+    std::replace(program.begin(), program.end(), '/', '\\');
+    entries.push_back(rt::RedistEntry{entry.id, base + "\\" + program, entry.arguments, ""});
+  }
+  if (!entries.empty())
+    log(rt::InstallRedistEntries(files.root.string(), install_dir, files.prefix, config_.unix_time(), entries, "gog",
+                                 /*burn_bundles=*/true, progress));
+  log(skipped);
 }
 
 // Sets what MfcStep may do for the work in its scope (RedistWork), and puts the default back after it.
@@ -1543,7 +1802,7 @@ std::filesystem::path RuntimeHost::SteamClientFolder() const {
 void RuntimeHost::SteamLibraryStep(Composition& c, const GameFiles& files) {
   const auto& features = files.settings.values.at("steam_features").value;
   if (features != "online" || !files.settings.helper_process || !SteamClientRecord()) return;
-  // Only games this title shows in steamapps\\common have an appmanifest in the bottle's Steam library.
+  // Only a game shown in steamapps\common (Steam library folder = Steam's folder) is in the bottle's Steam library.
   if (const auto library = files.settings.values.find("steam_library_path");
       library == files.settings.values.end() || !library->second.available || library->second.value != "steam")
     return;
@@ -1595,8 +1854,9 @@ bool RuntimeHost::SaveSteamClientRecord(const std::string& version, const std::s
   const auto path = config_.state_root / kSteamClientRecord;
   const auto temporary = path.string() + ".playden-partial";
   const std::string text = version + " " + sha256 + "\n";
-  const int out = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+  const int out = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0666);
   if (out < 0) return false;
+  (void)fchmod(out, 0666);  // open to FTP whatever the umask (#868)
   const bool ok = write(out, text.data(), text.size()) == static_cast<ssize_t>(text.size()) && fsync(out) == 0;
   close(out);
   if (!ok || std::rename(temporary.c_str(), path.c_str()) != 0) {
@@ -1704,7 +1964,7 @@ std::string RuntimeHost::RecipeRegistryStep(Composition& c, const GameFiles& fil
   // superset tracked, never a bottle holding values the file doesn't list.
   if (!values.empty()) {
     const auto interim = rt::SerializeRecipeRegistryState(rt::RecipeRegistryInterim(previous ? &*previous : nullptr, next));
-    const auto noted = c.storage.WriteAtomicPrivate(file, Bytes(interim.begin(), interim.end()));
+    const auto noted = c.storage.WriteAtomic(file, Bytes(interim.begin(), interim.end()));
     if (!noted.ok()) {
       Log("recipe registry state write failed install=" + files.record.install_id + " " + noted.message());
       return "The recipe's registry values could not be recorded: " + noted.message() + ".";
@@ -1725,7 +1985,7 @@ std::string RuntimeHost::RecipeRegistryStep(Composition& c, const GameFiles& fil
     return {};
   }
   const auto text = rt::SerializeRecipeRegistryState(next);
-  const auto written = c.storage.WriteAtomicPrivate(file, Bytes(text.begin(), text.end()));
+  const auto written = c.storage.WriteAtomic(file, Bytes(text.begin(), text.end()));
   if (!written.ok()) {
     Log("recipe registry state write failed install=" + files.record.install_id + " " + written.message());
     return "The recipe's registry values could not be recorded: " + written.message() + ".";
@@ -1750,6 +2010,59 @@ std::string RuntimeHost::RecipeIniStep(const GameFiles& files) {
   return applied.ok ? std::string() : applied.message;
 }
 
+// GOG step: the setIni and folder steps of each installed product's goggame-<id>.script, before every start, as the
+// install ran them. `{app}` is the game folder as Wine sees it (the console path, which a move changes: ScummVM's game
+// `path`). The script's copies ran once at install and never again: they could overwrite the player's files. A
+// failure is logged and never stops the start.
+void RuntimeHost::GogScriptStep(const GameFiles& files) {
+  const auto& record = files.record;
+  if (GameOf(record).store != Store::kGog) return;
+  const auto app = "gog script app=" + std::to_string(record.runtime_number);
+  const auto root = files.root.string();
+  const auto installed = installs::ReadInstallRecord((files.root / installs::kInstallRecordName).string());
+  if (!installed || !installed->gog) {
+    Log(app + " failed=the install record has no GOG build");
+    return;
+  }
+  const auto windows_app = rt::ProsperoWindowsPath(record.install_path);
+  if (!windows_app) {
+    Log(app + " failed=the game folder has no Windows path");
+    return;
+  }
+  std::size_t scripts = 0, ini = 0, changed = 0, skipped = 0, failed = 0;
+  std::string failure;
+  for (const auto product : installed->gog->products) {
+    const auto path = gog::FindScriptFile(root, product);
+    if (!path) continue;
+    ++scripts;
+    const auto script = gog::ReadScript(*path);
+    if (!script) {
+      ++failed;
+      if (failure.empty()) failure = "goggame-" + std::to_string(product) + ".script can't be read";
+      continue;
+    }
+    gog::ScriptContext context;
+    context.game_root = root;
+    context.support_root = root + "/" + gog::kGogDirName + "/support/" + std::to_string(product);
+    context.product = std::to_string(product);
+    context.gog_language = installed->gog->language;
+    context.windows_app = *windows_app;
+    std::size_t left_out = 0;
+    const auto steps = gog::PlanScript(*script, context, /*skip_copies=*/true, &left_out);
+    ini += static_cast<std::size_t>(std::count_if(steps.begin(), steps.end(), [](const gog::ScriptStep& step) {
+      return step.kind == gog::ScriptStep::Kind::kSetIni;
+    }));
+    const auto run = gog::RunScript(steps);
+    changed += run.changed;
+    skipped += left_out + run.skipped;
+    failed += run.failed;
+    if (failure.empty()) failure = run.failure;
+  }
+  if (scripts == 0) return;
+  Log(app + " ini=" + std::to_string(ini) + " changed=" + std::to_string(changed) + " skipped=" +
+      std::to_string(skipped) + (failed ? " failed=" + (failure.empty() ? std::to_string(failed) : failure) : std::string()));
+}
+
 // Generic step: files Playden ships for a game that can't run on the console without them (docs/community-recipes.md).
 std::string RuntimeHost::RecipeFilesStep(const GameFiles& files) {
   if (!files.game_files_recipe) return {};
@@ -1760,9 +2073,8 @@ std::string RuntimeHost::RecipeFilesStep(const GameFiles& files) {
       std::string removed, kept;
       for (const auto& file : retired.changed) removed += (removed.empty() ? "" : ",") + file;
       for (const auto& file : retired.skipped) kept += (kept.empty() ? "" : ",") + file;
-      Log("recipe files app=" + std::to_string(files.record.runtime_number) + " retired=" +
-          (removed.empty() ? "-" : removed) + (kept.empty() ? std::string() : " kept=" + kept) +
-          (retired.ok ? std::string() : " failed=" + retired.message));
+      Log("recipe files app=" + std::to_string(files.record.runtime_number) + " retired=" + (removed.empty() ? "-" : removed) +
+          (kept.empty() ? std::string() : " kept=" + kept) + (retired.ok ? std::string() : " failed=" + retired.message));
     }
     if (!retired.ok) return retired.message;
   }
@@ -1792,8 +2104,8 @@ std::string RuntimeHost::DotnetHeapStep(const GameFiles& files) {
 
 // The steps run in this order for every game, whatever its store: generic ones (media, EULA, Direct3D 12, Wine
 // Mono, the bottle's Environment, MFC, the Visual C++ runtime key, the recipe's registry and INI values and files, the
-// .NET heap) and Steam-file ones, which act only on the Steam files a game has (SteamStub, Steamworks and steam.dll,
-// install scripts and redistributables).
+// .NET heap), GOG's install script registry and INI values, and Steam-file ones, which act only on the Steam files a game has
+// (SteamStub, Steamworks and steam.dll, install scripts and redistributables, Cloud save folders).
 std::string RuntimeHost::ApplyPreparationSteps(Composition& c, const rt::RuntimeInstall& record, bool steam_account_known) {
   MediaStep(c, record);
   GameFiles files{record};
@@ -1856,7 +2168,9 @@ std::string RuntimeHost::ApplyPreparationSteps(Composition& c, const rt::Runtime
   // After the redistributables (install scripts, MFC): one that writes an older runtime key doesn't stay.
   VcRuntimeStep(files);
   if (auto refused = RecipeRegistryStep(c, files); !refused.empty()) return refused;
+  if (auto refused = GogRegistryStep(files); !refused.empty()) return refused;
   if (auto refused = RecipeIniStep(files); !refused.empty()) return refused;
+  GogScriptStep(files);
   if (auto refused = RecipeFilesStep(files); !refused.empty()) return refused;
   return DotnetHeapStep(files);
 }
@@ -1909,6 +2223,9 @@ std::size_t RuntimeHost::LeftoverRequests(Composition& c, bool remove) {
   std::set<std::string> referenced;
   for (const auto& record : c.repository.Snapshot())
     if (record.journal) referenced.insert(record.journal->operation_id);
+  // A later build's game may have a publication of its own pending: its request stays for that build.
+  for (const auto& foreign : c.repository.ForeignInstalls())
+    if (!foreign.journal_operation_id.empty()) referenced.insert(foreign.journal_operation_id);
   const auto& directory = c.request_directory;
   std::vector<std::string> leftovers;
   std::error_code error;
@@ -1921,7 +2238,7 @@ std::size_t RuntimeHost::LeftoverRequests(Composition& c, bool remove) {
     if (!referenced.count(transaction)) leftovers.push_back(name);
   }
   if (!remove) return leftovers.size();
-  playden::Storage storage(directory.string());
+  auto storage = playden::Storage(directory.string()).OpenTree();
   std::size_t kept = 0;
   for (const auto& name : leftovers) {
     const auto removed = storage.RemoveDurable(name);
@@ -2423,8 +2740,10 @@ std::string RuntimeHost::TightenWorkingFolder(const std::filesystem::path& root,
 // The publication being replaced is checked before its settings change, and that needs the folder its
 // program ran in. A folder the player deleted comes back empty so another program can still be chosen.
 // The folders it made, outermost first; empty when none was missing or the game folder itself is gone.
+// `mode`: 0777 under an unowned publication (FTP can delete it, #868), 0755 under an owned one, whose start
+// check refuses a folder others can write.
 static std::vector<std::filesystem::path> RestorePublishedFolder(const std::filesystem::path& root,
-                                                                 const std::string& working) {
+                                                                 const std::string& working, mode_t mode) {
   std::vector<std::filesystem::path> made;
   struct stat info{};
   if (working.empty() || lstat(root.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) return made;
@@ -2444,8 +2763,8 @@ static std::vector<std::filesystem::path> RestorePublishedFolder(const std::file
       if (!S_ISDIR(info.st_mode)) break;
       continue;
     }
-    if (errno != ENOENT || mkdir(folder.c_str(), 0755) != 0) break;
-    chmod(folder.c_str(), 0755);  // whatever the umask: the publication check admits 0755
+    if (errno != ENOENT || mkdir(folder.c_str(), mode) != 0) break;
+    chmod(folder.c_str(), mode);  // whatever the umask
     made.push_back(folder);
   }
   return made;
@@ -2899,7 +3218,9 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   if (record.moved_from.empty())
     restored_folders = RestorePublishedFolder(HostPath(record.install_path),
                                               WorkingFolder(record.launch_working_directory, record.launch_path,
-                                                            record.launch_in_install_root));
+                                                            record.launch_in_install_root),
+                                              rt::PublishedGameRootUnowned(record, config_.host_namespace_prefix) ==
+                                                      std::optional<bool>(false) ? 0755 : 0777);
   for (const auto& folder : restored_folders) Log("settings update restored missing folder " + folder.string());
   rt::SettingsPublicationRequest request;
   request.transaction_id = *transaction;
@@ -3472,6 +3793,9 @@ void RuntimeHost::RunPlay(Composition& c, std::uint32_t app_id, const std::strin
                record->state == rt::PreparationState::kReady &&
                c.coordinator->Activity(record->title_id) == rt::NativeActivity::kStopped;
       }
+      // A bottle opened over FTP is given its modes back before the settings below read it (#568): the
+      // launch preflight heals it too, but only after them.
+      if (idle) HealBottle(c, record->data_root, record->title_id);
       std::string settings;
       if (!setup_program.empty()) {
         // Another program for one run: its profile is published now, so nothing of the game may be running.
@@ -3513,6 +3837,9 @@ void RuntimeHost::RunPlay(Composition& c, std::uint32_t app_id, const std::strin
       std::optional<rt::RuntimeInstall> current;
       if (idle && settings.empty())
         if ((current = c.records.Find(record->install_id))) HandOverOnline(c, *current, online, "play");
+      // A launcher or setup run publishes its own program and controls: "play setup program" names it instead.
+      if (settings.empty() && setup_program.empty())
+        if (const auto latest = current ? current : c.records.Find(record->install_id)) LogPlaySettings(c, *latest);
       result = settings.empty() ? c.launch->Request(record->install_id)
                                 : rt::LaunchResult::Failure(rt::LaunchError::kPreflight, settings);
       // What this Play asked of the bridge once is for this start only, kept handoff or not.
@@ -3940,12 +4267,20 @@ const rt::CommunityRecipe* RuntimeHost::BoundCommunityRecipe(Composition& c, con
       Log("community recipe app=" + std::to_string(runtime_number) + " id=" + loaded.recipe.id + " program " +
           rt::SelectedProgram(fresh->recipe) + " is " + fresh->recipe.architecture + " in this copy, not " + architecture);
   }
+  // A recipe shared from Windows, or exported from a setup made before Playden matched Steam's folder to the disk, may
+  // name System/ as "system" (#844): the title and publication open the folder by its name on disk.
+  const bool respelled = !install_path.empty() && rt::MatchWorkingFoldersToDisk(HostPath(install_path).string(), &fresh->recipe);
   // Kept for the session, so pointers stay valid; updated in place when the copy or Playden's own recipe changed.
   auto& bound = c.bound_community[{loaded.recipe.revision, runtime_number}];
+  bool changed = true;
   if (!bound) bound = std::move(fresh);
   else if (rt::SerializeGameRecipe(bound->recipe) != rt::SerializeGameRecipe(fresh->recipe) ||
            bound->recipe.generated_launch != fresh->recipe.generated_launch)
     *bound = std::move(*fresh);
+  else changed = false;
+  if (respelled && changed)
+    Log("community recipe app=" + std::to_string(runtime_number) + " id=" + loaded.recipe.id +
+        " working folder spelled as on disk");
   return bound.get();
 }
 
@@ -4189,7 +4524,7 @@ const rt::GameRecipe* RuntimeHost::GenerateRecipeForPrepare(Composition& c, cons
   });
   if (!made) return nullptr;
   const auto text = rt::SerializeGameRecipe(generated);
-  const auto written = c.storage.WriteAtomicPrivate(GeneratedRecipeFile(generated.id), Bytes(text.begin(), text.end()));
+  const auto written = c.storage.WriteAtomic(GeneratedRecipeFile(generated.id), Bytes(text.begin(), text.end()));
   if (!written.ok()) {
     Log("generated recipe write failed app=" + std::to_string(request.runtime_number) + " message=" + written.message());
     *reason = "Playden could not save how to start this game.";
@@ -4242,7 +4577,7 @@ void RuntimeHost::RefreshGeneratedRecipeDefaults(Composition& c, const rt::Runti
       return;
     }
     const auto saved = rt::SerializeGameRecipe(candidate);
-    const auto written = c.storage.WriteAtomicPrivate(GeneratedRecipeFile(candidate.id), Bytes(saved.begin(), saved.end()));
+    const auto written = c.storage.WriteAtomic(GeneratedRecipeFile(candidate.id), Bytes(saved.begin(), saved.end()));
     Log("generated recipe refreshed app=" + app + " defaults revision " + std::to_string(before.defaults_revision) + " to " +
         std::to_string(candidate.defaults_revision) + (written.ok() ? std::string() : " not saved: " + written.message()));
     PublishRecipes(c);
@@ -4273,14 +4608,18 @@ void RuntimeHost::LoadGeneratedRecipes(Composition& c) {
     }
     c.recipes.push_back(std::move(recipe));
   }
-  // The registry values community recipes left in bottles, for the cache's garbage collection.
-  for (const auto& record : c.repository.Snapshot()) {
-    const auto bytes = c.storage.Read(RecipeRegistryFile(record.install_id), 64 * 1024);
+  // The registry values community recipes left in bottles, for the cache's garbage collection. A later build's game
+  // (a foreign record) keeps its own too.
+  std::vector<std::string> install_ids;
+  for (const auto& record : c.repository.Snapshot()) install_ids.push_back(record.install_id);
+  for (const auto& foreign : c.repository.ForeignInstalls()) install_ids.push_back(foreign.install_id);
+  for (const auto& install_id : install_ids) {
+    const auto bytes = c.storage.Read(RecipeRegistryFile(install_id), 64 * 1024);
     rt::RecipeRegistryState state;
     std::string reason;
     if (bytes.ok() && rt::ParseRecipeRegistryState(std::string(bytes.value().begin(), bytes.value().end()), &state, &reason) &&
         rt::IsCommunityRevision(state.revision))
-      c.registry_revisions[record.install_id] = state.revision;
+      c.registry_revisions[install_id] = state.revision;
   }
   PublishRecipes(c);
 }
@@ -4297,16 +4636,25 @@ std::string RuntimeHost::RebindRecipeMarkers(Composition& c, const rt::RuntimeIn
 
 void RuntimeHost::PublishCommunityReferences(const Composition& c) {
   std::set<std::string> references;
+  // An unfinished settings transaction carries the recipe it publishes.
+  const auto pending = [&](const std::string& operation, const std::string& operation_id) {
+    if (operation != "settings-request" && operation != "settings-publication") return;
+    const auto loaded = rt::LoadSettingsPublicationRequest(c.request_directory, operation_id);
+    if (loaded.request && rt::IsInstalledCommunityRecipeId(loaded.request->install.recipe_id) &&
+        rt::IsCommunityRevisionPrefix(loaded.request->install.recipe_version))
+      references.insert(loaded.request->install.recipe_version);
+  };
   for (const auto& record : c.repository.Snapshot()) {
     if (rt::IsInstalledCommunityRecipeId(record.recipe_id) && rt::IsCommunityRevisionPrefix(record.recipe_version))
       references.insert(record.recipe_version);
-    // An unfinished settings transaction carries the recipe it publishes.
-    if (record.journal && (record.journal->operation == "settings-request" || record.journal->operation == "settings-publication")) {
-      const auto loaded = rt::LoadSettingsPublicationRequest(c.request_directory, record.journal->operation_id);
-      if (loaded.request && rt::IsInstalledCommunityRecipeId(loaded.request->install.recipe_id) &&
-          rt::IsCommunityRevisionPrefix(loaded.request->install.recipe_version))
-        references.insert(loaded.request->install.recipe_version);
-    }
+    if (record.journal) pending(record.journal->operation, record.journal->operation_id);
+  }
+  // A later build's game keeps the community recipe it was published with. Its recipe id names a store this build
+  // can't read, so only its shape is checked; a request that doesn't parse here keeps nothing.
+  for (const auto& foreign : c.repository.ForeignInstalls()) {
+    if (foreign.recipe_id.rfind("community-", 0) == 0 && rt::IsCommunityRevisionPrefix(foreign.recipe_version))
+      references.insert(foreign.recipe_version);
+    if (!foreign.journal_operation_id.empty()) pending(foreign.journal_operation, foreign.journal_operation_id);
   }
   for (const auto& [install_id, revision] : c.registry_revisions) references.insert(revision);
   std::vector<std::string> list(references.begin(), references.end());
@@ -4725,7 +5073,7 @@ std::string RuntimeHost::RunPrepare(Composition& c, const RuntimePrepareRequest&
       // Every ID refused at once usually means one source cannot answer, not that every ID is taken:
       // ask the IDs no other game holds what each source says, until one is not clearly in use.
       std::set<std::string> held;
-      for (const auto& install : c.repository.Snapshot()) held.insert(install.title_id);
+      for (const auto& title : c.repository.ReservedTitles()) held.insert(title);  // a later build's games' too
       const auto log_prefix = "title reservation refused app=" + std::to_string(request.runtime_number) +
                               " candidates=" + std::to_string(reserve.kit_title_variants.size()) +
                               " held=" + std::to_string(held.size());
@@ -4825,7 +5173,7 @@ constexpr char kPartlyRestoredMarker[] = ".playden-saves-partly-restored";
 constexpr char kSaveBackupSuffix[] = ".saves";
 constexpr std::size_t kSaveBackupsKept = 3;
 
-// "steam-<app id>" or "local-<uuid>": the install IDs a kept bottle may carry.
+// "steam-<app id>", "gog-<id>" or "local-<uuid>": the install IDs a kept bottle may carry.
 bool KeptInstallId(const std::string& id) { return ParseInstallId(id).has_value(); }
 
 // Deletes a tree with lstat/unlink/rmdir: links are removed as links and never
@@ -5085,6 +5433,8 @@ std::string RuntimeHost::RunMaintenance(Composition& c, std::uint32_t app, Runti
     if (action == RuntimeMaintenance::kApplySettings) return "Changes apply the next time Playden starts the game.";
     return refused;
   }
+  // The game is stopped: a bottle opened over FTP gets its modes back before anything reads it (#568).
+  HealBottle(c, record->data_root, record->title_id);
   switch (action) {
     case RuntimeMaintenance::kApplySettings: {
       bool published = false;
@@ -5140,16 +5490,20 @@ std::string RuntimeHost::RunMaintenance(Composition& c, std::uint32_t app, Runti
       struct stat info{};
       if (lstat(users.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) return "The game has no Windows user folders to back up.";
       const auto root = SaveBackupRoot(record->install_id);
-      if (lstat(root.c_str(), &info) != 0 && mkdir(root.c_str(), 0700) != 0) return "The backup folder could not be made.";
+      if (lstat(root.c_str(), &info) != 0 && (mkdir(root.c_str(), 0777) != 0 || chmod(root.c_str(), 0777) != 0))
+        return "The backup folder could not be made.";
       const auto stamp = std::to_string(config_.unix_time());
       const auto staging = root / ("." + stamp + ".partial");
       const auto target = root / stamp;
       std::error_code error;
       RemoveTreeNoFollow(staging, error);
-      if (mkdir(staging.c_str(), 0700) != 0) return "The backup folder could not be made.";
+      if (mkdir(staging.c_str(), 0777) != 0) return "The backup folder could not be made.";
       std::string reason;
-      if (!CopySavesTree(users, staging / "users", &reason, [this](const std::string& line) { Log(line); }) ||
-          rename(staging.c_str(), target.c_str()) != 0) {
+      // The copy is private like the bottle it comes from; no title uses a backup, so it is opened to FTP
+      // whole (#868), launcher sign-ins aside, before it takes its name.
+      const bool copied = CopySavesTree(users, staging / "users", &reason, [this](const std::string& line) { Log(line); });
+      if (copied) OpenKeptBottle(staging, "users/prospero");
+      if (!copied || rename(staging.c_str(), target.c_str()) != 0) {
         RemoveTreeNoFollow(staging, error);
         Log("maintenance backup failed app=" + std::to_string(app) + " " + reason);
         return "The saves could not be backed up" + (reason.empty() ? std::string(".") : ": " + reason + ".");
@@ -5189,6 +5543,9 @@ std::string RuntimeHost::SyncTitleAllowList(Composition& c) {
   std::set<std::string> titles;
   for (const auto& record : c.repository.Snapshot())
     if (rt::KitVariantFor(c.kit->view, record.title_id)) titles.insert(record.title_id);
+  // A later build's game keeps starting from Home: its title stays reserved, so it stays allowed.
+  for (const auto& foreign : c.repository.ForeignInstalls())
+    if (rt::KitVariantFor(c.kit->view, foreign.title_id)) titles.insert(foreign.title_id);
   std::string contents;
   for (const auto& title : titles) contents += title + "\n";
   std::string error;
@@ -5209,6 +5566,7 @@ bool RuntimeHost::TitleListed(Composition& c, const std::string& title_id) {
 void RuntimeHost::PublishKeptBottles(Composition& c) {
   std::set<std::string> recorded;
   for (const auto& record : c.repository.Snapshot()) recorded.insert(record.install_id);
+  for (const auto& foreign : c.repository.ForeignInstalls()) recorded.insert(foreign.install_id);
   std::vector<KeptBottleView> kept;
   const auto games = HostPath(config_.package_paths.console_data_root + "/playden/games");
   std::error_code error;
@@ -5254,8 +5612,8 @@ std::optional<RuntimeHost::RemovalFailure> RuntimeHost::RetireTitle(
     return RemovalFailure{"source-changed", "The " PLAYDEN_CONSOLE_NAME " title's folder changed since it was found; it was left as it is."};
   std::string reason;
   const auto trash = config_.state_root / "trash";
-  if (!rt::EnsurePrivateDirectories(config_.boundary, config_.state_root, trash, &reason))
-    return RemovalFailure{"trash-unavailable", "Playden could not prepare its private trash: " + reason};
+  if (!rt::EnsureOpenDirectories(config_.boundary, config_.state_root, trash, &reason))
+    return RemovalFailure{"trash-unavailable", "Playden could not prepare its trash: " + reason};
   auto homebrew = platform::ManagedDirectory::Open(config_.homebrew_root, platform::DirectoryPolicy::kApprovedTree);
   auto destination = platform::ManagedDirectory::Open(trash, platform::DirectoryPolicy::kApprovedTree);
   struct stat checked{};
@@ -5302,7 +5660,7 @@ std::string RuntimeHost::DeleteRetiredTitle(const std::string& title_id, const s
   const auto trash = config_.state_root / "trash" / (title_id + "-" + operation_id);
   struct stat info{};
   if (lstat(trash.c_str(), &info) != 0 && errno == ENOENT) return {};
-  auto parent = platform::ManagedDirectory::Open(trash.parent_path(), platform::DirectoryPolicy::kPrivate);
+  auto parent = platform::ManagedDirectory::Open(trash.parent_path(), platform::DirectoryPolicy::kOpenTree);
   if (!parent || !parent->InspectChild(trash.filename().string(), &info) ||
       !S_ISDIR(info.st_mode) || info.st_uid != geteuid())
     return "The retired " PLAYDEN_CONSOLE_NAME " title's folder is not Playden's; it was left as it is.";
@@ -5349,15 +5707,17 @@ std::string RuntimeHost::SaveLeftoverDelete(Composition& c, const LeftoverDelete
 }
 
 void RuntimeHost::PublishLeftoverTitles(Composition& c) {
-  auto titles = rt::FindLeftoverTitles(config_.homebrew_root, c.repository.Loaded() && c.leftover_journals_known, c.repository.Snapshot(),
+  // Every title a record holds, a later build's games' included, is never a leftover.
+  const auto reserved_titles = c.repository.ReservedTitles();
+  const std::unordered_set<std::string> reserved(reserved_titles.begin(), reserved_titles.end());
+  auto titles = rt::FindLeftoverTitles(config_.homebrew_root, c.repository.Loaded() && c.leftover_journals_known,
+                                      c.repository.Snapshot(), reserved,
                                       [&c](const std::string& title) { return c.coordinator->Activity(title); }, geteuid());
   // A retired title still waiting for the remover remains available to retry, even though its
   // source has left the scan root. Its private journal reserves the ID until completion.
   if (c.repository.Loaded())
     for (const auto& [id, request] : c.leftover_deletes) {
-      const auto records = c.repository.Snapshot();
-      if (std::any_of(records.begin(), records.end(), [&](const auto& record) { return record.title_id == id; }) ||
-          c.coordinator->Activity(id) != rt::NativeActivity::kStopped) continue;
+      if (reserved.count(id) || c.coordinator->Activity(id) != rt::NativeActivity::kStopped) continue;
       if (std::none_of(titles.begin(), titles.end(), [&](const auto& title) { return title.title_id == id; }))
         titles.push_back(request.title);
     }
@@ -5404,7 +5764,7 @@ std::string RuntimeHost::RunDeleteLeftover(Composition& c, LeftoverDelete reques
     const auto trash = config_.state_root / "trash";
     const auto retired = trash / (id + "-" + request.operation_id);
     if (lstat(retired.c_str(), &info) == 0) {
-      const auto parent = platform::ManagedDirectory::Open(trash, platform::DirectoryPolicy::kPrivate);
+      const auto parent = platform::ManagedDirectory::Open(trash, platform::DirectoryPolicy::kOpenTree);
       if (!parent || !S_ISDIR(info.st_mode) || info.st_uid != geteuid() ||
           request.title.device != static_cast<std::uint64_t>(info.st_dev) ||
           request.title.inode != static_cast<std::uint64_t>(info.st_ino))
@@ -5484,10 +5844,10 @@ void RuntimeHost::ResumeLeftoverDeletes(Composition& c) {
       continue;
     }
     c.blocked_leftover_titles.insert(id);
-    const auto directory = platform::ManagedDirectory::Open(config_.state_root, platform::DirectoryPolicy::kPrivate);
+    const auto directory = platform::ManagedDirectory::Open(config_.state_root, platform::DirectoryPolicy::kOpenTree);
     struct stat journal_info{};
     if (!directory || !directory->InspectChild(entry_name, &journal_info) || !S_ISREG(journal_info.st_mode) ||
-        journal_info.st_uid != geteuid() || (journal_info.st_mode & 07777) != 0600) {
+        journal_info.st_uid != geteuid()) {
       Log("leftover removal journal permissions invalid title=" + id); continue;
     }
     const auto bytes = c.storage.ReadDurable(entry_name, 8192);
@@ -5539,7 +5899,7 @@ std::optional<RuntimeHost::RemovalFailure> RuntimeHost::KeepBottle(
                       std::to_string(runtime_number) + identity + ",\"name\":\"" + JsonEscaped(name) +
                       "\",\"kept_at\":" + std::to_string(config_.unix_time ? config_.unix_time() : std::int64_t(time(nullptr))) +
                       ",\"bytes\":" + std::to_string(TreeBytes(bottle)) + "}\n";
-  const int fd = open((bottle / kKeptMarker).c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+  const int fd = open((bottle / kKeptMarker).c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0666);
   const bool written = fd >= 0 && write(fd, marker.data(), marker.size()) == static_cast<ssize_t>(marker.size()) &&
                        fsync(fd) == 0;
   if (fd >= 0) close(fd);
@@ -5574,7 +5934,88 @@ std::optional<RuntimeHost::RemovalFailure> RuntimeHost::KeepBottle(
   } else if (rename(bottle.c_str(), kept.c_str()) != 0) {
     return RemovalFailure{"bottle-keep", "The game's saves could not be kept (error " + std::to_string(errno) + ")."};
   }
+  // No title starts a kept or set-aside bottle, so it is opened to FTP whole (#868), launcher sign-ins
+  // (runtime::PrivateProfilePaths) aside. A failure is only logged: the saves are kept either way.
+  OpenKeptBottle(kept);
+  OpenKeptBottle(bottle.parent_path() / (install_id + ".set-aside-" + operation_id));
   return std::nullopt;
+}
+
+void RuntimeHost::OpenKeptBottle(const std::filesystem::path& folder, const std::filesystem::path& profile) {
+  struct stat info{};
+  if (lstat(folder.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) return;
+  rt::SharedTreeOptions options;
+  options.private_paths = {};
+  options.open_private_folders = true;
+  for (const auto& path : rt::PrivateProfilePaths()) options.private_paths.push_back(profile / path);
+  const auto opened = rt::OpenTreeToEveryone(folder, options);
+  if (!opened.ok || opened.skipped || opened.truncated)
+    Log("kept bottle not fully opened path=" + folder.string() + " changed=" + std::to_string(opened.changed) +
+        " skipped=" + std::to_string(opened.skipped) + " truncated=" + std::to_string(opened.truncated));
+}
+
+PlaydenRemovalOutcome RuntimeHost::RunRemovePlayden(Composition& c, bool keep_saves) {
+  PlaydenRemovalOutcome outcome;
+  const auto paths = rt::ConsoleRemovalPaths(config_.host_namespace_prefix);
+  const auto stop = [&](std::string message) {
+    Log("playden removal stopped: " + message);
+    outcome.message = std::move(message);
+    PublishInstalls(c);
+    PublishKeptBottles(c);
+    PublishLeftoverTitles(c);
+    return outcome;
+  };
+  // Nothing of a game may run: its title is removed, and Wine holds its bottle.
+  if (c.launch_journal) {
+    const auto pending = c.launch_journal->LoadPending();
+    if (!pending.ok) return stop("The launch record cannot be read. Restart Playden and try again.");
+    if (pending.session) return stop("Close the game first. A game started from Playden may still be running or suspended.");
+  }
+  const auto records = c.repository.Snapshot();
+  for (const auto& record : records)
+    if (c.coordinator->Activity(record.title_id) != rt::NativeActivity::kStopped)
+      return stop("Close every game first: " + record.title_id + " is running or suspended.");
+  // A drive that isn't there keeps its playden folder: the player is told which.
+  std::set<std::string> disconnected;
+  for (const auto& record : records) {
+    const auto path = std::filesystem::path(record.install_path);
+    auto it = path.begin();
+    if (path.is_absolute() && ++it != path.end() && *it == "mnt" && ++it != path.end()) {
+      const auto mount = std::filesystem::path("/mnt") / *it;
+      struct stat info{};
+      if (lstat(HostPath(mount.string()).c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) disconnected.insert(mount.string());
+    }
+  }
+  outcome.disconnected.assign(disconnected.begin(), disconnected.end());
+  Log("playden removal starts games=" + std::to_string(records.size()) + " keep_saves=" + std::to_string(keep_saves) +
+      " disconnected=" + std::to_string(disconnected.size()));
+  if (!rt::SaveRemovalJournal(paths.data_root, {rt::RemovalStep::kTitles, keep_saves}))
+    return stop("Playden could not record that it is being removed (" + std::string(std::strerror(errno)) + ").");
+  // 1. Every game's PS5 title, as Uninstall does (its bottle kept as <id>.kept with keep_saves).
+  for (const auto& record : records) {
+    Publish([&](RuntimeSnapshot& s) { s.removing_app = record.runtime_number; });
+    const auto refusal = RunRemove(c, record.runtime_number, !keep_saves);
+    Publish([](RuntimeSnapshot& s) { s.removing_app.reset(); });
+    if (!refusal.empty()) return stop("A game's PS5 title could not be removed (" + record.title_id + "): " + refusal);
+  }
+  // 2. Titles of Playden's with no game record left (an interrupted uninstall, an older version).
+  PublishLeftoverTitles(c);
+  for (const auto& title : Snapshot().leftover_titles) {
+    const auto refusal = RunDeleteLeftover(c, LeftoverDelete{title, {}, "retire"});
+    if (!refusal.empty()) return stop("A leftover PS5 title could not be removed (" + title.title_id + "): " + refusal);
+  }
+  // 3. No title left to allow (the list itself goes with Playden's files).
+  if (const auto refused = SyncTitleAllowList(c); !refused.empty()) Log("playden removal allow-list: " + refused);
+  if (!rt::SaveRemovalJournal(paths.data_root, {rt::RemovalStep::kFiles, keep_saves}))
+    return stop("Playden could not record that its PS5 titles are gone.");
+  Log("playden removal titles done; removing files");
+  // 4. The files. Nothing is logged after this: the log folder is gone.
+  const auto removed = rt::RemovePlaydenFiles(paths, keep_saves, config_.as_root, {});
+  outcome.complete = removed.complete;
+  outcome.kept = removed.kept;
+  outcome.failed = removed.failed;
+  if (!removed.complete) outcome.message = "Some of Playden's files could not be removed.";
+  return outcome;
 }
 
 void RuntimeHost::KeepUnrecordedBottles(Composition& c) {
@@ -5585,6 +6026,7 @@ void RuntimeHost::KeepUnrecordedBottles(Composition& c) {
   const auto records = c.repository.Snapshot();
   std::set<std::string> recorded_installs;
   for (const auto& record : records) recorded_installs.insert(record.install_id);
+  for (const auto& foreign : c.repository.ForeignInstalls()) recorded_installs.insert(foreign.install_id);
   // A PS5 title starts the bottle its game-launch.json names, running or not, whatever owns its folder and
   // whatever the records say about it: that bottle stays until the title is deleted (Storage lists it as a leftover).
   std::set<std::string> named_installs, named_roots;
@@ -5920,6 +6362,21 @@ std::string RuntimeHost::DeleteKept(Composition& c, std::uint32_t app) {
   return {};
 }
 
+void RuntimeHost::CopyTitleLogs(const Composition& c) {
+  for (const auto& record : c.repository.Snapshot()) {
+    if (Stopping()) return;
+    const auto root = config_.host_namespace_prefix.empty()
+        ? std::filesystem::path(record.data_root)
+        : config_.host_namespace_prefix / std::filesystem::path(record.data_root).relative_path();
+    const auto install = config_.host_namespace_prefix.empty()
+        ? std::filesystem::path(record.install_path)
+        : config_.host_namespace_prefix / std::filesystem::path(record.install_path).relative_path();
+    const auto program = record.install_path.empty() || record.launch_path.empty()
+        ? std::filesystem::path() : install / record.launch_path;
+    if (const auto text = NewestSessionLog(root, program)) config_.title_log(record.title_id, *text);
+  }
+}
+
 void RuntimeHost::Run() {
   while (RunServices()) Log("kit reload: starting the runtime services again");
 }
@@ -5939,11 +6396,11 @@ bool RuntimeHost::RunServices() {
   std::string reason;
   const auto request_directory = config_.state_root / "requests";
   const bool private_ready =
-      rt::EnsurePrivateDirectories(config_.boundary, config_.state_root, config_.state_root, &reason) &&
-      rt::EnsurePrivateDirectories(config_.boundary, config_.state_root, request_directory, &reason);
+      rt::EnsureOpenDirectories(config_.boundary, config_.state_root, config_.state_root, &reason) &&
+      rt::EnsureOpenDirectories(config_.boundary, config_.state_root, request_directory, &reason);
   if (!private_ready) {
     Log("runtime unavailable: " + reason);
-    unavailable("Private runtime state is unavailable: " + reason);
+    unavailable("Runtime state is unavailable: " + reason);
   }
   std::unique_ptr<Composition> composition;
   if (private_ready) {
@@ -5973,7 +6430,9 @@ bool RuntimeHost::RunServices() {
       // Community recipes resolve by their id's form (CommunityRecipeNamesGame); the object itself, and its game, are
       // required only where a plan is built from it (RecipeOf).
       installer->AcceptRecipes(CommunityRecipeNamesGame);
-      installer->ShareBottleProfiles(rt::KitCapabilitiesFromManifest(c.kit->capabilities, true).bottle_profile_shared);
+      const auto capabilities = rt::KitCapabilitiesFromManifest(c.kit->capabilities, true);
+      installer->ShareBottleProfiles(capabilities.bottle_profile_shared);
+      installer->AdmitOpenModes(capabilities.publication_open_modes);
       c.filesystem_installer = installer.get();
       c.installer = std::move(installer);
     } else {
@@ -6003,6 +6462,14 @@ bool RuntimeHost::RunServices() {
         [this] { return Stopping(); },
         [this, &c](const rt::RuntimeInstall& record) { return DrivePublication(c, record); });
     Log("startup loading records");
+    // Each startup step's time, for a report of a slow start: the first frame waits for all of them.
+    auto step_began = std::chrono::steady_clock::now();
+    const auto step = [&](const char* name) {
+      const auto now = std::chrono::steady_clock::now();
+      Log(std::string("startup step=") + name + " ms=" +
+          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now - step_began).count()));
+      step_began = now;
+    };
     const auto loaded = c.repository.Load();
     std::string move_error;
     if (!loaded.ok() || !MoveGames(c, &move_error)) {
@@ -6016,15 +6483,19 @@ bool RuntimeHost::RunServices() {
       ShareNumbers(&c.repository);
       // Install records with a journal wait for an explicit recovery action. Leftover-title
       // deletion journals are resumed separately before their retired folders can be swept.
-      Log("startup records loaded installs=" + std::to_string(c.repository.Snapshot().size()));
+      Log("startup records loaded installs=" + std::to_string(c.repository.Snapshot().size()) +
+          " foreign=" + std::to_string(c.repository.ForeignInstalls().size()));
       FollowUsbDrives(c);
       LoadGeneratedRecipes(c);
       Log("startup generated recipes loaded");
+      step("records");
       PublishInstalls(c);
       Log("startup installs published");
+      step("publish");
       SyncOnlineSessions(c, true);
       ResumeLeftoverDeletes(c);
       PublishLeftoverTitles(c);
+      step("leftovers");
       KeepUnrecordedBottles(c);
       // Retired title folders left by an earlier removal are outside the scan
       // root already; deleting them is only housekeeping.
@@ -6041,7 +6512,9 @@ bool RuntimeHost::RunServices() {
         }
       }
       Log("startup trash emptied");
+      step("trash");
       if (const auto listed = SyncTitleAllowList(c); !listed.empty()) Log("startup allow-list: " + listed);
+      step("allow-list");
       if (c.kit)
         for (const auto& record : c.repository.Snapshot())
           if (record.state == rt::PreparationState::kReady) {
@@ -6052,6 +6525,7 @@ bool RuntimeHost::RunServices() {
             Log("admission check title=" + record.title_id + " result=" + c.admission[record.install_id]);
           }
       PublishInstalls(c);
+      step("admission+publish");
       // A title's last run ended before this start (a game's start closes Playden).
       {
         std::map<std::uint32_t, std::string> hints;
@@ -6073,18 +6547,7 @@ bool RuntimeHost::RunServices() {
         }
         if (!physx.empty()) Publish([&](RuntimeSnapshot& s) { s.physx_needed = std::move(physx); });
       }
-      if (config_.title_log)
-        for (const auto& record : c.repository.Snapshot()) {
-          const auto root = config_.host_namespace_prefix.empty()
-              ? std::filesystem::path(record.data_root)
-              : config_.host_namespace_prefix / std::filesystem::path(record.data_root).relative_path();
-          const auto install = config_.host_namespace_prefix.empty()
-              ? std::filesystem::path(record.install_path)
-              : config_.host_namespace_prefix / std::filesystem::path(record.install_path).relative_path();
-          const auto program = record.install_path.empty() || record.launch_path.empty()
-              ? std::filesystem::path() : install / record.launch_path;
-          if (const auto text = NewestSessionLog(root, program)) config_.title_log(record.title_id, *text);
-        }
+      step("hints");
       // Play: the launch journal sits beside the install records. A session
       // pending from before a restart is polled, never handed off again.
       c.launch_journal = std::make_unique<rt::StorageLaunchSessionJournal>(c.storage);
@@ -6115,6 +6578,7 @@ bool RuntimeHost::RunServices() {
         std::lock_guard<std::mutex> lock(mutex_);
         launch_poll_ = true;
       }
+      step("launch");
       // A recipe switch cut off between its commit and its markers (RebindRecipeMarkers) finishes
       // before anything reads the markers: the bottle's modes, the republish passes, the installs view.
       if (c.kit) {
@@ -6128,6 +6592,7 @@ bool RuntimeHost::RunServices() {
         }
         if (changed) PublishInstalls(c);
       }
+      step("rebind");
       // Games started from Home (and Playden's, which close Playden) left Wine's 0600 saves: with
       // bottle-profile-shared they are opened to FTP again once their title is stopped.
       if (c.kit && rt::KitCapabilitiesFromManifest(c.kit->capabilities, true).bottle_profile_shared) {
@@ -6144,6 +6609,7 @@ bool RuntimeHost::RunServices() {
         for (const auto& record : c.repository.Snapshot())
           if (record.state == rt::PreparationState::kReady && MaintenanceRefusal(c, record).empty())
             KitMonoStep(c, record, "startup");
+      step("mono");
       // An unowned upgrade's request cut off before its publication began (a crash, a capture
       // refused on an earlier start) is dropped first: the game plays under its owned publication,
       // and the pass below tries the upgrade again. Moved games and newer settings keep theirs.
@@ -6151,6 +6617,7 @@ bool RuntimeHost::RunServices() {
         if (record.state == rt::PreparationState::kReady && record.journal && record.moved_from.empty() &&
             record.journal->operation == "settings-request" && record.journal->step == "capture-update")
           DropUpgradeRequest(c, record.install_id, "left by an earlier start");
+      step("drop-requests");
       // Games whose folder moved with the games root (0.6) start from Home only once their
       // publication names the new folder: republished now, busy titles wait for Play.
       // So are games published owned while the kit admits unowned folders (folders opened for
@@ -6171,6 +6638,7 @@ bool RuntimeHost::RunServices() {
                                  : (busy.empty() ? "failed: " : "waits: ") + refused));
       }
       FinishGamesMove(c);
+      step("republish");
       // Settings saved while Playden was closed, or before a title was stopped, are published
       // now, so a start from the PS5 Home screen uses them too. Busy titles wait for Play.
       if (c.kit)
@@ -6189,6 +6657,7 @@ bool RuntimeHost::RunServices() {
             Log("startup settings app=" + std::to_string(record.runtime_number) + " " + (refused.empty() ? "applied" : refused));
         }
       RemoveFinishedRequests(c);
+      step("settings");
       const bool kit_available = c.kit.has_value();
       Log("runtime ready installs=" + std::to_string(c.repository.Snapshot().size()) + " kit=" +
           (kit_available ? c.kit->view.kit_id : "none (" + kit_reason + ")") +
@@ -6200,6 +6669,10 @@ bool RuntimeHost::RunServices() {
         std::lock_guard<std::mutex> lock(mutex_);
         drive_updates_pending_ = drive_updates > 0;
         drive_update_not_before_ = {};
+        // Uninstall Playden stopped while removing PS5 titles (the console went off): it goes on now.
+        if (const auto journal = rt::LoadRemovalJournal(rt::ConsoleRemovalPaths(config_.host_namespace_prefix).data_root);
+            journal && journal->step == rt::RemovalStep::kTitles && !playden_removal_request_)
+          playden_removal_request_ = journal->keep_saves;
       }
       Publish([&](RuntimeSnapshot& s) {
         s.status = RuntimeHostStatus::kReady; s.reason.clear();
@@ -6222,11 +6695,18 @@ bool RuntimeHost::RunServices() {
     PublishPrepared(composition.get());
   }
   startup_hold.reset();
+  // Each title's newest session reports, copied to the logs folder for a report: reading every bottle's logs takes a
+  // while with many games, and nothing at start needs them, so the first frame doesn't wait for them.
+  if (composition && composition->repository.Loaded() && config_.title_log) {
+    const auto logs_hold = hold();
+    CopyTitleLogs(*composition);
+  }
   bool reload = false;
   for (;;) {
     std::vector<PlayRequest> plays;
     std::vector<RemovalRequest> removals;
     std::vector<std::uint32_t> kept_deletes;
+    std::optional<bool> remove_playden;  // keep_saves
     std::vector<std::pair<std::uint32_t, RuntimeMaintenance>> maintenance;
     std::vector<std::pair<std::uint32_t, std::string>> scans;
     bool poll = false;
@@ -6245,23 +6725,25 @@ bool RuntimeHost::RunServices() {
       // Preparation changes install records that Handoff reads on the
       // application thread, so it waits while a handoff is pending.
       const auto ready = [this] {
-        return stopping_ || (!prepare_requests_.empty() && !snapshot_.handoff_ready && !prepares_held_) ||
+        return stopping_ || (!prepare_requests_.empty() && !snapshot_.handoff_ready && !PreparesHeldLocked()) ||
                !play_requests_.empty() ||
                cleanup_requested_ || measure_requested_ || !activity_requests_.empty() || title_names_changed_ ||
                installs_recheck_requested_ ||
                steam_account_changed_ ||
                (!remove_requests_.empty() && !snapshot_.handoff_ready) ||
                (!kept_delete_requests_.empty() && !snapshot_.handoff_ready) ||
+               (playden_removal_request_ && !snapshot_.handoff_ready) ||
                !scan_requests_.empty() || !prepared_dismissals_.empty() || prepared_clear_requested_ ||
                (!maintenance_requests_.empty() && !snapshot_.handoff_ready) ||
                (!home_handoff_requests_.empty() && !snapshot_.handoff_ready) ||
                (!relocation_requests_.empty() && !snapshot_.handoff_ready) ||
                (kit_reload_requested_ && !snapshot_.handoff_ready && !launch_poll_) ||
-               (drive_updates_pending_ && !snapshot_.handoff_ready && !launch_poll_ &&
+               (drive_updates_pending_ && !snapshot_.handoff_ready && !launch_poll_ && !PreparesHeldLocked() &&
                 std::chrono::steady_clock::now() >= drive_update_not_before_);
       };
+      // A held or paused queue holds the drive update too: its deadline wakes nothing until the hold ends.
       if (launch_poll_) wake_.wait_for(lock, kLaunchPollInterval, ready);
-      else if (drive_updates_pending_) wake_.wait_until(lock, drive_update_not_before_, [&] { return ready() || launch_poll_; });
+      else if (drive_updates_pending_ && !PreparesHeldLocked()) wake_.wait_until(lock, drive_update_not_before_, [&] { return ready() || launch_poll_; });
       else wake_.wait(lock, [&] { return ready() || launch_poll_; });
       if (stopping_) {
         // A sign-out not acted on yet still takes the kept sessions with it.
@@ -6283,12 +6765,16 @@ bool RuntimeHost::RunServices() {
       plays.swap(play_requests_);
       // Removal changes install records that Handoff reads, like preparation.
       if (!snapshot_.handoff_ready && !remove_requests_.empty() &&
-          (prepare_requests_.empty() || prepares_held_ ||
+          (prepare_requests_.empty() || PreparesHeldLocked() ||
            remove_requests_.front().order < prepare_order_.at(prepare_requests_.front().runtime_number))) {
         removals.push_back(std::move(remove_requests_.front()));
         remove_requests_.erase(remove_requests_.begin());
       }
       if (!snapshot_.handoff_ready) kept_deletes.swap(kept_delete_requests_);
+      if (!snapshot_.handoff_ready && playden_removal_request_) {
+        remove_playden = playden_removal_request_;
+        playden_removal_request_.reset();
+      }
       scans.swap(scan_requests_);
       // Maintenance changes the bottle and install record, like removal.
       if (!snapshot_.handoff_ready) maintenance.swap(maintenance_requests_);
@@ -6452,6 +6938,18 @@ bool RuntimeHost::RunServices() {
         ++s.removals_handled;
       });
     }
+    if (remove_playden) {
+      Publish([](RuntimeSnapshot& s) { s.removing_playden = true; s.playden_removal.reset(); });
+      PlaydenRemovalOutcome outcome;
+      if (composition) outcome = RunRemovePlayden(*composition, *remove_playden);
+      else outcome.message = Snapshot().reason.empty() ? "The runtime services are unavailable." : Snapshot().reason;
+      ClearWork();
+      Publish([&](RuntimeSnapshot& s) {
+        s.removing_playden = false;
+        s.playden_removal = outcome;
+        ++s.playden_removals_handled;
+      });
+    }
     for (const auto app : kept_deletes) {
       if (!composition) continue;
       const auto refusal = DeleteKept(*composition, app);
@@ -6511,7 +7009,7 @@ bool RuntimeHost::RunServices() {
       bool step = false;
       {
         std::lock_guard<std::mutex> lock(mutex_);
-        step = drive_updates_pending_ && !stopping_ && !launch_poll_ && !snapshot_.handoff_ready && !prepares_held_ &&
+        step = drive_updates_pending_ && !stopping_ && !launch_poll_ && !snapshot_.handoff_ready && !PreparesHeldLocked() &&
                prepare_requests_.empty() && play_requests_.empty() && maintenance_requests_.empty() &&
                remove_requests_.empty() && relocation_requests_.empty() &&
                std::chrono::steady_clock::now() >= drive_update_not_before_;
@@ -6525,7 +7023,7 @@ bool RuntimeHost::RunServices() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       // A preparation that came after this batch read the Steam session waits for the next batch.
-      if (!prepare_requests_.empty() && !snapshot_.handoff_ready && !prepares_held_ && !stopping_ &&
+      if (!prepare_requests_.empty() && !snapshot_.handoff_ready && !PreparesHeldLocked() && !stopping_ &&
           (batch_online_session_loaded_ || !composition || !config_.online_session) &&
           (remove_requests_.empty() ||
            prepare_order_.at(prepare_requests_.front().runtime_number) < remove_requests_.front().order)) {

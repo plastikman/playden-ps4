@@ -35,7 +35,12 @@ struct PeSpec {
   std::vector<std::string> delay_imports;  // delay-loaded DLLs (descriptors at RVA 0x2a00)
   std::string resource;      // the resource directory's bytes, at RVA 0x2c00 (at most 0x400)
   std::string code_section = ".text";  // the first section's name (Watcom's linker calls it BEGTEXT)
+  std::uint32_t code_raw_size = 0x1000;  // the first section's SizeOfRawData
 };
+
+// Watcom's startup at a program's entry: a near jump over its banner (NFS3's Modern Patch, 0x4f7fa0).
+const std::string kWatcomEntry =
+    std::string("\xe9\xfb\xd8\x01\x00\x03\x10\x40\x00", 9) + "WATCOM C/C++32 Run-Time system. (c) Copyright";
 
 void Put32(std::string* bytes, std::size_t at, std::uint32_t value) {
   for (int i = 0; i < 4; ++i) (*bytes)[at + i] = static_cast<char>((value >> (8 * i)) & 0xff);
@@ -69,6 +74,7 @@ void WritePe(const fs::path& path, const PeSpec& spec) {
     Put32(&bytes, table + row * 40 + 20, raw);
   };
   section(0, spec.bind_entry ? ".bind" : spec.code_section.c_str(), 0x1000, 0x400);
+  Put32(&bytes, table + 16, spec.code_raw_size);
   section(1, ".rdata", 0x2000, static_cast<std::uint32_t>(spec.data_at));
   if (spec.shared_data) Put32(&bytes, table + 40 + 36, 0xd0000040);
   bytes.replace(0x400, spec.text.size(), spec.text);
@@ -363,6 +369,27 @@ int main() {
     x64.code_section = "BEGTEXT";
     WritePe(root / "w64.exe", x64);
     CHECK(!ProbeGame(root.string(), "w64.exe").watcom && DefaultsFor(ProbeGame(root.string(), "w64.exe")).cpu.empty());
+    // NFS3's Modern Patch is linked by Watcom with .code and .data sections; its entry jumps over Watcom's banner.
+    PeSpec nfs3{false, {"USER32.dll", "DDRAW.dll"}};
+    nfs3.code_section = ".code";
+    nfs3.text = std::string(0x10, '\x90') + kWatcomEntry;
+    WritePe(root / "nfs3.exe", nfs3);
+    const auto modern = ProbeGame(root.string(), "nfs3.exe");
+    CHECK(modern.watcom && DefaultsFor(modern).cpu == "translator");
+    // The banner elsewhere in a program (a string in its data) says nothing; nor does a 64-bit program's.
+    PeSpec quoted{false, {"USER32.dll"}};
+    quoted.text = std::string(0x100, '\x90') + kWatcomEntry;
+    WritePe(root / "quoted.exe", quoted);
+    CHECK(!ProbeGame(root.string(), "quoted.exe").watcom);
+    PeSpec banner64{true, {"USER32.dll"}};
+    banner64.text = nfs3.text;
+    WritePe(root / "b64.exe", banner64);
+    CHECK(!ProbeGame(root.string(), "b64.exe").watcom);
+    // Only the entry section's file bytes count: a banner past them is in another section or not in the file.
+    PeSpec short_raw = nfs3;
+    short_raw.code_raw_size = 0x20;
+    WritePe(root / "short.exe", short_raw);
+    CHECK(!ProbeGame(root.string(), "short.exe").watcom);
   }
   {  // Godot and Source.
     const auto root = fresh();
@@ -404,6 +431,16 @@ int main() {
     mono.wine_mono = true;
     const auto xna = DefaultsFor(ProbeGame(root.string(), "Celeste.exe"), mono);
     CHECK(xna.refusal.empty() && xna.graphics == "opengl" && DetectedLabel(xna.summary) == "XNA \xC2\xB7 OpenGL");
+    // FNA builds have no Microsoft.Xna.Framework.Game assembly; FEZ.exe names the graphics namespace and
+    // GraphicsDeviceManager.
+    WritePe(root / "FEZ.exe", {false, {"mscoree.dll"}, true, false,
+                               "Microsoft.Xna.Framework Microsoft.Xna.Framework.Graphics GraphicsDeviceManager"});
+    CHECK(ProbeGame(root.string(), "FEZ.exe").engine == "xna");
+    // The framework's name alone is not an XNA game: Borderlands 2's 2K launcher reads the pad through XNA's input.
+    WritePe(root / "Launcher.exe",
+            {false, {"mscoree.dll"}, true, false, "Microsoft.Xna.Framework Microsoft.Xna.Framework.Input"});
+    const auto launcher = ProbeGame(root.string(), "Launcher.exe");
+    CHECK(launcher.dotnet && launcher.engine.empty());
   }
   {  // LÖVE (Balatro): OpenGL, found through love.dll beside the program.
     const auto root = fresh();
@@ -518,6 +555,18 @@ int main() {
     CHECK(old.defaults.at("cpu") == "translator" && old.detected == "ddraw,watcom graphics=auto" && old.graphics == "dxvk");
     CHECK(!RefreshRecipeDefaults(root.string(), kit, &old));
     // A Native the recipe already says, a 32-bit program that isn't Watcom's and a 64-bit recipe stay as they are.
+    // One linked with other section names (NFS3's Modern Patch), saved before as an unknown engine.
+    PeSpec nfs3{false, {"USER32.dll", "DDRAW.dll"}};
+    nfs3.code_section = ".code";
+    nfs3.text = std::string(0x10, '\x90') + kWatcomEntry;
+    WritePe(root / "nfs3.exe", nfs3);
+    GameRecipe modern;
+    CHECK(GenerateGameRecipe(4026531863u, "NFS3", {{"", "", "nfs3.exe", "", ""}}, root.string(), &modern, &reason, kit));
+    CHECK(modern.defaults.at("cpu") == "translator");
+    modern.defaults.erase("cpu");
+    modern.detected = "unknown graphics=dxvk";
+    CHECK(RefreshRecipeDefaults(root.string(), kit, &modern));
+    CHECK(modern.defaults.at("cpu") == "translator" && modern.detected == "watcom graphics=dxvk");
     auto native = recipe;
     native.defaults["cpu"] = "native";
     native.detected = "ddraw graphics=auto";
@@ -683,6 +732,60 @@ int main() {
     CHECK(UnrealGameProgram(root.string(), "WindowsNoEditor/Other/Binaries/Win64/Other-Win64-Shipping.exe").empty());
     WritePe(root / "WindowsNoEditor/UE4PrereqSetup_x64.exe", {true, {"KERNEL32.dll"}});
     CHECK(UnrealGameProgram(root.string(), "WindowsNoEditor/UE4PrereqSetup_x64.exe").empty());
+  }
+  {  // SUPERHOT (#755): Steam starts SUPERHOT.exe, a bootstrap beside UnityPlayer.dll that starts the launcher as a child
+     // process; the console refuses that and the bootstrap stops. The player is SH.exe, the one with a <stem>_Data folder.
+    const auto root = fresh();
+    // A 32-bit .NET bootstrap with SteamStub (both refused when it is the program) in front of a 64-bit native player:
+    // the player's own files decide.
+    WritePe(root / "SUPERHOT.exe", {false, {"mscoree.dll"}, true, true});
+    WritePe(root / "SH.exe", {true, {"UnityPlayer.dll", "KERNEL32.dll"}});
+    WritePe(root / "UnityPlayer.dll", {true, {"KERNEL32.dll"}, false, false, Wide("d3d11.dll")});
+    WritePe(root / "UnityCrashHandler64.exe", {true, {"KERNEL32.dll"}});
+    fs::create_directories(root / "SH_Data");
+    const auto probe = ProbeGame(root.string(), "SUPERHOT.exe");
+    CHECK(probe.engine == "unity" && probe.unity_program == "SH.exe" && probe.unreal_program.empty());
+    CHECK(UnityGameProgram(root.string(), "SUPERHOT.exe") == "SH.exe");
+    CHECK(GameProgramInstead(root.string(), "SUPERHOT.exe") == "SH.exe");
+    GameRecipe recipe;
+    std::string reason;
+    CHECK(GenerateGameRecipe(322500, "SUPERHOT", {{"", "", "SUPERHOT.exe", "", ""}}, root.string(), &recipe, &reason));
+    CHECK(recipe.launch_entries[0].executable == "SH.exe" && recipe.graphics == "dxvk" && recipe.architecture == "pe64");
+    CHECK(recipe.arguments.find("-force-d3d11") != std::string::npos);
+    // The player itself, and a program with no UnityPlayer.dll beside it, are started as they are.
+    CHECK(ProbeGame(root.string(), "SH.exe").unity_program.empty());
+    CHECK(UnityGameProgram(root.string(), "SH.exe").empty());
+    // A recipe generated before this (SUPERHOT.exe, current defaults) starts the player from the next Play on.
+    GameRecipe old = recipe;
+    old.launch_entries[0].executable = "SUPERHOT.exe";
+    old.architecture = "pe32";
+    KitCapabilities kit;
+    CHECK(RefreshRecipeDefaults(root.string(), kit, &old));
+    CHECK(old.launch_entries[0].executable == "SH.exe" && old.launch_entries[0].working_directory.empty() &&
+          old.arguments == recipe.arguments && old.architecture == "pe64");
+    CHECK(!RefreshRecipeDefaults(root.string(), kit, &old));  // nothing more to do
+    // A program the player chose is kept as chosen.
+    GameRecipe picked = recipe;
+    picked.launch_entries[0].id = kProgramEntryId;
+    picked.launch_entries[0].executable = "SUPERHOT.exe";
+    CHECK(!RefreshRecipeDefaults(root.string(), kit, &picked) && picked.launch_entries[0].executable == "SUPERHOT.exe");
+    // A program with a <name>_Data folder that doesn't load UnityPlayer.dll is not a player.
+    WritePe(root / "Editor.exe", {true, {"KERNEL32.dll"}});
+    fs::create_directories(root / "Editor_Data");
+    CHECK(UnityGameProgram(root.string(), "SUPERHOT.exe") == "SH.exe");
+    // Two players: none is guessed.
+    WritePe(root / "Other.exe", {true, {"UnityPlayer.dll"}});
+    fs::create_directories(root / "Other_Data");
+    CHECK(UnityGameProgram(root.string(), "SUPERHOT.exe").empty());
+    // In a subfolder, the path keeps it.
+    const auto nested = fresh();
+    WritePe(nested / "Game/Start.exe", {true, {"KERNEL32.dll"}});
+    WritePe(nested / "Game/Player.exe", {true, {"UnityPlayer.dll"}});
+    WritePe(nested / "Game/UnityPlayer.dll", {true, {"KERNEL32.dll"}});
+    fs::create_directories(nested / "Game/Player_Data");
+    CHECK(UnityGameProgram(nested.string(), "Game/Start.exe") == "Game/Player.exe");
+    WritePe(nested / "Lonely.exe", {true, {"KERNEL32.dll"}});
+    CHECK(UnityGameProgram(nested.string(), "Lonely.exe").empty());
   }
   {  // Satisfactory (Epic): the root FactoryGameEGS.exe starts FactoryGame/Binaries/Win64/*-Shipping.exe.
     const auto root = fresh();
@@ -962,6 +1065,78 @@ int main() {
                                &reason, mono, {}, nullptr, &none));
       CHECK(none.steam_default.empty() && !ProgramInsteadOfSteamDefault(recipe, nullptr));
     }
+    {  // Borderlands 2: Steam's only program is the 2K launcher, a .NET program that uses XNA for the pad and nothing
+       // else. It is a launcher: the game's own program starts, on DXVK, not the launcher on OpenGL.
+      const auto bl2 = fresh();
+      WritePe(bl2 / "Binaries/Win32/Launcher.exe",
+              {false, {"mscoree.dll"}, true, false, "Microsoft.Xna.Framework Microsoft.Xna.Framework.Input"});
+      WritePe(bl2 / "Binaries/Win32/Microsoft.Xna.Framework.dll", {false, {"mscoree.dll"}, true});
+      WritePe(bl2 / "Binaries/Win32/Borderlands2.exe", {false, {"KERNEL32.dll", "d3d9.dll"}, false, false, "", 0x40000});
+      KitCapabilities mono;
+      mono.wine_mono = true;
+      GameRecipeDiagnostics swap;
+      CHECK(GenerateGameRecipe(49520, "Borderlands 2", {{"", "", "Binaries/Win32/Launcher.exe", "", ""}}, bl2.string(),
+                               &recipe, &reason, mono, {}, nullptr, &swap));
+      CHECK(recipe.launch_entries.size() == 2 && recipe.launch_entries[0].executable == "Binaries/Win32/Borderlands2.exe" &&
+            recipe.launch_entries[0].id == "game" && recipe.launch_entries[1].executable == "Binaries/Win32/Launcher.exe");
+      CHECK(recipe.graphics == "dxvk" && recipe.architecture == "pe32");
+      CHECK(swap.steam_default_skipped_because == "dotnet-launcher" &&
+            swap.game_instead == "Binaries/Win32/Borderlands2.exe");
+
+      // A copy set up while the launcher counted as an XNA game starts the launcher on OpenGL. Its recipe is made
+      // again at the next Play, as this setup made it.
+      auto old = recipe;
+      old.launch_entries = {recipe.launch_entries[1]};
+      old.launch_entries[0].id = "launch-1";
+      old.graphics = "opengl";
+      old.arguments.clear();
+      old.detected = "xna graphics=opengl";
+      old.defaults_revision = 0;
+      CHECK(DefaultsRevision("xna") == 1);
+      CHECK(RefreshRecipeDefaults(bl2.string(), mono, &old));
+      CHECK(old.id == recipe.id && old.launch_entries.size() == 2 &&
+            old.launch_entries[0].executable == "Binaries/Win32/Borderlands2.exe" && old.launch_entries[0].id == "game" &&
+            old.launch_entries[1].executable == "Binaries/Win32/Launcher.exe" && old.graphics == "dxvk" &&
+            old.detected == recipe.detected);
+      CHECK(!RefreshRecipeDefaults(bl2.string(), mono, &old));
+      // Steam's entries keep their ids (a saved choice names them) and folders; the game's program goes before them.
+      auto numbered = old;
+      numbered.launch_entries = {recipe.launch_entries[1], recipe.launch_entries[1]};
+      numbered.launch_entries[0].id = "launch-1";
+      numbered.launch_entries[0].in_install_root = false;
+      numbered.launch_entries[1].id = "launch-3";
+      numbered.launch_entries[1].arguments = "-safe";
+      numbered.launch_entries[1].working_directory = "Binaries";
+      numbered.graphics = "opengl";
+      numbered.detected = "xna graphics=opengl";
+      numbered.defaults_revision = 0;
+      CHECK(RefreshRecipeDefaults(bl2.string(), mono, &numbered));
+      CHECK(numbered.launch_entries.size() == 3 && numbered.launch_entries[0].id == "game" &&
+            numbered.launch_entries[1].id == "launch-1" && !numbered.launch_entries[1].in_install_root &&
+            numbered.launch_entries[2].id == "launch-3" && numbered.launch_entries[2].arguments == "-safe" &&
+            numbered.launch_entries[2].working_directory == "Binaries" && numbered.graphics == "dxvk");
+      // A program the player chose is kept with what it was set up with, and isn't read again at each Play.
+      auto chosen = recipe;
+      chosen.launch_entries = {recipe.launch_entries[1]};
+      chosen.launch_entries[0].id = kProgramEntryId;
+      chosen.graphics = "opengl";
+      chosen.detected = "xna graphics=opengl";
+      chosen.defaults_revision = 0;
+      CHECK(RefreshRecipeDefaults(bl2.string(), mono, &chosen));
+      CHECK(chosen.launch_entries.size() == 1 && chosen.launch_entries[0].executable == "Binaries/Win32/Launcher.exe" &&
+            chosen.graphics == "opengl" && chosen.detected == "xna graphics=opengl" && chosen.defaults_revision == 1);
+      CHECK(!RefreshRecipeDefaults(bl2.string(), mono, &chosen));
+      // An XNA game set up before keeps its program and takes the new revision once.
+      WritePe(bl2 / "Celeste.exe", {false, {"mscoree.dll"}, true, false, "Microsoft.Xna.Framework.Game"});
+      CHECK(GenerateGameRecipe(504230, "Celeste", {{"", "", "Celeste.exe", "", ""}}, bl2.string(), &recipe, &reason, mono));
+      CHECK(recipe.defaults_revision == 1);
+      auto celeste = recipe;
+      celeste.defaults_revision = 0;
+      CHECK(RefreshRecipeDefaults(bl2.string(), mono, &celeste));
+      CHECK(celeste.launch_entries.size() == 1 && celeste.launch_entries[0].executable == "Celeste.exe" &&
+            celeste.graphics == "opengl" && celeste.defaults_revision == 1);
+      CHECK(!RefreshRecipeDefaults(bl2.string(), mono, &celeste));
+    }
     // A program that draws, or the player's choice, is started as listed.
     CHECK(GenerateGameRecipe(1, "Game", {{"", "", "Tools/Viewer.exe", "", ""}}, root.string(), &recipe, &reason));
     CHECK(recipe.launch_entries.size() == 1 && recipe.launch_entries[0].executable == "Tools/Viewer.exe");
@@ -1056,6 +1231,27 @@ int main() {
     WritePe(root / "game/Game-Win64-Shipping.exe", {false, {"KERNEL32.dll"}});
     note("Z:\\data\\games\\1\\Game-Win64-Shipping.exe");
     CHECK(take() == "Game-Win64-Shipping.exe");
+    // A title with [steam] shows the game in steamapps\common through links in the bottle: a program named there, in
+    // any case and by any of the links' names, counts; with no link there, it doesn't.
+    note("C:\\Program Files (x86)\\Steam\\steamapps\\common\\The Game\\bin\\Game.exe");
+    CHECK(take().empty());
+    const auto common = prefix / "drive_c/Program Files (x86)/Steam/steamapps/common";
+    fs::create_directories(common);
+    std::ofstream(common / ".pw-symlinks", std::ios::binary) << "1\t/data/games/1\nThe Game\t/data/games/1\n";
+    note("C:\\Program Files (x86)\\Steam\\steamapps\\common\\The Game\\bin\\Game.exe");
+    CHECK(take() == "bin/Game.exe");
+    note("c:\\program files (x86)\\steam\\steamapps\\common\\the game\\bin\\Game.exe");
+    CHECK(take() == "bin/Game.exe");
+    note("C:\\Program Files (x86)\\Steam\\steamapps\\common\\1\\bin\\Game.exe");
+    CHECK(take() == "bin/Game.exe");
+    note("Z:\\data\\games\\1\\bin\\Game.exe");
+    CHECK(take() == "bin/Game.exe");
+    // Another folder there, or the library folder itself: nothing.
+    note("C:\\Program Files (x86)\\Steam\\steamapps\\common\\Other\\bin\\Game.exe");
+    CHECK(take().empty());
+    note("C:\\Program Files (x86)\\Steam\\steamapps\\common\\The Game\\");
+    CHECK(take().empty());
+    fs::remove_all(prefix / "drive_c");
     // A program that can't be read keeps the note for a later start.
     { std::ofstream(root / "game/Broken.exe", std::ios::binary) << "x"; }
     note("Z:\\data\\games\\1\\Broken.exe");

@@ -345,6 +345,8 @@ ui::Button legend_button(std::string_view legend, std::size_t index)
         return ui::Button::options;
     if (legend.rfind("Touchpad", 0) == 0)
         return ui::Button::touchpad;
+    if (legend.rfind("Left ", 0) == 0)
+        return ui::Button::dpad;
     if (legend.find("Favorite") != std::string_view::npos)
         return ui::Button::square;
     if (legend.find("Backspace") != std::string_view::npos)
@@ -365,7 +367,7 @@ ui::Button legend_button(std::string_view legend, std::size_t index)
 // The glyph already names the button, so "Cross Open" reads "Open" beside it.
 const char *legend_text(const std::string &legend)
 {
-    for (const std::string_view button : {"Cross ", "Circle ", "Square ", "Triangle ", "Options ", "Touchpad "})
+    for (const std::string_view button : {"Cross ", "Circle ", "Square ", "Triangle ", "Options ", "Touchpad ", "Left "})
     {
         if (legend.rfind(button, 0) == 0)
             return legend.c_str() + button.size();
@@ -1221,7 +1223,7 @@ class Render::Impl
         return y;
     }
 
-    void draw_startup(ui::Canvas &, const ViewData &view, const State &state)
+    void draw_startup(ui::Canvas &canvas, const ViewData &view, const State &state)
     {
         section_label("Playden", 96.0F, 78.0F);
         if (state.root_access_missing)
@@ -1238,24 +1240,25 @@ class Render::Impl
             draw_actions(view, 96.0F, y, 560.0F);
             return;
         }
-        draw_title(view, 96.0F, 292.0F, 720.0F);
-        if (state.startup_loading)
+        // Accounts and libraries still loading (the model's "startup-loading" row): a spinner and what it
+        // waits for, without the welcome or the hero card, since a player with games is about to see them.
+        const auto loading = std::find_if(view.rows.begin(), view.rows.end(),
+                                          [](const ViewRow &row) { return row.key == "startup-loading"; });
+        if (loading != view.rows.end())
         {
-            const gfx::Rect loading{96.0F, 520.0F, 560.0F, 112.0F};
-            scene_.rounded_rect(loading, 10.0F, kPanel);
-            scene_.circle(130.0F, 558.0F, 7.0F, kAccent);
-            ui::text(scene_, fonts_.semibold,
-                     state.simulation_mode ? "Loading saved fixture state…" :
-                                             "Restoring your accounts…",
-                     154.0F, 566.0F,
-                     24.0F, kText);
-            scene_.rounded_rect({128.0F, 594.0F, 496.0F, 6.0F}, 3.0F,
-                                kText.with_alpha(0.14F));
-            const float pulse = 0.18F + 0.22F * (0.5F + 0.5F * std::sin(clock_ * 5.0F));
-            scene_.rounded_rect({128.0F, 594.0F, 496.0F * pulse, 6.0F}, 3.0F, kAccent);
+            startup_spinner_.style.theme = theme_;
+            startup_spinner_.style.reduced_motion = state.reduced_motion;
+            startup_spinner_.style.size = 64.0F;
+            startup_spinner_.set_bounds({928.0F, 436.0F, 64.0F, 64.0F});
+            startup_spinner_.update(frame_dt_);
+            startup_spinner_.draw(canvas);
+            ui::text(scene_, fonts_.semibold, loading->title, 960.0F, 566.0F, 28.0F, kSecondary, gfx::Align::center);
+            // The fixture's own controls (Advance fixture clock); Live has none.
+            draw_actions(view, 680.0F, 640.0F, 560.0F);
+            return;
         }
-        else
-            draw_actions(view, 96.0F, 520.0F, 560.0F);
+        draw_title(view, 96.0F, 292.0F, 720.0F);
+        draw_actions(view, 96.0F, 520.0F, 560.0F);
 
         scene_.rounded_rect({988.0F, 194.0F, 724.0F, 680.0F}, 14.0F, kPanel);
         scene_.glow({1050.0F, 268.0F, 600.0F, 360.0F}, 12.0F, 42.0F, kAccent.with_alpha(0.08F));
@@ -1267,11 +1270,8 @@ class Render::Impl
                                  kAccent.with_alpha(0.25F), kPanel);
         ui::text(scene_, fonts_.display, "YOUR GAMES", 1100.0F, 704.0F, 48.0F, kText);
         ui::text(scene_, fonts_.regular,
-                 state.startup_loading ?
-                     (state.simulation_mode ? "Restoring local fixture…" : "Connecting securely…") :
                  state.persistence_available ? "Ready when you are." : "Browsing can continue without saving.",
-                 1100.0F, 752.0F, 25.0F,
-                 state.persistence_available || state.startup_loading ? kSecondary : kAmber);
+                 1100.0F, 752.0F, 25.0F, state.persistence_available ? kSecondary : kAmber);
     }
 
     void clear_qr_cache()
@@ -1639,7 +1639,22 @@ class Render::Impl
         const State &state = simulation.state();
         const ViewData &view = simulation.route_view();
         const auto games = simulation.visible_games();
-        draw_library_rail(view, state);
+        draw_library_rail(canvas, view, state);
+        // A store collection gets a heading over the grid: its name, its store's word for it, and its games.
+        float grid_top = 123.0F;
+        if (const StoreCollection *chosen = find_store_collection(state, state.library.scope))
+        {
+            library_heading_.style.theme = theme_;
+            library_heading_.title = chosen->name + (chosen->store == Store::kGog ? " · GOG tag" : " · Steam collection");
+            library_heading_.set_count(static_cast<int>(games.size()));
+            library_heading_.set_bounds({444.0F, 146.0F, 1380.0F, 44.0F});
+            library_heading_.update(1.0F / 60.0F);
+            library_heading_.draw(canvas);
+            grid_top += 56.0F;
+        }
+        // Only on a change: setting the bounds snaps the grid's scroll.
+        if (grid_.bounds().y != grid_top)
+            grid_.set_bounds({417.0F, grid_top, 1434.0F, 903.0F - (grid_top - 123.0F)});
 
         if (games.empty())
         {
@@ -1695,14 +1710,18 @@ class Render::Impl
         }
     }
 
-    void draw_library_rail(const ViewData &view, const State &state)
+    void draw_library_rail(ui::Canvas &canvas, const ViewData &view, const State &state)
     {
-        struct RailEntry
+        struct RailRow
         {
             std::string key;
             std::string title;
             std::string value;
+            std::string second;  // under the title: a closed store's chosen collection
             bool selected = false;
+            bool child = false;   // a row inside an open store: indented
+            bool folder = false;  // a store with collections: a chevron, down while open
+            bool open = false;
         };
         // As the Installed scope counts them: imported games playing from their folder too.
         const std::size_t installed = std::count_if(
@@ -1710,28 +1729,77 @@ class Render::Impl
             [&state](const Installation &installation) {
                 return installation.installed_bytes > 0 || !state.simulation_mode;
             }) + state.external_games.size();
-        std::vector<RailEntry> entries = {
-            {"rail-installed", "Installed", std::to_string(installed), state.library.scope == "installed"},
-            {"rail-all", "All", std::to_string(state.games.size()), state.library.scope == "all"},
-            {"rail-favorites", "Favorites", std::to_string(state.library.favorites.size()),
-             state.library.scope == "favorites"},
-            {"rail-hidden", "Hidden", std::to_string(state.library.hidden.size()), state.library.scope == "hidden"}};
-        if (has_imported_games(state))
-            entries.push_back({"rail-imported", "Imported",
-                               std::to_string(std::count_if(state.games.begin(), state.games.end(),
-                                                            [](const Game &game) { return game.id.store == Store::kLocal; })),
-                               state.library.scope == "imported"});
-        for (const Collection &collection : state.library.collections)
-            entries.push_back({"rail-" + collection.id, collection.name,
-                               std::to_string(collection.members.size()),
-                               state.library.scope == collection.id});
-        entries.push_back({"rail-new-collection", "New collection", "+", false});
+        const auto store_count = [&state](Store store) {
+            return std::to_string(std::count_if(state.games.begin(), state.games.end(),
+                                                [store](const Game &game) { return game.id.store == store; }));
+        };
+        const auto store_of = [](const std::string &name) { return name == "gog" ? Store::kGog : Store::kSteam; };
+        const auto store_title = [](const std::string &name) { return std::string(name == "gog" ? "GOG" : "Steam"); };
+        // No store section: a store folder stands alone (2A), named for its collections.
+        const bool lone_folder = library_store_scopes(state).empty();
+        // One row per rail entry (library_rail_entries), so selected_index finds its row;
+        // the dividers around the store section are drawn between rows and never take the focus.
+        const std::string marked = library_rail_marked_scope(state);
+        std::vector<RailRow> entries;
+        for (const RailEntry &rail : library_rail_entries(state))
+        {
+            const std::string &scope = rail.key;
+            RailRow entry{"rail-" + scope, {}, {}, {}, scope == marked};
+            entry.child = rail.kind == RailEntryKind::kStoreAll || rail.kind == RailEntryKind::kStoreCollection;
+            if (rail.kind == RailEntryKind::kStoreFolder)
+            {
+                entry.folder = true, entry.open = rail.open;
+                if (lone_folder)
+                    entry.title = rail.store == "gog" ? "GOG tags" : "Steam collections",
+                    entry.value = std::to_string(store_collections_of(state, store_of(rail.store)).size());
+                else
+                    entry.title = store_title(rail.store), entry.value = store_count(store_of(rail.store));
+                // Closed, with one of its collections chosen: the collection's name under the store.
+                if (!rail.open && entry.selected)
+                    if (const StoreCollection *chosen = find_store_collection(state, state.library.scope))
+                        entry.second = chosen->name;
+            }
+            else if (rail.kind == RailEntryKind::kStoreAll)
+                entry.title = "All " + store_title(rail.store) + " games", entry.value = store_count(store_of(rail.store));
+            else if (rail.kind == RailEntryKind::kStoreCollection)
+            {
+                if (const StoreCollection *collection = find_store_collection(state, scope))
+                    entry.title = collection->name, entry.value = std::to_string(store_collection_count(state, *collection));
+            }
+            else if (scope == "installed")
+                entry.title = "Installed", entry.value = std::to_string(installed);
+            else if (scope == "all")
+                entry.title = "All", entry.value = std::to_string(state.games.size());
+            else if (scope == "favorites")
+                entry.title = "Favorites", entry.value = std::to_string(state.library.favorites.size());
+            else if (scope == "hidden")
+                entry.title = "Hidden", entry.value = std::to_string(state.library.hidden.size());
+            else if (scope == "steam")
+                entry.title = "Steam", entry.value = store_count(Store::kSteam);
+            else if (scope == "gog")
+                entry.title = "GOG", entry.value = store_count(Store::kGog);
+            else if (scope == "imported")
+                entry.title = "Imported", entry.value = store_count(Store::kLocal);
+            else if (scope == "new-collection")
+                entry.title = "New collection", entry.value = "+", entry.selected = false;
+            else
+                for (const Collection &collection : state.library.collections)
+                    if (collection.id == scope)
+                        entry.title = collection.name, entry.value = std::to_string(collection.members.size());
+            entries.push_back(std::move(entry));
+        }
+        const std::vector<int> dividers = library_rail_dividers(state);
         const auto selected_entry = std::find_if(entries.begin(), entries.end(),
-                                                 [](const RailEntry &entry) { return entry.selected; });
+                                                 [](const RailRow &entry) { return entry.selected; });
         const int selected = selected_entry == entries.end() ? -1 :
                                  static_cast<int>(std::distance(entries.begin(), selected_entry));
-        const int focus_index = state.navigation.library_rail_focused ? state.navigation.selected_index :
-                                                                         std::max(0, selected);
+        // The focused row by its key: an open or closed store moves the rows under it.
+        const auto focus_entry = std::find_if(entries.begin(), entries.end(), [&state](const RailRow &entry) {
+            return entry.key == state.navigation.focus_key;
+        });
+        const int rail_focus = focus_entry != entries.end() ? static_cast<int>(std::distance(entries.begin(), focus_entry))
+                                                            : state.navigation.selected_index;
+        const int focus_index = state.navigation.library_rail_focused ? rail_focus : std::max(0, selected);
         // An applied search gets its own row above the rail, so nothing is drawn over a focus ring.
         const bool searching = !state.library.query.empty();
         const float rail_top = searching ? 200.0F : 150.0F;
@@ -1741,14 +1809,30 @@ class Render::Impl
             ui::text(scene_, fonts_.regular, fit(fonts_.regular, state.library.query, 22.0F, 260.0F),
                      118.0F, 177.0F, 22.0F, kText);
         }
-        const ShelfWindow window = shelf_window(static_cast<int>(entries.size()), focus_index, searching ? 11 : 12);
+        // The two dividers take one entry's room, so the rail still ends above the legend.
+        constexpr float kDividerGap = 16.0F;
+        const int capacity = (searching ? 11 : 12) - (dividers.empty() ? 0 : 1);
+        const ShelfWindow window = shelf_window(static_cast<int>(entries.size()), focus_index, capacity);
+        float y = rail_top;
+        float bottom = rail_top;
         for (int visible = 0; visible < window.count; ++visible)
         {
             const int index = window.first + visible;
-            const float y = rail_top + visible * 66.0F;
-            const bool focused = route_focus_ && state.navigation.library_rail_focused &&
-                                 index == state.navigation.selected_index;
-            const gfx::Rect entry{96.0F, y, 300.0F, 60.0F};
+            // A divider sets the store section apart; only between two entries the window shows.
+            if (visible > 0 && std::find(dividers.begin(), dividers.end(), index) != dividers.end())
+            {
+                ui::DividerStyle line;
+                line.theme = theme_;
+                line.color = kText.with_alpha(0.12F);
+                // Centred in the room between the entries: the usual 6 px spacing plus the gap.
+                const float middle = y + (kDividerGap - 6.0F) / 2.0F;
+                ui::draw_divider(canvas, line, {108.0F, middle - 9.0F, 276.0F, 18.0F});
+                y += kDividerGap;
+            }
+            const bool focused = route_focus_ && state.navigation.library_rail_focused && index == rail_focus;
+            const RailRow &row = entries[static_cast<std::size_t>(index)];
+            const float indent = row.child ? 24.0F : 0.0F;
+            const gfx::Rect entry{96.0F + indent, y, 300.0F - indent, 60.0F};
             const float amount = control_focus(entries[static_cast<std::size_t>(index)].key, focused);
             focus_glow(scene_, entry, amount, true);
             scene_.rounded_rect(entry, 8.0F, kBackground);
@@ -1757,16 +1841,43 @@ class Render::Impl
             focus_ring(scene_, entry, amount, true);
             if (focused)
                 stats_.focused_control_key = entries[static_cast<std::size_t>(index)].key;
-            ui::text(scene_, fonts_.display,
-                     fit(fonts_.display, entries[static_cast<std::size_t>(index)].title, 28.0F, 225.0F),
-                     118.0F, y + 40.0F, 28.0F,
-                     entries[static_cast<std::size_t>(index)].selected || index == selected ? kText
-                                                                                             : kSecondary);
+            const gfx::Color ink = row.selected || index == selected ? kText : kSecondary;
+            float title_x = 118.0F + indent;
+            if (row.folder)
+            {
+                // Before the title, as the Library's other chevrons are drawn (the console fonts lack the glyphs):
+                // right while closed, down while open.
+                const float cx = title_x + 5.0F, cy = y + (row.second.empty() ? 30.0F : 22.0F);
+                if (row.open)
+                {
+                    scene_.line(cx - 6.0F, cy - 3.0F, cx, cy + 3.0F, 2.4F, ink);
+                    scene_.line(cx, cy + 3.0F, cx + 6.0F, cy - 3.0F, 2.4F, ink);
+                }
+                else
+                {
+                    scene_.line(cx - 3.0F, cy - 6.0F, cx + 3.0F, cy, 2.4F, ink);
+                    scene_.line(cx + 3.0F, cy, cx - 3.0F, cy + 6.0F, 2.4F, ink);
+                }
+                title_x += 22.0F;
+            }
+            const float title_width = 343.0F - title_x;
+            if (row.second.empty())
+                ui::text(scene_, fonts_.display, fit(fonts_.display, row.title, 28.0F, title_width), title_x, y + 40.0F,
+                         28.0F, ink);
+            else
+            {
+                ui::text(scene_, fonts_.display, fit(fonts_.display, row.title, 24.0F, title_width), title_x, y + 29.0F,
+                         24.0F, ink);
+                ui::text(scene_, fonts_.regular, fit(fonts_.regular, row.second, 18.0F, title_width), title_x, y + 51.0F,
+                         18.0F, kMuted);
+            }
             ui::text(scene_, fonts_.regular, entries[static_cast<std::size_t>(index)].value,
                      374.0F, y + 38.0F, 20.0F, kMuted,
                      gfx::Align::right);
+            bottom = y + 60.0F;
+            y += 66.0F;
         }
-        if (!view.subtitle.empty() && entries.size() <= (searching ? 7U : 8U))
+        if (!view.subtitle.empty() && bottom <= 692.0F)
             ui::paragraph(scene_, fonts_.regular, view.subtitle, 96.0F, 722.0F, 22.0F, 300.0F,
                           30.0F, kSecondary, 4);
     }
@@ -1904,6 +2015,20 @@ class Render::Impl
         scene_.line(cx - 6.0F, cy + 7.0F, cx + 6.0F, cy + 7.0F, 1.8F, ink);
     }
 
+    // A fixture game's poster: Steam's fixture games are numbered from 900001; another store's fixture game names its
+    // poster ("poster3"). An imported game has none (its title shows).
+    std::optional<std::size_t> fixture_art(const Game &game) const
+    {
+        if (const auto app = game.id.steam_app())
+            return *app >= 900001 ? (*app - 900001) % art_.size() : *app % art_.size();
+        if (game.cover_key.rfind("poster", 0) == 0 && game.cover_key.size() > 6)
+        {
+            const auto number = std::strtoul(game.cover_key.c_str() + 6, nullptr, 10);
+            if (number > 0) return (number - 1) % art_.size();
+        }
+        return std::nullopt;
+    }
+
     void draw_poster(const Game &game, const gfx::Rect &rect, bool focused, float progress,
                      bool title_overlay = true, std::string_view motion_key = {})
     {
@@ -1911,15 +2036,11 @@ class Render::Impl
         const float amount = motion_key.empty() ? (focused ? 1.0F : 0.0F) : focus_motion_.amount(motion_key, focused);
         const float scale = motion_key.empty() ? 1.0F : 1.0F + (FocusMotion::focused_scale - 1.0F) * amount;
         scene_.push_transform(scale, rect.cx(), rect.cy(), 0.0F, 0.0F);
-        // Fixture games are numbered from 900001.
-        const std::uint32_t number = game.id.steam_app().value_or(0);
-        const std::size_t texture_index = number >= 900001 ? (number - 900001) % art_.size() :
-                                                             number % art_.size();
+        const auto texture_index = fixture_art(game);
         const bool simulated = current_state_ != nullptr && current_state_->simulation_mode;
-        // Fixture posters belong to the fixture's Steam games; an imported game has none (its title shows).
         const std::uint32_t texture = simulated
-            ? (game.art_failed || game.art_pending || !game.id.steam_app() ? 0 : art_[texture_index])
-            : (live_artwork_ && current_state_ && !current_state_->account().id.empty()
+            ? (game.art_failed || game.art_pending || !texture_index ? 0 : art_[*texture_index])
+            : (live_artwork_ && current_state_ && LiveStoreArt(*current_state_, game.id)
                 ? store_texture(game.id, CoverUrl(game)) : 0);
         // No cover from the store: a poster made from the icon inside the game's program (#213).
         const std::uint32_t icon = simulated || texture != 0 ? 0 : program_icon_texture(game.id, CoverUrl(game));
@@ -2268,7 +2389,9 @@ class Render::Impl
                 else
                 {
                     // Preparing or uninstalling: the actual step, with a spinner; no percentage or time is made up.
-                    const char *label = entry->leftover ? "Deleting title" : entry->uninstall ? "Uninstalling" : "Preparing";
+                    // A paused queue's card says it pauses after this game.
+                    const std::string label = entry->leftover ? "Deleting title" : entry->uninstall ? "Uninstalling"
+                                            : entry->status.empty() ? "Preparing" : entry->status;
                     const float status_width = fonts_.semibold.measure(label, 24.0F);
                     spinner(right - status_width - 22.0F, top + 36.0F, 9.0F, kBlue);
                     ui::text(scene_, fonts_.semibold, label, right, top + 44.0F, 24.0F, kBlue, gfx::Align::right);
@@ -2289,7 +2412,17 @@ class Render::Impl
                          gfx::Align::center);
                 art_x = left + 54.0F;
             }
-            save_art(state, entry->game_id, {art_x, top + 9.0F, 48.0F, 72.0F});
+            if (entry->key == "prep-paused")
+            {
+                // No game: a pause sign where the art goes.
+                scene_.rounded_rect({art_x, top + 9.0F, 48.0F, 72.0F}, 6.0F, kMuted.with_alpha(0.25F));
+                scene_.rounded_rect({art_x + 14.0F, top + 31.0F, 7.0F, 28.0F}, 2.0F, kAmber);
+                scene_.rounded_rect({art_x + 27.0F, top + 31.0F, 7.0F, 28.0F}, 2.0F, kAmber);
+            }
+            else
+            {
+                save_art(state, entry->game_id, {art_x, top + 9.0F, 48.0F, 72.0F});
+            }
             std::string value = entry->status, subtitle = entry->note, aside, badge;
             std::string tone = entry->tone;
             float progress = 0.0F;
@@ -2544,14 +2677,25 @@ class Render::Impl
                 rows.push_back(index);
         // Games storage carries the default drive's usage under its title.
         const Volume *usage = nullptr;
-        if (current == "Storage" && !state.volumes.empty())
+        if (!state.volumes.empty())
         {
             const auto found = std::find_if(state.volumes.begin(), state.volumes.end(),
                                             [&state](const Volume &volume) { return volume.id == state.default_volume_id; });
             usage = found != state.volumes.end() ? &*found : &state.volumes.front();
         }
         const auto drive_row = [&](const ViewRow &row) { return usage != nullptr && row.key == "settings-storage"; };
+        // A group's heading: its name, and above every heading but the section's first a line that sets the
+        // groups apart, as in the side sheets. The first heading sits flush with the top.
+        const int first_row = rows.empty() ? -1 : rows.front();
+        constexpr float heading_line = 36.0F, heading_name = 40.0F;
+        const auto heading_height = [&](int index) {
+            return index == first_row ? heading_name : heading_line + heading_name;
+        };
+        // The space under a row: a heading keeps close to the rows it names.
+        const auto gap = [&](const ViewRow &row) { return row.kind == RowKind::Heading ? 8.0F : 24.0F; };
         const auto height = [&](const ViewRow &row) {
+            if (row.kind == RowKind::Heading)
+                return heading_height(static_cast<int>(&row - view.rows.data()));
             if (!row.qr.empty())
                 return 300.0F;
             return drive_row(row) ? (usage->capacity_known ? 186.0F : 160.0F) : row.subtitle.empty() ? 92.0F : 118.0F;
@@ -2559,19 +2703,23 @@ class Render::Impl
         float offset = 0.0F;
         {
             // Eased to the focused row like Home; with the focus on the rail the list stays where it was.
-            float top = 0.0F, focus_min = -1.0F, focus_max = 0.0F;
+            // The heading right above the focused row comes into view with it.
+            float top = 0.0F, focus_min = -1.0F, focus_max = 0.0F, heading_top = -1.0F, last_gap = 0.0F;
             for (const int index : rows)
             {
-                const float h = height(view.rows[static_cast<std::size_t>(index)]);
+                const ViewRow &row = view.rows[static_cast<std::size_t>(index)];
+                const float h = height(row);
                 if (index == focused)
                 {
-                    focus_min = top;
+                    focus_min = heading_top >= 0.0F ? heading_top : top;
                     focus_max = top + h;
                 }
-                top += h + 24.0F;
+                heading_top = row.kind == RowKind::Heading ? top : -1.0F;
+                last_gap = gap(row);
+                top += h + last_gap;
             }
             Scroll &scroll = list_scrolls_["settings-" + current];
-            const float content = std::max(0.0F, top - 24.0F);
+            const float content = std::max(0.0F, top - last_gap);
             scroll.target = focus_min >= 0.0F ? reveal(scroll.target, focus_min, focus_max, 740.0F, content)
                                               : std::clamp(scroll.target, 0.0F, std::max(0.0F, content - 740.0F));
             offset = scroll.step(frame_dt_, state.reduced_motion);
@@ -2582,6 +2730,22 @@ class Render::Impl
         {
             const ViewRow &row = view.rows[static_cast<std::size_t>(index)];
             const float h = height(row);
+            if (row.kind == RowKind::Heading)
+            {
+                const float name_top = y + h - heading_name;
+                if (index != first_row)
+                {
+                    ui::DividerStyle line;
+                    line.theme = theme_;
+                    line.color = kText.with_alpha(0.12F);
+                    ui::Canvas canvas{scene_, fonts_, renderer_.glass_texture(), clock_};
+                    ui::draw_divider(canvas, line, {left, y + 6.0F, width, 18.0F});
+                }
+                ui::text(scene_, fonts_.display, ui::upper(row.title), left + 4.0F, name_top + 30.0F, 19.0F, kMuted,
+                         gfx::Align::left, 2.0F);
+                y += h + gap(row);
+                continue;
+            }
             const gfx::Rect card{left, y, width, h};
             // The title, summary and control sit in the row's usual height; the drive's bar goes below.
             const gfx::Rect head{left, y, width, drive_row(row) ? 118.0F : h};
@@ -2746,24 +2910,24 @@ class Render::Impl
     void save_art(const State &state, GameId id, const gfx::Rect &rect)
     {
         // The cover when it is loaded; a small tile would wrap the poster's title letter by letter.
-        if (const Game *game = game_by_id(state, id); game != nullptr && state.simulation_mode && id.steam_app())
-        {
-            const std::uint32_t number = id.steam_app().value_or(0);
-            const std::size_t index = number >= 900001 ? (number - 900001) % art_.size() : number % art_.size();
-            if (!game->art_failed && !game->art_pending && art_[index] != 0)
+        const Game *game = game_by_id(state, id);
+        if (game != nullptr && state.simulation_mode)
+            if (const auto index = fixture_art(*game);
+                index && !game->art_failed && !game->art_pending && art_[*index] != 0)
             {
-                scene_.image(art_[index], rect, gfx::kFullUv, kText, 6.0F);
+                scene_.image(art_[*index], rect, gfx::kFullUv, kText, 6.0F);
                 return;
             }
-        }
-        if (live_artwork_ && !state.account().id.empty())
-            if (const std::uint32_t cover = store_texture(id, CoverUrl(id)))
+        // A GOG game's cover address is kept with the game, so the Game is asked when there is one.
+        const std::string cover_url = game != nullptr ? CoverUrl(*game) : CoverUrl(id);
+        if (live_artwork_ && LiveStoreArt(state, id))
+            if (const std::uint32_t cover = store_texture(id, cover_url))
             {
                 scene_.image(cover, rect, gfx::kFullUv, kText, 6.0F);
                 return;
             }
         // No cover: the poster made from its program's icon, else the game's colour.
-        if (const std::uint32_t icon = program_icon_texture(id, CoverUrl(id)))
+        if (const std::uint32_t icon = program_icon_texture(id, cover_url))
             scene_.image(icon, rect, gfx::kFullUv, kText, 6.0F);
         else
             scene_.gradient_rect(rect, 6.0F, id_color(id), gfx::Color::rgb(0x24201D));
@@ -3445,9 +3609,9 @@ class Render::Impl
         const GameId id = state.navigation.detail_id.value_or(state.navigation.selected_game_id);
         const Game *game = game_by_id(state, id);
         const gfx::Rect hero{0.0F, 0.0F, kWidth, 620.0F};
-        const bool live_art = !state.simulation_mode && live_artwork_ && !state.account().id.empty() && id.valid();
+        const bool live_art = !state.simulation_mode && live_artwork_ && LiveStoreArt(state, id);
         const std::uint32_t hero_texture = state.simulation_mode ? hero_ :
-            live_art ? store_texture(id, HeroUrl(id)) : 0;
+            live_art ? store_texture(id, game != nullptr ? HeroUrl(*game) : HeroUrl(id)) : 0;
         if (hero_texture != 0)
             scene_.image(hero_texture, hero, gfx::kFullUv, kText);
         else
@@ -3466,7 +3630,7 @@ class Render::Impl
         std::uint32_t logo_width = 0;
         std::uint32_t logo_height = 0;
         const std::uint32_t logo = live_art ?
-            store_texture(id, LogoUrl(id), &logo_width, &logo_height) : 0;
+            store_texture(id, game != nullptr ? LogoUrl(*game) : LogoUrl(id), &logo_width, &logo_height) : 0;
         if (logo != 0 && logo_width > 0 && logo_height > 0)
         {
             const float fit_scale = std::min(460.0F / static_cast<float>(logo_width),
@@ -3573,9 +3737,10 @@ class Render::Impl
             break;
         }
         // Non-installed games retain their download, destination and kept-save notes; an imported
-        // game says where it plays from (the fixture's too).
+        // game says where it plays from, and a game this build can't install says why (the fixture's too).
         const bool folder_note = std::any_of(view.rows.begin(), view.rows.end(), [](const ViewRow &row) {
-            return row.key == "details-folder" || row.key == "details-update-note" || row.key == "details-updating";
+            return row.key == "details-folder" || row.key == "details-update-note" || row.key == "details-updating" ||
+                   row.key == "details-unavailable";
         });
         if (!state.simulation_mode || folder_note)
         {
@@ -3758,17 +3923,12 @@ class Render::Impl
                                                 Compatibility::Untested : rating->second;
         const bool installed = installation != nullptr && installation->installed_bytes > 0;
         // One size for a game: what it takes on the drive (installed, or the install estimate).
-        std::optional<std::uint64_t> scanned_bytes;  // an imported game playing in place: its folder's size
-        for (const auto &candidate : state.import_candidates)
-            if (candidate.imported == game->id && candidate.total_bytes > 0)
-                scanned_bytes = candidate.total_bytes;
         // Not installed: as the Install button says it, what the install sheet will say.
         const auto install_row = std::find_if(view.rows.begin(), view.rows.end(), [](const ViewRow &row) { return row.key == "details-install"; });
         const auto bare_bytes = uninstalled_size(*game, state.jobs);
         const std::string size = installed ? short_size(installation->installed_bytes) :
             install_row != view.rows.end() && !install_row->value.empty() && install_row->value != "Size unknown" ? install_row->value :
-            bare_bytes ? short_size(*bare_bytes) :
-            scanned_bytes ? short_size(*scanned_bytes) : std::string("Unknown");
+            bare_bytes ? short_size(*bare_bytes) : std::string("Unknown");
         const std::string playtime = game->playtime_minutes && *game->playtime_minutes > 0 ?
             playtime_label(game->playtime_minutes) : std::string("Never played");
         // The player's own rating, apart from how the community's list has the game.
@@ -3809,6 +3969,7 @@ class Render::Impl
         detail_cell("Size", size, right, facts_top, 240.0F);
         // A game a Steam family member shares comes from Steam Families, not the account's own library.
         const std::string store = game->id.store == Store::kLocal ? std::string("Imported") :
+                                  game->id.store == Store::kGog ? std::string("GOG") :
                                   game->family_shared ? std::string("Steam Family") :
                                   game->source.empty() ? std::string("Steam") : game->source;
         detail_cell("Store", store, left, facts_top + 76.0F, 240.0F);
@@ -3970,6 +4131,10 @@ class Render::Impl
             draw_hint_row(scene_, hints, 96.0F);
             return;
         }
+        // Startup while accounts and libraries load: nothing to select, no sections to reach.
+        if (current_state_ && current_state_->navigation.route == Route::Startup && !current_state_->simulation_mode &&
+            std::any_of(view.rows.begin(), view.rows.end(), [](const ViewRow &row) { return row.key == "startup-loading"; }))
+            return;
         std::string shoulder;
         draw_hint_row(scene_, legend_hints(view, shoulder, true), 96.0F);
         if (view.show_simulation_label)
@@ -4010,7 +4175,8 @@ class Render::Impl
         if (!state.navigation.modals.empty())
         {
             const ModalEntry &modal = state.navigation.modals.back();
-            if (modal.destructive || modal.id == "confirmation")
+            // GOG's sign-in is a dialog too: its QR code needs the link strip.
+            if (modal.destructive || modal.id == "confirmation" || modal.id == "gog-sign-in")
                 draw_modal_overlay(modal, view);
             else
                 draw_sheet_overlay(view);
@@ -4179,12 +4345,15 @@ class Render::Impl
         constexpr float body_size = 25.0F, body_line = 35.0F, address_size = 21.0F, address_line = 28.0F;
         const float inner = width - 2.0F * pad;
         const float address_w = inner - qr_side - strip_gap;
-        std::string address = modal.link;
+        // A fragment is for the code only (GOG's sign-in token): others in the room can read the screen.
+        std::string address = modal.link.substr(0, modal.link.find('#'));
+        // The caption already is the address: it isn't written twice.
+        if (address == modal.link_caption) address.clear();
         if (address.rfind("https://", 0) == 0) address.erase(0, 8);
 
         const int body_lines = modal.body.empty() ? 0 :
             std::min(10, static_cast<int>(fonts_.regular.font->wrap(modal.body, body_size, inner).size()));
-        const int address_lines =
+        const int address_lines = address.empty() ? 0 :
             std::min(3, std::max(1, static_cast<int>(fonts_.regular.font->wrap(address, address_size, address_w).size())));
         constexpr float title_h = 60.0F;
         const float body_h = body_lines * body_line;
@@ -4208,13 +4377,14 @@ class Render::Impl
         if (!draw_qr_matrix(overlay_, link_qr_, panel.x + pad, y, static_cast<int>(qr_side)))
             overlay_.rounded_rect({panel.x + pad, y, qr_side, qr_side}, 12.0F, kMuted.with_alpha(0.25F));
         const float text_x = panel.x + pad + qr_side + strip_gap;
-        const float block_h = 30.0F + 14.0F + address_lines * address_line;
+        const float block_h = 30.0F + (address_lines ? 14.0F : 0.0F) + address_lines * address_line;
         const float block_y = y + (qr_side - block_h) * 0.5F;
         // What the code leads to: the release notes, or a shared recipe's pull request.
         ui::text(overlay_, fonts_.semibold, modal.link_caption.empty() ? std::string("Scan for the full release notes") : modal.link_caption,
                  text_x, block_y + 24.0F, 26.0F, kText);
-        ui::paragraph(overlay_, fonts_.regular, address, text_x, block_y + 30.0F + 14.0F + 21.0F, address_size,
-                      address_w, address_line, kSecondary, 3);
+        if (!address.empty())
+            ui::paragraph(overlay_, fonts_.regular, address, text_x, block_y + 30.0F + 14.0F + 21.0F, address_size,
+                          address_w, address_line, kSecondary, 3);
         y += qr_side + 40.0F;
 
         const std::size_t count = std::max<std::size_t>(1, view.rows.size());
@@ -4222,9 +4392,11 @@ class Render::Impl
         for (std::size_t index = 0; index < view.rows.size(); ++index)
         {
             const gfx::Rect button{panel.x + pad + index * (button_width + 16.0F), y, button_width, 68.0F};
+            // A choice in the dialog (Stay signed in) says whether it is on.
+            const bool toggle = view.rows[index].kind == RowKind::Toggle;
             mac_button(overlay_, button, overlay_label(view.rows[index]), view.rows[index].dangerous,
                        control_focus("modal-" + view.rows[index].key, static_cast<int>(index) == view.focused_row),
-                       !view.rows[index].enabled, "", false, kPanel);
+                       !view.rows[index].enabled, toggle ? (view.rows[index].selected ? "On" : "Off") : "", false, kPanel);
         }
     }
 
@@ -5155,7 +5327,9 @@ class Render::Impl
     std::map<std::string, Scroll> home_rows_;
     float frame_dt_ = 1.0F / 60.0F;
     ui::TabBar tabs_;
+    ui::Spinner startup_spinner_;  // Startup while accounts and libraries load
     ui::GridView grid_;
+    ui::SectionHeader library_heading_;  // over the grid while a store collection is shown
     ui::ListView list_;
     ui::Keyboard keyboard_;
     int keyboard_layouts_ = 0;  // 0 the default layouts, 1 a password's (Show), 2 a revealed password's (Hide)

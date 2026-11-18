@@ -35,6 +35,39 @@ the first `owned_app_ids.txt` build `7100368e` (`4635ee7b…` 32-bit, `a87257fa�
 
 Playden checks both hashes (`src/runtime/steamworks.h`) before every use.
 
+## steamclient.dll and steamclient64.dll (gbe_fork, LGPL-3.0)
+
+For Game settings › Steam features = Offline emulation, game's library. The game keeps its own `steam_api(64).dll`
+(Valve's), and gbe_fork answers one level lower, as the Steam client library Valve's DLL loads. Playden copies both
+files into the game's bottle at `C:\playden\steamclient`, writes the same `steam_settings` folder beside them (gbe_fork
+reads it from beside the client in this mode), and writes the registry values a running Steam leaves for Valve's DLL
+(`HKCU\Software\Valve\Steam` `SteamPath`, and `ActiveProcess` `pid`, `SteamClientDll`, `SteamClientDll64`,
+`ActiveUser`, `Universe`). The `pid` names the game's own Wine process (0x20, the first process of the title's Wine):
+Valve's DLL loads the client only while that process runs. Any other Steam features value removes those registry values
+again. This is for games that check their own `steam_api` file (Mortal Kombat 11) or carry Valve's inside their
+program (Resident Evil 5); the game's folder stays as Steam installed it, apart from a `steam_appid.txt` beside its
+programs, as with Online.
+
+They are gbe_fork's `steamclient_experimental` release builds of
+[`d5e74e28`](https://github.com/leolobato/gbe_fork/commit/d5e74e285644deb86eca787519be0980a72c54c3): the emulator's commit
+`ca45922c` above with one more change, in `be0aa99b` and `d5e74e28`. The client builds hook the game's own `connect`,
+`sendto` and `WinHttpConnect`, and refuse addresses outside the LAN, so the game sees it is offline. gbe_fork sends a
+blocked WinHTTP connection to `127.1.33.7`; on the console a loopback address can hang until it times out, and
+Borderlands 2 retries any failed connection at its loading logo. `d5e74e28` sends it to `x.invalid`, a host that never
+resolves, as on a computer without a network: Borderlands 2 goes on at once, and Mortal Kombat 11 reports its inventory
+offline in seconds. The regular build above has no hooks. They come from that commit's `emu-build-all-win-vs22` run
+[43567730619](https://github.com/leolobato/gbe_fork/actions/runs/43567730619) (jobs 132365184465, artifact
+`emu-win-vs22-steamclient_experimental-release-Win32-…`, and 132365184540, `…-x64-…`). Like the
+emulator, they answer interfaces up to `SteamClient023`.
+
+| File | SHA-256 |
+| --- | --- |
+| `steamclient.dll` | `387130915545bae8aea33c77e5fb78e9f5f22227f71e8974b96a3ac06fecdc2c` |
+| `steamclient64.dll` | `a57def605cc88b035ad7dd6193621bb50cffdc076465c4ad77882e45797ab79a` |
+
+Playden checks both hashes (`kSteamClient32Sha256` and `kSteamClient64Sha256` in `src/runtime/steamworks.h`) before
+every use.
+
 ## steam.dll (Playden's own)
 
 `steam.dll` is not gbe_fork's: it is a minimal Steam2-era client library built from `tools/steam-legacy/steam.c` (no imports,

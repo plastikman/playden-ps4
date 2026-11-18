@@ -4,6 +4,7 @@
 
 #undef fsync
 #include "homebrew/simulation.hpp"
+#include "runtime/game_settings.h"
 
 #include <cerrno>
 
@@ -48,7 +49,10 @@ void check(bool condition, const char* message) {
     }
 }
 
+bool settings_page_with(playden::homebrew::Simulation& simulation, const std::string& key);
+
 void activate(Simulation& model, const std::string& key) {
+    settings_page_with(model, key);
     check(model.action("focus:" + key), "requested live row must exist");
     check(model.action("cross"), "requested live row must activate");
 }
@@ -162,12 +166,14 @@ void account_commands_dispatch_refresh_and_switch_barriers(const std::filesystem
     refresh.UpdateAccount({AuthState::SignedIn, "76561198000000002", "Refresh Tester", {}, {}, false});
     refresh.action("l1");
     activate(refresh, "settings-account");
-    activate(refresh, "account-sync");
+    activate(refresh, "refresh-library");
     auto actions = refresh.TakeServiceActions();
     check(actions.size() == 1 && actions.front() == ServiceAction::RefreshLibrary
               && refresh.state().account().authentication == AuthState::SignedIn
               && refresh.state().library_loading && refresh.state().library_syncing,
           "account sync dispatches refresh and remains pending external completion");
+    check(refresh.state().navigation.route == Route::Settings,
+          "Refresh library in Steam's account sheet keeps Settings on screen, as GOG's does");
 
     auto switching = make_live(base);
     switching.UpdateAccount({AuthState::SignedIn, "76561198000000003", "Switch Tester", {}, {}, false});
@@ -229,7 +235,41 @@ void settings_survive_account_restore_and_cache_action_is_honest(const std::file
           "live settings wait until the game has a prepared PS5 title");
 }
 
-const playden::homebrew::ViewRow* find_row(const Simulation& model, const std::string& key) {
+// Game settings has two pages: the summary, and over it the list that Change settings… opens. Tests name rows on
+// either page; this goes to the page that has the row, as a player would, and stays put when neither has it.
+bool settings_page_with(playden::homebrew::Simulation& simulation, const std::string& key) {
+    const auto shown = [&] {
+        for (const auto& row : simulation.view().rows)
+            if (row.key == key) return true;
+        return false;
+    };
+    if (shown()) return true;
+    const auto& modals = simulation.state().navigation.modals;
+    if (modals.empty()) return false;
+    // A row on neither page leaves the page and its focus as they were.
+    const std::string start_id = modals.back().id;
+    const std::string start_focus = simulation.state().navigation.focus_key;
+    const auto restore = [&] {
+        if (!simulation.state().navigation.modals.empty() && simulation.state().navigation.modals.back().id == start_id)
+            simulation.action("focus:" + start_focus);
+        return false;
+    };
+    if (modals.back().id == "game-settings-list") {
+        simulation.action("circle");
+        if (shown()) return true;
+        simulation.action("focus:change-settings");
+        simulation.action("cross");
+    } else if (modals.back().id == "game-settings" && simulation.action("focus:change-settings") && simulation.action("cross")) {
+        if (shown()) return true;
+        simulation.action("circle");
+    } else {
+        return false;
+    }
+    return shown() || restore();
+}
+
+const playden::homebrew::ViewRow* find_row(Simulation& model, const std::string& key) {
+    settings_page_with(model, key);
     const auto& rows = model.view().rows;
     const auto found = std::find_if(rows.begin(), rows.end(), [&key](const auto& row) { return row.key == key; });
     return found == rows.end() ? nullptr : &*found;
@@ -238,6 +278,230 @@ const playden::homebrew::ViewRow* find_row(const Simulation& model, const std::s
 bool has_notice(const Simulation& model, const std::string& id) {
     const auto& notices = model.state().notices;
     return std::any_of(notices.begin(), notices.end(), [&id](const auto& notice) { return notice.id == id; });
+}
+
+// Steam features = Online on a game the store lists with Valve Anti-Cheat says the account could be banned, on the
+// choice and on the row once chosen. Without the store's word, Online keeps its own text.
+void live_vac_warns_on_online(const std::filesystem::path& base) {
+    std::filesystem::create_directories(base);
+    playden::runtime::SetOnlineSteamEnabled(true);
+    auto model = make_live(base);
+    model.SetGameSettingsFile(base / "vac-settings.json");
+    model.SetSettingsData({{"playden-default", "Playden default", "Most games", "", {}}}, {});
+    // A runtime kit that runs Steam beside the game: Online is offered.
+    model.SetKitCapabilities(playden::runtime::KitCapabilitiesFromManifest({"dxvk", "helper-process"}, true));
+    model.UpdateAccount({AuthState::SignedIn, "account", "Owner", {}, {}, false});
+    playden::GameSummary game;
+    game.id = SteamId(220);
+    game.title = "Half-Life 2";
+    check(model.UpdateLibrary({{game}, false, {}, false, true, 100}), "VAC game library delivered");
+    model.UpdateInstalls({}, {{SteamId(220), 1024, "internal", true}});
+    playden::homebrew::LiveRuntimeGame runtime;
+    runtime.game_id = SteamId(220);
+    runtime.prepared = runtime.has_title = true;
+    runtime.runtime_current = true;
+    runtime.launch_entry_id = "game";
+    runtime.activity = playden::homebrew::TitleActivity::Stopped;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {runtime});
+    check(model.action("details:220"), "open the VAC game's details");
+    activate(model, "details-more");
+    activate(model, "game-settings");
+    const std::string warning = "This game uses Valve Anti-Cheat (VAC). Playing it online could get your account banned from this game.";
+    activate(model, "section-compatibility");
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {runtime});  // the console's answer: not running
+    const auto opens_picker = [&] {
+        activate(model, "setting-steam_features");
+        if (find_row(model, "unlock-setting")) activate(model, "unlock-setting");
+    };
+    opens_picker();
+    const auto* online = find_row(model, "choice-1");
+    check(online && online->title == "Online (experimental)" && online->subtitle.find(warning) == std::string::npos,
+          "without the store's word, Online keeps its own text");
+    check(model.action("circle"), "close the Steam features picker");
+    model.UpdateStoreDetails(SteamId(220), "A game.", {"Action"}, "full", true);
+    activate(model, "setting-steam_features");
+    online = find_row(model, "choice-1");
+    check(online && online->enabled && online->subtitle.rfind(warning, 0) == 0, "a VAC game's Online choice warns about bans");
+    check(find_row(model, "choice-0") && find_row(model, "choice-0")->subtitle.find(warning) == std::string::npos,
+          "Offline emulation doesn't warn");
+    activate(model, "choice-1");
+    const auto* row = find_row(model, "setting-steam_features");
+    check(row && row->value == "Online (experimental)" && row->subtitle.rfind(warning, 0) == 0,
+          "the Steam features row warns while a VAC game is on Online");
+    // Game invites shows only once the game is Online. A runtime kit without title-notify runs Ask as Off, and its
+    // picker offers only Join at once and Off.
+    const auto* invites = find_row(model, "setting-game_invites");
+    check(invites && invites->value == "Off" &&
+              invites->subtitle.find("Needs a runtime kit that shows game invites.") != std::string::npos,
+          "Game invites shows Off and why on a runtime kit without notifications");
+    activate(model, "setting-game_invites");
+    check(find_row(model, "choice-0") && !find_row(model, "choice-0")->enabled && find_row(model, "choice-1")->enabled &&
+              !find_row(model, "choice-2")->enabled && find_row(model, "choice-3")->enabled,
+          "only Join at once and Off can be picked");
+    check(model.action("circle"), "close the Game invites picker");
+    activate(model, "setting-steam_features");
+    activate(model, "choice-0");
+    check(!find_row(model, "setting-game_invites"), "Game invites is not listed for Offline emulation");
+    playden::runtime::SetOnlineSteamEnabled(false);
+}
+
+// Steam friends from the controller (online-steam): the Friends tab and a game's page list them; Join on a VAC game not
+// set to Online warns, sets Online and plays into the lobby; Invite friends takes 16 at most. Without online-steam,
+// none of it is shown and friends handed over are dropped.
+void live_friends_join_and_invite(const std::filesystem::path& base) {
+    namespace rt = playden::runtime;
+    using playden::homebrew::Friend;
+    using playden::homebrew::Route;
+    std::filesystem::create_directories(base);
+    check(::chmod(base.c_str(), 0700) == 0, "friends: private settings folder");
+    rt::SetOnlineSteamEnabled(true);
+    auto model = make_live(base);
+    model.SetGameSettingsFile(base / "friends-settings.json");
+    model.SetSettingsData({{"playden-default", "Playden default", "Most games", "", {}}}, {});
+    model.SetKitCapabilities(rt::KitCapabilitiesFromManifest({"dxvk", "helper-process"}, true));
+    std::vector<rt::GameRecipe> recipes;
+    for (const std::uint32_t app : {220u, 440u}) {
+        rt::GameRecipe recipe;
+        recipe.id = rt::GeneratedRecipeId(app);
+        recipe.version = 1;
+        recipe.app_id = app;
+        recipe.launch_entries = {{"launch-1", "Game", "game.exe", "", ""}};
+        recipes.push_back(recipe);
+    }
+    model.SetGeneratedRecipes(recipes);
+    model.UpdateAccount({AuthState::SignedIn, "account", "Owner", {}, {}, false});
+    playden::GameSummary half_life;
+    half_life.id = SteamId(220);
+    half_life.title = "Half-Life 2";
+    playden::GameSummary fortress;
+    fortress.id = SteamId(440);
+    fortress.title = "Team Fortress 2";
+    check(model.UpdateLibrary({{half_life, fortress}, false, {}, false, true, 100}), "friends: library delivered");
+    model.UpdateInstalls({}, {{SteamId(220), 1024, "internal", true}, {SteamId(440), 1024, "internal", true}});
+    std::vector<playden::homebrew::LiveRuntimeGame> runtimes;
+    for (const std::uint32_t app : {220u, 440u}) {
+        playden::homebrew::LiveRuntimeGame runtime;
+        runtime.game_id = SteamId(app);
+        runtime.prepared = runtime.has_title = runtime.ready = runtime.can_play = true;
+        runtime.status = "Ready";
+        runtime.runtime_current = true;
+        runtime.launch_entry_id = "launch-1";
+        runtime.activity = playden::homebrew::TitleActivity::Stopped;
+        runtimes.push_back(runtime);
+    }
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, runtimes);
+    model.UpdateStoreDetails(SteamId(220), "A game.", {"Action"}, "full", true);
+
+    std::vector<Friend> friends = {{1001, "Mara", 1, 220, "", 5001, std::string(40, 'a')}, {1002, "Rui", 1, 440, "", 5002, ""}};
+    for (std::uint64_t id = 2000; id < 2020; ++id) friends.push_back({id, "Friend " + std::to_string(id), 1, 0, "", 0, ""});
+    model.UpdateFriends(friends, true, false);
+    check(model.state().friends.size() == 22, "friends: the controller's friends reach the model");
+    for (int step = 0; step < 6 && model.state().navigation.route != Route::Friends; ++step) {
+        model.action("r1");
+    }
+    check(model.state().navigation.route == Route::Friends, "friends: R1 reaches the Friends tab");
+    check(find_row(model, "friend-1001") && find_row(model, "friend-1001")->action == "friend-join" &&
+              find_row(model, "friend-1001")->subtitle == "Playing Half-Life 2 · in a lobby",
+          "friends: a friend in a lobby of a library game can be joined");
+
+    {
+        // Appear invisible: a saved preference comes back as the model's state, and Triangle changes it as a preference
+        // to save.
+        auto restarted = make_live(base);
+        playden::PreferencesLoadResult loaded;
+        loaded.preferences.steam_invisible = true;
+        check(restarted.ApplyPreferences(restarted.BeginPreferencesLoad(), loaded) && restarted.state().steam_invisible &&
+                  !restarted.PreferencesDirty(),
+              "friends: a saved Appear invisible loads");
+        restarted.UpdateAccount({AuthState::SignedIn, "account", "Owner", {}, {}, false});
+        for (int step = 0; step < 6 && restarted.state().navigation.route != Route::Friends; ++step) restarted.action("r1");
+        check(restarted.state().navigation.route == Route::Friends &&
+                  restarted.view().subtitle.rfind("You appear invisible", 0) == 0,
+              "friends: the Friends tab says the account appears invisible");
+        restarted.action("triangle");
+        check(!restarted.state().steam_invisible && !restarted.ExportPreferences().steam_invisible &&
+                  restarted.PreferencesDirty(),
+              "friends: Triangle appears online again, as a preference change to save");
+    }
+
+    {
+        // Settings › Accounts › Steam sign-in notice: on by default, a saved Off comes back, and the row changes it as
+        // a preference to save.
+        auto settings = make_live(base);
+        check(settings.state().steam_online_notice && settings.ExportPreferences().steam_online_notice,
+              "notice: the Steam sign-in notice is on by default");
+        playden::PreferencesLoadResult loaded;
+        loaded.preferences.steam_online_notice = false;
+        check(settings.ApplyPreferences(settings.BeginPreferencesLoad(), loaded) && !settings.state().steam_online_notice,
+              "notice: a saved Off loads");
+        settings.UpdateAccount({AuthState::SignedIn, "account", "Owner", {}, {}, false});
+        for (int step = 0; step < 8 && settings.state().navigation.route != Route::Settings; ++step) settings.action("r1");
+        const auto* row = find_row(settings, "settings-steam-online-notice");
+        check(row && row->kind == playden::homebrew::RowKind::Toggle && !row->selected && row->section == "Accounts" &&
+                  row->subtitle == "Off: Online games start without the notification.",
+              "notice: Settings has the row under Accounts › Stores, off");
+        activate(settings, "settings-steam-online-notice");
+        row = find_row(settings, "settings-steam-online-notice");
+        check(settings.state().steam_online_notice && settings.ExportPreferences().steam_online_notice &&
+                  settings.PreferencesDirty() && row && row->selected &&
+                  row->subtitle == "When an Online game starts, a notification shows the Steam account it signed in as.",
+              "notice: the row turns it on again, as a preference change to save");
+        // Without online-steam there is no row, and the action does nothing.
+        rt::SetOnlineSteamEnabled(false);
+        settings.action("r1");
+        settings.action("l1");
+        check(!find_row(settings, "settings-steam-online-notice"), "notice: without online-steam Settings has no row");
+        check(!settings.action("toggle-steam-online-notice") || settings.state().steam_online_notice,
+              "notice: without online-steam the action changes nothing");
+        rt::SetOnlineSteamEnabled(true);
+    }
+
+    // Join on Half-Life 2 (Offline emulation, Valve Anti-Cheat): the sheet warns, Use Online saves it and plays.
+    activate(model, "friend-1001");
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, runtimes);  // the console's answer: not running
+    check(find_row(model, "join-use-online") && model.view().subtitle.rfind("This game uses Valve Anti-Cheat (VAC).", 0) == 0,
+          "friends: Join on a VAC game not set to Online offers Online with the VAC warning");
+    activate(model, "join-use-online");
+    const auto& record = model.state().game_settings.at(SteamId(220));
+    check(record.overrides.count("steam_features") && record.overrides.at("steam_features") == "online",
+          "friends: Use Online for this game saves Steam features = Online");
+    const auto plays = model.TakeRuntimePlayRequests();
+    auto launches = model.TakeRuntimeOnlineLaunches();
+    check(plays.size() == 1 && plays.front() == SteamId(220) && launches.count(SteamId(220)) &&
+              launches[SteamId(220)].connect_lobby == 5001,
+          "friends: Join plays the game into the friend's lobby");
+    check(model.state().navigation.route == Route::Details && model.state().navigation.detail_id == SteamId(220),
+          "friends: the game's page shows the start");
+
+    // The page: Friends playing and Invite friends; the sheet takes 16 friends at most.
+    check(find_row(model, "friends-playing") && find_row(model, "friend-1001") && !find_row(model, "friend-1002"),
+          "friends: the game page lists the friends playing it");
+    check(find_row(model, "details-invite"), "friends: Invite friends beside Play once the game is Online");
+    activate(model, "details-invite");
+    for (std::uint64_t id = 2000; id < 2020; ++id) activate(model, "invite-friend-" + std::to_string(id));
+    const auto* left_out = find_row(model, "invite-friend-2019");
+    check(left_out && !left_out->selected && !left_out->enabled, "friends: a 17th friend can't be picked");
+    activate(model, "invite-play");
+    launches = model.TakeRuntimeOnlineLaunches();
+    check(launches.count(SteamId(220)) && launches[SteamId(220)].invites.size() == 16 &&
+              launches[SteamId(220)].connect_lobby == 0 && model.TakeRuntimePlayRequests().size() == 1,
+          "friends: Play and invite plays with 16 friends to invite");
+    // A plain Play asks the bridge nothing.
+    activate(model, "details-play");
+    check(model.TakeRuntimeOnlineLaunches().empty() && model.TakeRuntimePlayRequests().size() == 1,
+          "friends: Play alone carries no online launch");
+
+    // online-steam off: no tab, no rows, and friends handed over are dropped.
+    rt::SetOnlineSteamEnabled(false);
+    model.UpdateFriends(friends, true, false);
+    check(model.state().friends.empty(), "friends: without online-steam the model keeps no friends");
+    for (int step = 0; step < 6; ++step) {
+        model.action("circle");
+        model.action("r1");
+        check(model.state().navigation.route != Route::Friends, "friends: without online-steam there is no Friends tab");
+    }
+    check(model.action("details:220") && !find_row(model, "details-invite") && !find_row(model, "friends-playing"),
+          "friends: without online-steam a game page has no Invite friends or Friends playing");
 }
 
 // 120 Hz output and the Frame limit choices it brings can be chosen while the game's title waits for its kit
@@ -557,14 +821,36 @@ void live_settings_follow_the_prepared_title(const std::filesystem::path& base) 
     runtime.activity = TitleActivity::Stopped;
     model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {runtime});
     check(find_row(model, "setting-windows_version")->enabled, "game-closed rows open once the game is stopped");
+    {
+        // A first setup holds the runtime's answer until it ends (Mouthwashing's Steam features, 2026-11-15): the
+        // runtime found the game closed before it started, so the rows don't wait for the answer.
+        auto preparing = runtime;
+        preparing.status = "Preparing";
+        preparing.ready = preparing.prepared = preparing.can_play = false;
+        preparing.activity = TitleActivity::Unknown;
+        model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {preparing});
+        const auto* row = find_row(model, "setting-windows_version");
+        check(row && row->enabled && row->subtitle.find("Checking whether") == std::string::npos,
+              "game-closed rows can change while the game is being set up");
+        const auto depth = model.state().navigation.modals.size();
+        activate(model, "setting-windows_version");
+        check(model.state().navigation.modals.size() == depth + 1, "and open their choices");
+        activate(model, "cancel");
+        model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {runtime});
+    }
     check(find_row(model, "setting-locale") && !find_row(model, "setting-locale")->enabled,
           "unbuilt rows stay listed and disabled");
     check(model.action("focus:setting-frame_limit") &&
-              find_row(model, "setting-frame_limit")->subtitle.find("Also called [display] frame_rate · dxgi.maxFrameRate") != std::string::npos,
-          "the focused row names its technical keys");
+              find_row(model, "setting-frame_limit")->subtitle.find("Also called dxgi.maxFrameRate · d3d9.maxFrameRate") != std::string::npos,
+          "the focused row names the DXVK options it sets");
+    check(model.action("focus:setting-resolution") &&
+              find_row(model, "setting-resolution")->subtitle.find("Also called") == std::string::npos,
+          "a Playden setting names no profile key");
 
     activate(model, "setting-resolution");
     activate(model, "choice-0");
+    check(model.action("circle") && model.state().navigation.modals.back().id == "game-settings", "back from the list");
+    check(model.TakeMaintenanceRequests().empty(), "leaving the list applies nothing yet");
     check(model.action("circle"), "close the settings sheet");
     check(model.TakeMaintenanceRequests() ==
               std::vector<std::pair<playden::homebrew::GameId, MaintenanceKind>>{{SteamId(220), MaintenanceKind::ApplySettings}},
@@ -663,7 +949,7 @@ void live_saved_settings_stay_ahead_of_the_title(const std::filesystem::path& ba
     activate(model, "game-settings");
     activate(model, "setting-resolution");
     activate(model, "choice-0");
-    check(model.action("circle"), "behind: close the settings sheet");
+    check(model.action("circle") && model.action("circle"), "behind: close the list and the settings sheet");
     check(read_revision(SteamId(240)) == 2, "a change that reaches the title's revision is saved above it");
     check(find_row(model, "game-settings")->subtitle == "Changes apply on next launch",
           "the lifted change waits for the next launch");
@@ -722,7 +1008,7 @@ void live_program_change_applies_like_other_settings(const std::filesystem::path
     check(find_row(model, "setting-launch_option")->badge.empty() &&
               find_row(model, "setting-launch_option")->value == "FalloutNV.exe",
           "program: the Program row is an ordinary setting");
-    check(model.action("circle") && model.state().navigation.modals.size() == 1 &&
+    check(model.action("circle") && model.action("circle") && model.state().navigation.modals.size() == 1 &&
               model.state().navigation.modals.back().id == "context",
           "program: closing the sheet asks nothing");
     check(model.TakeMaintenanceRequests() == Requests{{SteamId(22380), MaintenanceKind::ApplySettings}},
@@ -740,7 +1026,7 @@ void live_program_change_applies_like_other_settings(const std::filesystem::path
           "picker: the choice is named by its program, not its id, and applies on next launch");
     activate(model, "value-reset");
     check(find_row(model, "setting-launch_option")->value == "Fallout: New Vegas", "program: reset goes back to Steam's");
-    check(model.action("circle") && model.state().navigation.modals.back().id == "context" &&
+    check(model.action("circle") && model.action("circle") && model.state().navigation.modals.back().id == "context" &&
               model.TakeMaintenanceRequests() == Requests{{SteamId(22380), MaintenanceKind::ApplySettings}},
           "program: the reset applies the same way");
 }
@@ -1387,8 +1673,9 @@ void live_names_program_found_instead_of_steam_default(const std::filesystem::pa
     activate(model, "details-more");
     activate(model, "game-settings");
     (void)model.TakeActivityRequests();
-    check(find_row(model, "setting-launch_option")->subtitle ==
-              "Found in the game's files: Steam's default program only starts the game.",
+    // The list opens on the Program row, which then also names its technical keys.
+    check(find_row(model, "setting-launch_option")->subtitle.rfind(
+              "Found in the game's files: Steam's default program only starts the game.", 0) == 0,
           "swap: the Program row says why");
     activate(model, "setting-launch_option");
     activate(model, "choice-1");
@@ -1444,6 +1731,8 @@ void live_runs_setup_program_once(const std::filesystem::path& base) {
     model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {runtime});
     activate(model, "details-more");
     check(find_row(model, "run-once")->enabled, "setup program: a game not known to run can open the list");
+    check(model.TakeActivityRequests() == std::vector<GameId>{SteamId(35140), SteamId(35140)},
+          "setup program: each opening of Game actions asks whether the game runs, for Move to…");
     activate(model, "run-once");
     check(model.TakeActivityRequests() == std::vector<GameId>{SteamId(35140)}, "setup program: the list asks whether it runs");
     activate(model, "setup-program-0");
@@ -1778,7 +2067,7 @@ void live_self_update(const std::filesystem::path& base) {
           find_row(model, "settings-beta-wait")->subtitle ==
               "Playden moves to the next stable version when it is out.",
           "opting out on a beta explains waiting for stable");
-    // Settings › About names a nightly as such, with its build number and commit.
+    // Settings › System › About names a nightly as such, with its build number and commit.
     update.current = "0.8.0-nightly.20261027.2";
     update.commit = "d94c0b384d";
     model.UpdateSelfUpdate(update);
@@ -2000,6 +2289,98 @@ void live_self_update(const std::filesystem::path& base) {
 }
 
 // Without the root grant only "Root access is missing" shows; its one action quits to Home.
+// A start with a saved account or imported games: while Steam restores and the other stores' libraries
+// have not answered, Startup is a loading state, not the welcome. Only a player with nothing gets the welcome.
+void live_startup_waits_before_the_welcome() {
+    using playden::homebrew::LibraryUpdate;
+    const auto row_of = [](const Simulation& model, const std::string& key) {
+        const auto& rows = model.view().rows;
+        return std::find_if(rows.begin(), rows.end(), [&](const auto& row) { return row.key == key; }) != rows.end();
+    };
+    const auto loading = [&](const Simulation& model) {
+        return model.state().navigation.route == Route::Startup && row_of(model, "startup-loading") &&
+               model.view().title.empty() && model.view().subtitle.empty() && !row_of(model, "startup-connect") &&
+               !row_of(model, "startup-import") && !row_of(model, "startup-skip");
+    };
+    const auto welcome = [&](const Simulation& model) {
+        const auto& view = model.view();
+        return model.state().navigation.route == Route::Startup && view.title == "Welcome to Playden" &&
+               !row_of(model, "startup-loading") && view.focused_row >= 0 &&
+               view.rows[static_cast<std::size_t>(view.focused_row)].key == "startup-connect";
+    };
+    const auto local_loading = [] { LibraryUpdate update{{}, true}; update.source = playden::Store::kLocal; return update; };
+    const auto local_answer = [](std::vector<playden::GameSummary> games) {
+        LibraryUpdate update{std::move(games), false, {}, false, true, 100};
+        update.source = playden::Store::kLocal;
+        return update;
+    };
+
+    // As the controller starts: Steam restores, the imported games' library loads.
+    {
+        Simulation model({}, {}, ModelMode::Live);
+        model.UpdateAccount({AuthState::Restoring, {}, {}, {}, {}, true});
+        check(model.UpdateLibrary(local_loading()), "startup: the local library starts loading");
+        check(loading(model), "startup: no welcome while Steam's saved sign-in restores");
+        check(model.view().legends.empty(), "startup: the loading state offers nothing to select");
+        model.UpdateAccount({AuthState::SignedIn, "76561198000000001", "Tester", {}, {}, false});
+        check(model.state().navigation.route == Route::Home, "startup: a restored account opens Home");
+    }
+    // Steam has no saved sign-in, and the imported games answer later.
+    {
+        Simulation model({}, {}, ModelMode::Live);
+        model.UpdateAccount({AuthState::Restoring, {}, {}, {}, {}, true});
+        check(model.UpdateLibrary(local_loading()), "startup: the local library starts loading");
+        model.UpdateAccount({AuthState::SignedOut, {}, {}, {}, {}, true});
+        check(loading(model), "startup: no welcome while the imported games are still loading");
+        playden::GameSummary game;
+        game.id = playden::GameId::Local("6d1f3a52-0c55-4f3e-9b2a-5d1c7e0a9f11");
+        game.title = "Night Sky";
+        check(model.UpdateLibrary(local_answer({game})), "startup: the imported games arrive");
+        check(model.state().navigation.route == Route::Home, "startup: imported games open Home, without the welcome");
+    }
+    // Nothing connected and nothing imported: the welcome, and a later refresh leaves it there.
+    {
+        Simulation model({}, {}, ModelMode::Live);
+        model.UpdateAccount({AuthState::Restoring, {}, {}, {}, {}, true});
+        check(model.UpdateLibrary(local_loading()), "startup: the local library starts loading");
+        check(model.UpdateLibrary(local_answer({})), "startup: no imported games");
+        check(loading(model), "startup: still loading while Steam restores");
+        model.UpdateAccount({AuthState::SignedOut, {}, {}, {}, {}, true});
+        check(welcome(model), "startup: a player with nothing gets the welcome, on Connect Steam");
+        check(model.UpdateLibrary(local_loading()), "startup: a later refresh of the imported games");
+        check(welcome(model), "startup: a refresh after the first answer keeps the welcome");
+    }
+    // The runtime kit offer waits for the loading to end, then shows on the welcome.
+    {
+        using playden::homebrew::LiveSelfUpdate;
+        Simulation model({}, {}, ModelMode::Live);
+        model.UpdateAccount({AuthState::Restoring, {}, {}, {}, {}, true});
+        LiveSelfUpdate update;
+        update.current = "0.6.0";
+        update.kit_phase = "checking";
+        model.UpdateSelfUpdate(update);
+        update.kit_phase = "available";
+        model.UpdateSelfUpdate(update);
+        check(model.state().navigation.modals.empty() && loading(model), "startup: no runtime kit offer over the loading state");
+        model.UpdateAccount({AuthState::SignedOut, {}, {}, {}, {}, true});
+        model.UpdateSelfUpdate(update);  // the controller's next tick
+        check(!model.state().navigation.modals.empty() &&
+                  model.state().navigation.modals.back().title == "Download the runtime kit?",
+              "startup: the runtime kit offer shows once the welcome does");
+    }
+    // A store whose first load fails ends the wait too.
+    {
+        Simulation model({}, {}, ModelMode::Live);
+        model.UpdateAccount({AuthState::SignedOut, {}, {}, {}, {}, true});
+        check(model.UpdateLibrary(local_loading()), "startup: the local library starts loading");
+        check(loading(model), "startup: waits for the imported games without Steam");
+        LibraryUpdate failed{{}, false, "Library is busy. Retry to refresh."};
+        failed.source = playden::Store::kLocal;
+        check(model.UpdateLibrary(failed), "startup: the local library fails");
+        check(welcome(model), "startup: a failed first load gives the welcome");
+    }
+}
+
 void live_root_access_missing() {
     Simulation model({}, {}, ModelMode::Live);
     const std::string error = "native data grant failed (code 2); helper stage=request status=unavailable error=2";
@@ -2212,6 +2593,7 @@ void live_imported_game_steam_app_id(const std::filesystem::path& base) {
               !find_view_row(model, "uninstall") && !find_view_row(model, "manage-saves"),
           "an imported game playing in place has Game settings and Remove from library, no Saves link");
     activate(model, "game-settings");
+    activate(model, "change-settings");
     const auto* row = find_view_row(model, "steam-app-id");
     check(row && row->title == "Steam app ID" && row->value == "None" &&
               row->subtitle == "Only for games that need Steam. Most run without it." && find_view_row(model, "setting-launch_option"),
@@ -2487,6 +2869,202 @@ void live_update_check(const std::filesystem::path& base) {
     check(unclocked.state().update_check.checked_at == 0, "update check: no clock, no time saved");
 }
 
+// Steam's and GOG's update checks side by side: each store's saved file holds its own games, the list shows both,
+// the copy names the stores checked or failing, and one store's sign-out keeps the other's updates.
+void live_update_check_stores(const std::filesystem::path& base) {
+    using playden::GameId;
+    using playden::Store;
+    using playden::homebrew::GameUpdate;
+    using playden::homebrew::ManageTab;
+    constexpr std::int64_t kNow = 1'800'000'000;
+    constexpr std::uint64_t kSteamAccount = 76561198000000003ull;
+    constexpr std::uint64_t kGogAccount = 0x8000000000000abcull;
+    constexpr std::uint64_t gb = 1'000'000'000;
+    const auto witcher = GameId::Gog(1207658924), gwent = GameId::Gog(1207658925), idle = GameId::Gog(1207658926);
+    const auto setup = [&](Simulation& model, bool steam, bool clock = true) {
+        if (clock) model.SetWallClock(kNow);
+        model.SetGogStoreEnabled(true);
+        model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb}}, "internal");
+        std::vector<playden::homebrew::LiveInstalledGame> installed{{witcher, 10 * gb, "internal"}, {gwent, 20 * gb, "internal"},
+                                                                    {idle, 5 * gb, "internal"}};
+        if (steam) {
+            model.UpdateAccount({AuthState::SignedIn, std::to_string(kSteamAccount), "Owner", {}, {}, false});
+            check(model.UpdateLibrary({{{SteamId(10), "Portal", "", "", ""}, {SteamId(20), "Stray", "", "", ""}}, false, {},
+                                       false, true, kNow}),
+                  "stores: Steam's library delivered");
+            installed.push_back({SteamId(10), 30 * gb, "internal"});
+            installed.push_back({SteamId(20), 40 * gb, "internal"});
+        }
+        AccountUpdate gog;
+        gog.store = Store::kGog;
+        gog.authentication = AuthState::SignedIn;
+        gog.id = "8000000000000abc";
+        gog.display_name = "Synthetic GOG";
+        model.UpdateAccount(gog);
+        playden::homebrew::LibraryUpdate library;
+        library.games = {playden::GameSummary{witcher, "Witcher", {}, {}, {}}, playden::GameSummary{gwent, "Gwent", {}, {}, {}},
+                         playden::GameSummary{idle, "Idle", {}, {}, {}}};
+        library.source = Store::kGog;
+        library.retrieved_at = kNow;
+        check(model.UpdateLibrary(library), "stores: GOG's library delivered");
+        model.UpdateInstalls({}, installed);
+    };
+    const auto open_updates = [](Simulation& model) {
+        while (!model.state().navigation.modals.empty() || model.state().navigation.route == Route::ManageGames)
+            model.action("circle");
+        for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
+        activate(model, "settings-game-updates");
+        check(model.state().navigation.manage_tab == ManageTab::Updates, "stores: Manage opens on Updates");
+    };
+    const auto settings_row = [](Simulation& model) {
+        while (!model.state().navigation.modals.empty() || model.state().navigation.route == Route::ManageGames)
+            model.action("circle");
+        for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
+        const auto* found = find_row(model, "settings-game-updates");
+        check(found, "stores: the Game updates row is there");
+        return *found;
+    };
+
+    auto model = make_live(base / "both");
+    setup(model, true);
+    const auto& check_state = model.state().update_check;
+    model.BeginUpdateCheckLoad(kSteamAccount);
+    model.BeginUpdateCheckLoad(Store::kGog, kGogAccount);
+    check(model.UpdateCheckAccount(Store::kGog) == kGogAccount && model.UpdateCheckAccount() == kSteamAccount,
+          "stores: each store has its account");
+    // A GOG page that answers before GOG's file is read wins once it is.
+    model.UpdateAppDetails(gwent, 1, 1, true, {}, {}, {}, GameUpdate{true, false, 3 * gb, 3 * gb, 4, true});
+    check(!check_state.games.count(gwent), "stores: an early GOG answer waits for GOG's file");
+    playden::SavedUpdateCheck steam_saved;
+    steam_saved.checked_at = kNow - 2 * 60 * 60;
+    steam_saved.games[SteamId(10)] = {true, false, 2 * gb, 2 * gb, 1, true};
+    model.ApplyUpdateCheck(kSteamAccount, steam_saved);
+    check(!check_state.loaded && check_state.stores.at(Store::kSteam).loaded, "stores: loaded only when every store is");
+    playden::SavedUpdateCheck gog_saved;
+    gog_saved.checked_at = kNow - 5 * 60 * 60;
+    gog_saved.games[witcher] = {true, false, 1 * gb, 1 * gb, 3, true};
+    gog_saved.games[gwent] = {false, true, 1, 1, 2, true};
+    gog_saved.games[SteamId(20)] = {true, false, 9 * gb, 9 * gb, 9, true};  // not GOG's
+    model.ApplyUpdateCheck(Store::kSteam, kGogAccount, gog_saved);
+    check(!check_state.stores.at(Store::kGog).loaded, "stores: a file read for another store's account is ignored");
+    model.ApplyUpdateCheck(Store::kGog, kGogAccount, gog_saved);
+    check(check_state.loaded && check_state.games.size() == 3 && check_state.games.count(SteamId(10)) &&
+              check_state.games.count(witcher) && !check_state.games.count(SteamId(20)),
+          "stores: GOG's file gives GOG's games only");
+    check(check_state.games.at(gwent) == (GameUpdate{true, false, 3 * gb, 3 * gb, 4, true}),
+          "stores: the early GOG answer is applied after GOG's file");
+    check(check_state.checked_at == kNow - 5 * 60 * 60, "stores: the oldest store's check is shown");
+    check(model.UpdateCheckDirty(Store::kGog) && !model.UpdateCheckDirty(), "stores: only GOG changed");
+
+    // Each store's export holds only its games: Steam's file never gets a gog- key.
+    const auto steam_export = model.ExportUpdateCheck();
+    const auto gog_export = model.ExportUpdateCheck(Store::kGog);
+    check(steam_export.checked_at == steam_saved.checked_at && steam_export.games.size() == 1 && steam_export.games.count(SteamId(10)),
+          "stores: Steam's export is Steam's");
+    check(gog_export.checked_at == gog_saved.checked_at && gog_export.games.size() == 2 && gog_export.games.count(witcher) &&
+              gog_export.games.count(gwent),
+          "stores: GOG's export is GOG's");
+    model.UpdateCheckSaveResult(Store::kGog, kGogAccount, model.UpdateCheckRevision(Store::kGog), playden::StorageError::kNone);
+    check(!model.UpdateCheckDirty(Store::kGog), "stores: GOG's saved");
+
+    // Manage Updates lists both stores' games; neither is due, so opening asks nothing.
+    open_updates(model);
+    check(!model.TakeUpdateCheckRequest() && !model.TakeUpdateCheckRequest(Store::kGog), "stores: neither store is due");
+    check(find_row(model, "manage-toggle-10") && find_row(model, "manage-toggle-" + playden::ToKey(witcher)) &&
+              find_row(model, "manage-toggle-" + playden::ToKey(gwent)) && !find_row(model, "manage-toggle-20") &&
+              !find_row(model, "manage-toggle-" + playden::ToKey(idle)),
+          "stores: Updates lists Steam's and GOG's games with an update");
+    check(model.view().subtitle == "Checked 5 h ago · only games with an update or new DLC", "stores: the oldest check is the list's");
+
+    // Check for updates asks both stores; progress adds up, and the copy names them.
+    activate(model, "manage-check");
+    check(model.TakeUpdateCheckRequest() && model.TakeUpdateCheckRequest(Store::kGog), "stores: both are asked");
+    check(check_state.checking && model.view().subtitle == "Checking Steam and GOG…", "stores: both are checked");
+    model.UpdateCheckProgress(3, 1, 3);
+    model.UpdateCheckProgress(Store::kGog, 6, 2, 6);
+    check(check_state.asked == 9 && check_state.answered == 3 && check_state.total == 9, "stores: progress sums");
+    check(model.view().subtitle == "Checking Steam and GOG · 3 of 9", "stores: the sums are shown");
+    model.FinishUpdateCheck(false);
+    check(check_state.checking && model.view().subtitle == "Checking GOG · 2 of 6", "stores: GOG still checks");
+    model.FinishUpdateCheck(Store::kGog, true);
+    check(!check_state.checking && check_state.failed && check_state.stores.at(Store::kSteam).checked_at == kNow &&
+              check_state.stores.at(Store::kGog).checked_at == gog_saved.checked_at,
+          "stores: Steam's check moves on, GOG's stays");
+    check(model.view().subtitle == "Couldn't check GOG · last checked 5 h ago", "stores: the list names the store that failed");
+    const auto failed_row = settings_row(model);
+    check(failed_row.value == "Couldn't check" && failed_row.subtitle == "GOG didn't answer · last checked 5 h ago",
+          "stores: Settings names the store that failed");
+
+    // Steam signs out: GOG's updates and its loaded state stay.
+    model.ResetUpdateCheck();
+    check(check_state.loaded && !check_state.stores.count(Store::kSteam) && check_state.games.size() == 2 &&
+              check_state.games.count(witcher) && check_state.games.count(gwent) && !check_state.games.count(SteamId(10)),
+          "stores: Steam's sign-out keeps GOG's updates");
+    check(model.UpdateCheckAccount(Store::kGog) == kGogAccount && model.ExportUpdateCheck(Store::kGog).games.size() == 2,
+          "stores: GOG's account stays");
+    open_updates(model);
+    check(find_row(model, "manage-toggle-" + playden::ToKey(witcher)) && !find_row(model, "manage-toggle-10"),
+          "stores: the list keeps GOG's games");
+
+    // GOG only, no Steam account: the list asks GOG, and only GOG's finish counts.
+    auto only = make_live(base / "gog-only");
+    setup(only, false);
+    only.BeginUpdateCheckLoad(Store::kGog, kGogAccount);
+    only.ApplyUpdateCheck(Store::kGog, kGogAccount, std::nullopt);
+    open_updates(only);
+    check(!only.TakeUpdateCheckRequest() && only.TakeUpdateCheckRequest(Store::kGog), "gog only: opening the list asks GOG");
+    check(only.view().subtitle == "Checking GOG…", "gog only: the list says GOG is checked");
+    only.FinishUpdateCheck(false);
+    check(only.state().update_check.checking, "gog only: a Steam finish is ignored");
+    only.UpdateAppDetails(witcher, 1, 1, true, {}, {}, {}, GameUpdate{true, false, 2 * gb});
+    only.FinishUpdateCheck(Store::kGog, false);
+    check(!only.state().update_check.checking && only.state().update_check.stores.at(Store::kGog).checked_at == kNow &&
+              only.state().update_check.checked_at == kNow && only.UpdateCheckDirty(Store::kGog),
+          "gog only: GOG's finish sets its time");
+    check(only.ExportUpdateCheck(Store::kGog).checked_at == kNow && only.ExportUpdateCheck(Store::kGog).games.count(witcher),
+          "gog only: GOG's export has the time and the game");
+    check(find_row(only, "manage-toggle-" + playden::ToKey(witcher)), "gog only: the game is listed");
+    only.UpdateAppDetails(witcher, 1, 1, true, {}, {}, {}, {});
+    activate(only, "manage-check");
+    check(only.TakeUpdateCheckRequest(Store::kGog), "gog only: the button asks GOG");
+    only.FinishUpdateCheck(Store::kGog, true);
+    const auto* empty = find_row(only, "manage-empty");
+    check(empty && empty->title == "Couldn't check" && empty->subtitle == "GOG didn't answer. Check for updates to try again.",
+          "gog only: the empty list names GOG");
+    check(only.view().subtitle.rfind("Couldn't check GOG · last checked", 0) == 0, "gog only: the subtitle names GOG");
+
+    // Not checked yet, with no clock: the copy names the stores; with only Steam it is as before.
+    auto steam_only = make_live(base / "steam-only");
+    steam_only.UpdateAccount({AuthState::SignedIn, std::to_string(kSteamAccount), "Owner", {}, {}, false});
+    check(steam_only.UpdateLibrary({{{SteamId(10), "Portal", "", "", ""}}, false, {}, false, true, kNow}),
+          "steam only: library delivered");
+    steam_only.UpdateInstalls({}, {{SteamId(10), 30 * gb, "internal"}});
+    steam_only.BeginUpdateCheckLoad(kSteamAccount);
+    steam_only.ApplyUpdateCheck(kSteamAccount, std::nullopt);
+    check(settings_row(steam_only).subtitle == "Steam is checked once a day when you open it", "steam only: Settings as before");
+    open_updates(steam_only);
+    const auto* never = find_row(steam_only, "manage-empty");
+    check(never && never->title == "Not checked" &&
+              never->subtitle == "Check for updates to ask Steam about your installed games." &&
+              steam_only.view().subtitle == "Not checked yet",
+          "steam only: the list as before");
+    auto unclocked = make_live(base / "unclocked");
+    setup(unclocked, true, false);
+    unclocked.BeginUpdateCheckLoad(kSteamAccount);
+    unclocked.ApplyUpdateCheck(kSteamAccount, std::nullopt);
+    unclocked.BeginUpdateCheckLoad(Store::kGog, kGogAccount);
+    unclocked.ApplyUpdateCheck(Store::kGog, kGogAccount, std::nullopt);
+    check(settings_row(unclocked).subtitle == "Steam and GOG are checked once a day when you open it",
+          "stores: Settings names both stores");
+    open_updates(unclocked);
+    const auto* both_never = find_row(unclocked, "manage-empty");
+    check(both_never && both_never->subtitle == "Check for updates to ask Steam and GOG about your installed games.",
+          "stores: the empty list names both stores");
+    // A store's finish when it isn't checking is ignored.
+    unclocked.FinishUpdateCheck(Store::kGog, true);
+    check(!unclocked.state().update_check.failed, "stores: a finish without a check is ignored");
+}
+
 // Manage installed games: L1/R1 switch between Updates and Uninstall, each tab keeps its own selection and
 // focus, Updates lists only installed Steam games with an update (all checked), and says how the check went.
 void live_manage_games_tabs(const std::filesystem::path& base) {
@@ -2739,7 +3317,7 @@ void live_manage_update_selected(const std::filesystem::path& base) {
           "update selected: Update anyway queues the games the drive may lack room for");
 }
 
-// Settings: Storage's Manage installed games counts the saved check's updates and opens on Uninstall; Updates'
+// Settings › Games: Manage installed games counts the saved check's updates and opens on Uninstall;
 // Game updates says how the check stands and opens on Updates. Both read the saved result without asking Steam.
 // The Runtimes tab: what is due, what it skips and why, and a batch that goes one game at a time and stops before
 // console storage runs too low.
@@ -3009,6 +3587,244 @@ void live_queue_cancel_preparations(const std::filesystem::path& base) {
                                      [](const auto& item) { return item.id == "runtime-batch"; });
     check(notice != model.state().notices.end() && notice->message == "Runtime kit updated" && notice->detail == "1 game",
           "the end counts only the game that was updated");
+}
+
+// Pause all in Queue › Preparation (#880): the game being prepared finishes ("Pausing after this game"), then the
+// section says Paused; waiting games keep their order and a game that joins waits too; Resume all stays reachable
+// with nothing waiting; a Runtimes batch sends no next game while paused; a quit doesn't wait for a paused queue.
+void live_queue_pause_preparations(const std::filesystem::path& base) {
+    using playden::GameId;
+    using playden::homebrew::LiveRuntimeGame;
+    using playden::homebrew::MaintenanceKind;
+    using playden::homebrew::Route;
+    using playden::homebrew::TitleActivity;
+    constexpr std::int64_t kNow = 1'800'000'000;
+    constexpr std::uint64_t gb = 1'000'000'000;
+    auto model = make_live(base);
+    model.SetWallClock(kNow);
+    model.UpdateAccount({AuthState::SignedIn, "76561198000000002", "Owner", {}, {}, false});
+    check(model.UpdateLibrary({{{SteamId(10), "Ten", "", "", ""}, {SteamId(20), "Twenty", "", "", ""}, {SteamId(30), "Thirty", "", "", ""},
+                                {SteamId(40), "Forty", "", "", ""}, {SteamId(50), "Fifty", "", "", ""}},
+                               false, {}, false, true, kNow}),
+          "pause: library delivered");
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb}}, "internal");
+    model.UpdateInstalls({}, {{SteamId(10), 4 * gb, "internal", true}, {SteamId(20), 3 * gb, "internal", true},
+                              {SteamId(30), 2 * gb, "internal", true}, {SteamId(40), 1 * gb, "internal", true},
+                              {SteamId(50), 1 * gb, "internal", true}});
+    const auto game = [](int id, const char* status) {
+        LiveRuntimeGame runtime;
+        runtime.game_id = SteamId(id);
+        runtime.status = status;
+        runtime.prepared = runtime.has_title = runtime.can_prepare = true;
+        runtime.activity = TitleActivity::Stopped;
+        return runtime;
+    };
+    // The Runtimes batch: 40 and 50 get the new runtime kit, one at a time.
+    auto forty = game(40, "Runtime kit update available");
+    auto fifty = game(50, "Runtime kit update available");
+    auto ten = game(10, "Preparing");
+    auto twenty = game(20, "Not prepared");
+    twenty.prepared = twenty.has_title = false;
+    twenty.queued = true;
+    auto thirty = twenty;
+    thirty.game_id = SteamId(30);
+    const auto all = [&] { return std::vector<LiveRuntimeGame>{ten, twenty, thirty, forty, fifty}; };
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, all());
+    model.UpdatePreparationQueue({SteamId(10), {SteamId(20)}, {}, {}});
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Downloads; ++i) model.action("r1");
+    check(model.state().navigation.route == Route::Downloads, "pause: R1 reaches the Queue");
+
+    activate(model, "prep-active-10");
+    check(find_row(model, "prep-pause-all") && find_row(model, "prep-pause-all")->title == "Pause all" &&
+              !find_row(model, "prep-resume-all"),
+          "pause: the game being prepared offers Pause all");
+    activate(model, "prep-pause-all");
+    check(model.state().preparation_paused, "pause: Pause all pauses the queue");
+    check(model.state().navigation.modals.empty(), "pause: the sheet closes");
+    const auto heading = [&] { const auto* row = find_row(model, "queue-preparation"); return row ? row->value : std::string(); };
+    check(heading().rfind("Pausing after this game", 0) == 0, "pause: the heading says it pauses after this game");
+    check(find_row(model, "prep-active-10") && find_row(model, "prep-active-10")->value == "Pausing after this game",
+          "pause: so does the card");
+    check(find_row(model, "prep-20") && find_row(model, "prep-20")->value == "Paused", "pause: a waiting game says Paused");
+    check(!find_row(model, "prep-paused"), "pause: no paused row while a game is still being prepared");
+    check(model.view().subtitle.find("Preparation pausing") != std::string::npos, "pause: the Queue's summary says so");
+
+    // 10 finishes; 30 finished downloading and joins the queue, after 20.
+    ten.status = "Ready";
+    ten.ready = true;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, all());
+    model.UpdatePreparationQueue({std::nullopt, {SteamId(20), SteamId(30)}, {}, {}});
+    check(heading().rfind("Paused", 0) == 0, "paused: the heading says Paused once the game is done");
+    const auto* paused_row = find_row(model, "prep-paused");
+    check(paused_row && paused_row->value == "Paused" && paused_row->subtitle == "The waiting games start when you resume",
+          "paused: a row says the preparation is paused");
+    check(find_row(model, "prep-30") && find_row(model, "prep-30")->value == "Paused", "paused: a game that joins waits too");
+    check((model.state().preparation_queue.waiting == std::vector<GameId>{SteamId(20), SteamId(30)}),
+          "paused: the waiting games keep their order");
+    activate(model, "prep-30");
+    check(find_row(model, "prep-resume-all") && find_row(model, "prep-resume-all")->title == "Resume all" &&
+              !find_row(model, "prep-pause-all"),
+          "paused: a waiting game offers Resume all");
+    model.action("circle");
+
+    // Prepare next on a paused queue says it starts on resume.
+    activate(model, "prep-30");
+    activate(model, "prep-next-30");
+    check((model.TakePrepareNextRequests() == std::vector<GameId>{SteamId(30)}), "paused: Prepare next still reorders");
+    {
+        const auto next = std::find_if(model.state().notices.begin(), model.state().notices.end(),
+                                       [](const auto& item) { return item.id == "prepare-next"; });
+        check(next != model.state().notices.end() && next->detail == "It starts first when you resume",
+              "paused: Prepare next says it starts on resume");
+    }
+    model.UpdatePreparationQueue({std::nullopt, {SteamId(30), SteamId(20)}, {}, {}});
+
+    // The game page of a waiting game says it is paused, and how to go on.
+    activate(model, "prep-20");
+    activate(model, "prep-open-20");
+    check(model.state().navigation.route == Route::Details, "paused: Game details opens the page");
+    check(find_row(model, "details-setup") && find_row(model, "details-setup")->value == "Paused",
+          "paused: the page's Setup says Paused");
+    check(find_row(model, "details-hint") &&
+              find_row(model, "details-hint")->title.find("Preparation is paused. Resume all in Queue sets it up.") != std::string::npos,
+          "paused: and says how to resume");
+    model.action("circle");
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Downloads; ++i) model.action("r1");
+
+    // Cancel all from the paused row: nothing waits, yet Resume all stays reachable.
+    activate(model, "prep-paused");
+    check(find_row(model, "prep-resume-all") && find_row(model, "prep-cancel-all"), "paused row: Resume all and Cancel all");
+    activate(model, "prep-cancel-all");
+    check((model.TakePrepareCancels() == std::vector<GameId>{SteamId(30), SteamId(20)}), "paused row: Cancel all withdraws both");
+    model.UpdatePreparationQueue({std::nullopt, {}, {}, {}});
+    paused_row = find_row(model, "prep-paused");
+    check(paused_row && paused_row->subtitle == "Games that finish downloading wait here until you resume",
+          "paused: with nothing waiting the row stays, to resume from");
+    check(model.state().preparation_paused, "paused: emptying the queue keeps the pause");
+
+    // A Runtimes batch started while paused sends nothing; its games wait in the queue.
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
+    activate(model, "settings-installed");
+    while (model.state().navigation.manage_tab != playden::homebrew::ManageTab::Runtimes) check(model.action("r1"), "batch: tabs go round");
+    (void)model.TakeMaintenanceRequests();
+    check(model.action("triangle"), "batch: the Runtimes batch starts");
+    check(model.TakeMaintenanceRequests().empty(), "batch: a paused queue sends no game");
+    check((model.state().preparation_queue.waiting == std::vector<GameId>{SteamId(50), SteamId(40)}), "batch: both wait in the queue");
+
+    // Resume all from the paused row: the batch starts.
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Downloads; ++i) model.action("r1");
+    activate(model, "prep-paused");
+    activate(model, "prep-resume-all");
+    check(!model.state().preparation_paused, "resume: Resume all ends the pause");
+    check(!find_row(model, "prep-paused"), "resume: the paused row goes");
+    auto sent = model.TakeMaintenanceRequests();
+    check(sent.size() == 1 && sent[0].first == SteamId(50), "resume: the batch sends its first game");
+    check(find_row(model, "prep-40") && find_row(model, "prep-40")->value != "Paused", "resume: waiting games no longer say Paused");
+    fifty.status = "Preparing";
+    fifty.maintenance = MaintenanceKind::UpdateRuntime;
+    fifty.maintenance_running = true;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, all());
+    model.UpdatePreparationQueue({SteamId(50), {}, {}, {}});
+
+    // Paused while 50 runs: 50 finishes, and the batch sends no next game until Resume all.
+    activate(model, "prep-active-50");
+    activate(model, "prep-pause-all");
+    fifty.status = "Ready";
+    fifty.ready = true;
+    fifty.maintenance_running = false;
+    fifty.maintenance_ok = true;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, all());
+    model.UpdatePreparationQueue({std::nullopt, {}, {}, {}});
+    check(model.TakeMaintenanceRequests().empty(), "batch: a paused queue sends no next game");
+    check((model.state().preparation_queue.waiting == std::vector<GameId>{SteamId(40)}), "batch: 40 waits in the queue");
+    {
+        const auto notice = std::find_if(model.state().notices.begin(), model.state().notices.end(),
+                                         [](const auto& item) { return item.id == "runtime-batch"; });
+        check(notice != model.state().notices.end() && notice->message == "Runtime kit update paused" &&
+                  notice->detail == "1 of 2 games · Resume all in Queue continues",
+              "batch: its notice says it is paused and counts the game done");
+    }
+    activate(model, "prep-paused");
+    activate(model, "prep-resume-all");
+    sent = model.TakeMaintenanceRequests();
+    check(sent.size() == 1 && sent[0].first == SteamId(40), "resume: the batch sends its next game");
+
+    // Paused with a game waiting and none being prepared, a quit to Home doesn't wait for the queue.
+    model.UpdatePreparationQueue({std::nullopt, {SteamId(20)}, {}, {}});
+    activate(model, "prep-20");
+    activate(model, "prep-pause-all");
+    model.RequestQuit();
+    check(model.state().quit_requested && !model.state().quit_waiting, "quit: a paused queue lets Playden quit at once");
+}
+
+// A GOG game that finishes installing while Preparation is paused (#880) waits like a Steam game, with only GOG signed
+// in: its row and its game page say Paused and how to go on, and Resume all lets it start.
+void live_queue_pause_gog_preparation(const std::filesystem::path& base) {
+    using playden::GameId;
+    using playden::Store;
+    using playden::homebrew::LiveRuntimeGame;
+    using playden::homebrew::TitleActivity;
+    constexpr std::int64_t kNow = 1'800'000'000;
+    constexpr std::uint64_t gb = 1'000'000'000;
+    const auto witcher = GameId::Gog(1207658924), gwent = GameId::Gog(1207658925);
+    const auto witcher_key = playden::ToKey(witcher), gwent_key = playden::ToKey(gwent);
+    auto model = make_live(base);
+    model.SetWallClock(kNow);
+    model.SetGogStoreEnabled(true);
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb}}, "internal");
+    AccountUpdate gog;
+    gog.store = Store::kGog;
+    gog.authentication = AuthState::SignedIn;
+    gog.id = "8000000000000abc";
+    gog.display_name = "Synthetic GOG";
+    model.UpdateAccount(gog);
+    playden::homebrew::LibraryUpdate library;
+    library.games = {playden::GameSummary{witcher, "Witcher", {}, {}, {}}, playden::GameSummary{gwent, "Gwent", {}, {}, {}}};
+    library.source = Store::kGog;
+    library.retrieved_at = kNow;
+    check(model.UpdateLibrary(library), "gog pause: GOG's library delivered");
+    model.UpdateInstalls({}, {{witcher, 10 * gb, "internal"}, {gwent, 2 * gb, "internal"}});
+    const auto waiting = [](GameId id) {
+        LiveRuntimeGame runtime;
+        runtime.game_id = id;
+        runtime.status = "Not prepared";
+        runtime.can_prepare = runtime.queued = true;
+        runtime.activity = TitleActivity::Stopped;
+        return runtime;
+    };
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {waiting(witcher), waiting(gwent)});
+    model.UpdatePreparationQueue({std::nullopt, {witcher}, {}, {}});
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Downloads; ++i) model.action("r1");
+    check(model.state().navigation.route == Route::Downloads, "gog pause: R1 reaches the Queue");
+
+    activate(model, "prep-" + witcher_key);
+    activate(model, "prep-pause-all");
+    check(model.state().preparation_paused, "gog pause: Pause all from a GOG game pauses the queue");
+    // Gwent finishes installing and joins the queue behind Witcher; both wait.
+    model.UpdatePreparationQueue({std::nullopt, {witcher, gwent}, {}, {}});
+    check(find_row(model, "prep-paused") && find_row(model, "prep-paused")->subtitle == "The waiting games start when you resume",
+          "gog pause: the paused row shows");
+    check(find_row(model, "prep-" + witcher_key) && find_row(model, "prep-" + witcher_key)->value == "Paused" &&
+              find_row(model, "prep-" + gwent_key) && find_row(model, "prep-" + gwent_key)->value == "Paused",
+          "gog pause: both GOG games say Paused");
+
+    activate(model, "prep-" + gwent_key);
+    activate(model, "prep-open-" + gwent_key);
+    check(model.state().navigation.route == Route::Details, "gog pause: Game details opens the GOG game's page");
+    check(find_row(model, "details-setup") && find_row(model, "details-setup")->value == "Paused",
+          "gog pause: the page's Setup says Paused");
+    check(find_row(model, "details-hint") &&
+              find_row(model, "details-hint")->title.find("Preparation is paused. Resume all in Queue sets it up.") != std::string::npos,
+          "gog pause: and says how to resume");
+    model.action("circle");
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Downloads; ++i) model.action("r1");
+
+    activate(model, "prep-paused");
+    activate(model, "prep-resume-all");
+    check(!model.state().preparation_paused, "gog resume: Resume all ends the pause");
+    check(!find_row(model, "prep-paused") && find_row(model, "prep-" + witcher_key) &&
+              find_row(model, "prep-" + witcher_key)->value == "Up next",
+          "gog resume: the first GOG game is up next");
 }
 
 // The runtime kit prompt: once per kit, only when a kit update is due, and never over What's new or another dialog.
@@ -3425,12 +4241,11 @@ void live_manage_move(const std::filesystem::path& base) {
     check(navigation.route == Route::Downloads && notice != model.state().notices.end() && notice->message == "2 moves queued",
           "move: the screen closes on the Queue, with a notice");
 
-    // The game page: Maintenance has Move to…, for installed Steam games only, and it queues the same move.
+    // The game page: Game actions has Move to…, for installed Steam games only, and it queues the same move.
     check(model.action("details:20"), "move: game page");
     activate(model, "details-more");
-    activate(model, "game-maintenance");
     const auto* entry = find_row(model, "game-move");
-    check(entry && entry->enabled && entry->value == "Console storage", "move: Maintenance offers Move to…");
+    check(entry && entry->enabled && entry->value == "Console storage", "move: Game actions offers Move to…");
     activate(model, "game-move");
     check(model.view().surface == "move-storage" && !find_row(model, "volume-internal")->enabled &&
               find_row(model, "volume-internal")->subtitle == "The game is here" && navigation.focus_key == "volume-usb",
@@ -3440,16 +4255,24 @@ void live_manage_move(const std::filesystem::path& base) {
     check(one.size() == 1 && one[0].kind == InstallRequestKind::Move && one[0].game_id == SteamId(20) && one[0].volume_id == "usb" &&
               navigation.modals.empty() && navigation.route == Route::Details,
           "move: choosing a drive queues the game's move and returns to its page");
+    // Last known stopped: the row still waits for the console's answer, which says it runs now.
+    auto stopped = playing;
+    stopped.activity = playden::homebrew::TitleActivity::Stopped;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {stopped});
     check(model.action("details:40"), "move: running game page");
+    model.TakeActivityRequests();
     activate(model, "details-more");
-    activate(model, "game-maintenance");
-    check(!find_row(model, "game-move")->enabled, "move: Maintenance waits to hear whether the game runs");
+    check(model.TakeActivityRequests() == std::vector<playden::GameId>{SteamId(40)},
+          "move: Game actions asks whether the game runs");
+    check(!find_row(model, "game-move")->enabled && find_row(model, "game-move")->value == "Checking…",
+          "move: Game actions waits to hear whether the game runs");
     model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {playing});
     check(find_row(model, "game-move") && !find_row(model, "game-move")->enabled &&
-              find_row(model, "game-move")->subtitle == "Quit Celeste to move it.",
-          "move: a running game can't move from Maintenance");
+              find_row(model, "game-move")->subtitle == "Quit Celeste to move it." &&
+              find_row(model, "game-move")->value == "Quit the game first",
+          "move: a running game can't move from Game actions, and the row says why");
     activate(model, "game-move");
-    check(model.view().surface == "game-maintenance" && model.TakeInstallRequests().empty(), "move: the disabled row does nothing");
+    check(model.view().surface == "context" && model.TakeInstallRequests().empty(), "move: the disabled row does nothing");
 }
 
 // The Queue holds 64 jobs: a batch of updates or moves that doesn't fit is not queued, the games stay
@@ -3516,6 +4339,7 @@ void live_manage_queue_full(const std::filesystem::path& base) {
 
 int main() {
     live_root_access_missing();
+    live_startup_waits_before_the_welcome();
     live_download_telemetry();
     const auto base = std::filesystem::canonical(std::filesystem::temp_directory_path())
         / ("playden-homebrew-live-model-test-" + std::to_string(getpid()));
@@ -3525,6 +4349,8 @@ int main() {
     settings_survive_account_restore_and_cache_action_is_honest(base);
     live_settings_follow_the_prepared_title(base);
     live_120hz_waits_for_the_title_update(base / "display");
+    live_vac_warns_on_online(base / "vac");
+    live_friends_join_and_invite(base / "friends");
     live_refresh_rate_keeps_off_over_a_preset_cap(base / "capped");
     live_update_runtime_from_maintenance(base / "update-runtime");
     live_saved_settings_stay_ahead_of_the_title(base / "behind");
@@ -3545,10 +4371,13 @@ int main() {
     live_self_update(base);
     live_kit_install(base / "kit");
     live_update_check(base / "update-check");
+    live_update_check_stores(base / "update-check-stores");
     live_manage_games_tabs(base / "manage-games");
     live_manage_update_selected(base / "update-selected");
     live_manage_runtimes(base / "manage-runtimes");
     live_queue_cancel_preparations(base / "queue-cancel-preparations");
+    live_queue_pause_preparations(base / "queue-pause-preparations");
+    live_queue_pause_gog_preparation(base / "queue-pause-gog-preparation");
     live_runtime_prompt(base / "runtime-prompt");
     live_runtime_prompt_survives_library(base / "runtime-prompt");
     live_manage_move(base / "manage-move");

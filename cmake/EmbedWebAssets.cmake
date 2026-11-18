@@ -18,7 +18,16 @@ foreach(asset IN LISTS ASSETS)
         message(FATAL_ERROR "Unknown web asset kind: ${kind}")
     endif()
     list(GET parts 2 source)
-    file(READ "${source}" hex HEX)
+    # CONSOLE names the machine the page is served from. The page is plain HTML with no templating,
+    # so a PS4 build served 28 hardcoded "PS5" strings, starting with the "Playden on PS5" heading.
+    # Every one of them is prose a player reads; none is an identifier or a URL.
+    if(kind STREQUAL "html" AND DEFINED CONSOLE AND NOT "${CONSOLE}" STREQUAL "" AND NOT "${CONSOLE}" STREQUAL "PS5")
+        file(READ "${source}" page)
+        string(REPLACE "PS5" "${CONSOLE}" page "${page}")
+        string(HEX "${page}" hex)
+    else()
+        file(READ "${source}" hex HEX)
+    endif()
     string(LENGTH "${hex}" hex_length)
     math(EXPR size "${hex_length} / 2")
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
