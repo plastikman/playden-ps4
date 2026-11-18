@@ -4,6 +4,8 @@
 #if PLAYDEN_PLATFORM_PS5
 #include <sys/mount.h>
 extern "C" int sceKernelDlsym(int, const char*, void**);
+#elif PLAYDEN_PLATFORM_PS4
+extern "C" int sceKernelDlsym(int, const char*, void**);
 #else
 #include <sys/statvfs.h>
 #endif
@@ -14,6 +16,7 @@ extern "C" int sceKernelDlsym(int, const char*, void**);
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <vector>
 #include <unistd.h>
 
 namespace playden::steam {
@@ -29,6 +32,7 @@ std::string ExternalRoot(const std::string& path) {
   }
   return {};
 }
+#endif
 
 // Collapse redundant separators/dots, but reject parent traversal so an external path
 // cannot escape its required root (including through a symlink before the '..').
@@ -48,7 +52,6 @@ std::string QueryPath(const std::string& path) {
   }
   return result.empty() ? "." : result;
 }
-#endif
 
 bool IsDirectory(const std::string& path) {
   struct stat info {};
@@ -101,6 +104,32 @@ bool CanWrite(const std::string& directory) {
   return written && closed;
 }
 
+#if PLAYDEN_PLATFORM_PS4
+// The SDK's fstatvfs never fills its caller's struct here: it calls libkernel's _fstatfs into a
+// buffer in its own frame and returns only 0 or -1, so a "successful" call left Playden reading
+// uninitialised stack -- which is why this reported nothing and the card read N/A. Orbis-Win's
+// ntdll hit the same wall and answers it the same way (archive patch 1086): call _fstatfs into a
+// FreeBSD struct of our own and read only its leading fields, the same in FreeBSD 9 and 12.
+// A title may still get EPERM from _fstatfs, and then there is no free space to report: this
+// says so rather than inventing a figure, and the card goes back to N/A.
+using Fstatfs = int (*)(int, void*);
+constexpr std::size_t kStatfsBytes = 0x928;  // FreeBSD 12's struct statfs
+constexpr std::size_t kStatfsVersion = 0, kStatfsBsize = 16, kStatfsBlocks = 32, kStatfsBavail = 48;
+template <typename T> T StatfsField(const unsigned char* buffer, std::size_t at) {
+  T value{};
+  std::memcpy(&value, buffer + at, sizeof(value));
+  return value;
+}
+Fstatfs ResolvedFstatfs() {
+  static const Fstatfs query = [] {
+    void* symbol = nullptr;
+    if (sceKernelDlsym(0x2001, "_fstatfs", &symbol) != 0) return Fstatfs{};
+    return reinterpret_cast<Fstatfs>(symbol);
+  }();
+  return query;
+}
+#endif
+
 #if PLAYDEN_PLATFORM_PS5
 using Fstatfs = int (*)(int, struct statfs*);
 // The ordinary statfs/fstatfs imports are absent in an app process (they live in libkernel_sys).
@@ -119,10 +148,9 @@ Fstatfs ResolvedFstatfs() {
 
 bool VolumeSpaceSupported() {
 #if PLAYDEN_PLATFORM_PS4
-  // PS4's app-process fstatvfs path reports zero available blocks even when the volume has
-  // substantial free space. Until a working native volume query is available, let writes be
-  // authoritative; the installer handles ENOSPC and retains its download journal.
-  return false;
+  // Whether the console lets this title ask at all. When _fstatfs is missing or refuses, writes
+  // stay authoritative: the installer handles ENOSPC and retains its download journal.
+  return ResolvedFstatfs() != nullptr;
 #elif PLAYDEN_PLATFORM_PS5
   return ResolvedFstatfs() != nullptr;
 #else
@@ -196,9 +224,34 @@ std::vector<VolumeCandidate> ConsoleVolumeCandidates(const std::string& title_ro
 
 std::optional<VolumeSpace> QueryVolumeSpace(const std::string& path, std::uint64_t console_reserve) {
 #if PLAYDEN_PLATFORM_PS4
-  (void)path;
-  (void)console_reserve;
-  return std::nullopt;
+  const auto query = ResolvedFstatfs();
+  if (!query) return std::nullopt;
+  std::string directory = QueryPath(path);
+  if (directory.empty()) return std::nullopt;
+  int fd = -1;
+  while ((fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY)) < 0) {
+    if (errno != ENOENT) return std::nullopt;
+    const auto slash = directory.rfind('/');
+    if (slash == std::string::npos || slash == 0) return std::nullopt;
+    directory.resize(slash);
+  }
+  // Zeroed, so a short write by the kernel reads as no blocks rather than as stack.
+  std::vector<unsigned char> buffer(kStatfsBytes, 0);
+  const bool ok = query(fd, buffer.data()) == 0;
+  close(fd);
+  if (!ok) return std::nullopt;  // EPERM for a title on some firmware: the card stays N/A
+  const auto bsize = StatfsField<std::uint64_t>(buffer.data(), kStatfsBsize);
+  const auto blocks = StatfsField<std::uint64_t>(buffer.data(), kStatfsBlocks);
+  const auto bavail = StatfsField<std::int64_t>(buffer.data(), kStatfsBavail);
+  // Refuse a reading that cannot be a volume rather than show the player a wrong number: a block
+  // size outside 512 B..1 MiB or not a power of two, no blocks at all, or more free than exists.
+  if (bsize < 512 || bsize > (1u << 20) || (bsize & (bsize - 1)) != 0 || blocks == 0 ||
+      bsize > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+      (bavail > 0 && static_cast<std::uint64_t>(bavail) > blocks))
+    return std::nullopt;
+  const auto space = detail::VolumeSpaceFromBlocks(static_cast<std::int64_t>(bsize), blocks, bavail);
+  // One volume here, and it is the console's: keep the system's share back as the PS5 path does.
+  return space ? std::optional<VolumeSpace>(detail::WithoutConsoleReserve(*space, console_reserve)) : space;
 #else
   std::string directory = QueryPath(path);
   if (directory.empty()) return std::nullopt;

@@ -289,6 +289,39 @@ void probe_bottle_chain()
     }
 }
 
+// The web page's Playden and Package cards read these two files from the title's data root
+// (src/web/logs_source.cpp Facts). Nothing on the PS4 wrote them, so both cards stayed empty.
+// Written at every start so they follow the package actually running.
+void write_web_status_files(const std::filesystem::path &data)
+{
+    const auto put = [&data](const char *name, const std::string &text) {
+        if (text.empty()) return;
+        const auto path = (data / name).string();
+        FILE *file = std::fopen(path.c_str(), "w");
+        if (!file) return;
+        std::fwrite(text.data(), 1, text.size(), file);
+        std::fputc('\n', file);
+        std::fclose(file);
+    };
+    put("playden-version", PLAYDEN_VERSION);
+    // The package's own version, as the build wrote it into the bundled runtime manifest
+    // (scripts/build-ps4-runtime.sh): "version=03.36" -> "PLDN10001 03.36". Facts shows the last
+    // word, shortened to 12 characters.
+    std::string identity;
+    if (FILE *manifest = std::fopen("/app0/runtime-manifest.txt", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), manifest))
+            if (std::strncmp(line, "version=", 8) == 0) {
+                std::string value(line + 8);
+                while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) value.pop_back();
+                if (!value.empty()) identity = "PLDN10001 " + value;
+                break;
+            }
+        std::fclose(manifest);
+    }
+    put("playden-package.identity", identity);
+}
+
 void probe_directory_identity()
 {
     const uid_t uid = ::geteuid();
@@ -421,6 +454,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     simulation.SetGameTestReportsEnabled(!s.features.game_test_reports_api.empty());
     playden::runtime::SetOnlineSteamEnabled(s.features.online_steam);
 
+    write_web_status_files(data);
     probe_directory_identity();
     probe_listing_methods();
     probe_durable_root();
@@ -909,6 +943,10 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         web_config.paths = playden::web::LogsPaths{log_directory, playden::runtime::kManagedTitleRoot,
                                                    "/data/playden/kits",
                                                    playden::runtime::kManagedTitleRoot};
+        // The PS4 kit is bundled in the package, not installed under /data/playden/kits, so the
+        // Runtime kit card had nothing to read. The kit view carries the same fields a kit
+        // manifest does (scripts/ps4-kit-view.py): runtime.artifact_revision and capabilities.
+        web_config.paths.kit_manifest = playden::ps4::kKitView;
         web_config.server.log = [log_directory](const std::string &line) {
             playden::app::AppendLogLine(log_directory, "web.log", line);
         };

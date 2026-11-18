@@ -20,6 +20,10 @@ struct LogsPaths {
   std::string homebrew;  // /data/homebrew: <title>/sce_sys/param.json
   std::string kits;      // /data/playden/kits
   std::string app;       // /data/homebrew/FAKE77031: playden-version, playden-package.identity
+  // One bundled kit instead of a folder of them: read this manifest directly and do not scan
+  // `kits`. The PS4 ships its kit inside the package (/app0) and describes it in the kit view,
+  // which carries the same runtime.artifact_revision and capabilities a kit manifest does.
+  std::string kit_manifest;
 };
 
 // One signed-in store account, replaced in everything served. Not a credential.

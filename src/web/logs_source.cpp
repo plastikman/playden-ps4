@@ -541,8 +541,9 @@ std::vector<std::pair<std::string, std::string>> LogsSource::Facts(std::int64_t 
   // The current kit folder first: a console updated from an earlier Playden may still hold the kit under the
   // id it had before, until Playden retires it. Other folders are listed.
   std::vector<std::string> kits;
-  for (const auto& entry : ListDirectory(paths_.kits))
-    if (entry.directory && entry.name[0] != '.') kits.push_back(entry.name);
+  if (paths_.kit_manifest.empty())
+    for (const auto& entry : ListDirectory(paths_.kits))
+      if (entry.directory && entry.name[0] != '.') kits.push_back(entry.name);
   std::sort(kits.begin(), kits.end(), [](const std::string& a, const std::string& b) {
     if ((a == kKitId) != (b == kKitId)) return a == kKitId;
     return a < b;
@@ -550,7 +551,28 @@ std::vector<std::pair<std::string, std::string>> LogsSource::Facts(std::int64_t 
   std::string others;
   for (std::size_t i = 1; i < kits.size(); ++i) others += (i > 1 ? ", " : "") + kits[i];
   bool found = false;
+  if (!paths_.kit_manifest.empty()) {
+    constexpr std::size_t kManifestBytes = 8 * 1024 * 1024, kManifestValues = 32768 * 8;
+    const auto slash = paths_.kit_manifest.find_last_of('/');
+    const auto folder = slash == std::string::npos ? std::string() : paths_.kit_manifest.substr(0, slash);
+    const auto name = slash == std::string::npos ? paths_.kit_manifest : paths_.kit_manifest.substr(slash + 1);
+    const auto text = ReadFile(folder, name, kManifestBytes);
+    const auto manifest = text ? json::Parse(*text, {kManifestBytes, 16, kManifestValues, 1024 * 1024}) : std::nullopt;
+    if (manifest && manifest->is_object()) {
+      std::string runtime, capabilities;
+      if (const auto* section = manifest->Find("runtime"); section && section->is_object())
+        if (const auto* revision = section->Find("artifact_revision"); revision && revision->is_string())
+          runtime = revision->text();
+      if (const auto* list = manifest->Find("capabilities"); list && list->is_array())
+        for (const auto& capability : list->array())
+          if (capability.is_string()) capabilities += (capabilities.empty() ? "" : ", ") + capability.text();
+      facts.emplace_back("kit runtime", Utf8Clean(runtime));
+      facts.emplace_back("kit capabilities", Utf8Clean(capabilities));
+      found = true;
+    }
+  }
   for (const auto& kit : kits) {
+    if (found) break;
     // A kit's manifest lists every file of the kit (about a megabyte and 20,000 values): the runtime's own limits.
     constexpr std::size_t kManifestBytes = 8 * 1024 * 1024, kManifestValues = 32768 * 8;
     const auto text = ReadFile(paths_.kits + "/" + kit, "manifest.json", kManifestBytes);
