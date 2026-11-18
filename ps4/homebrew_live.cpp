@@ -689,7 +689,20 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     s.stores->Add(std::make_unique<playden::stores::SteamLibrarySource>(*s.library_service));
     s.stores->Add(std::make_unique<playden::stores::SteamDetailsSource>(*s.app_details));
     playden::stores::local::LocalLibraryConfig import_config;
-    import_config.volumes = {{playden::steam::InstallService::kPrimaryVolumeId, "/data", "playden-import", false}};
+    // The drop folder AND the external drives. ConsoleImportVolumes() returns both from
+    // ImportRoots() (scanner.cpp): /data/playden-import, then <mount>/playden/import for
+    // /mnt/ext0, /mnt/ext1 and /mnt/usb0..7, each marked require_mount_point so an empty
+    // /mnt/usb* -- which the console keeps whether or not a drive is attached -- is skipped.
+    // Only the drop folder was listed before, so a USB drive was invisible to the importer and
+    // every game had to be copied onto internal storage over FTP first.
+    //
+    // Importing COPIES into /data/PLDN10001/games (move_into_playden routes to Enqueue above),
+    // so a game taken from a drive lands owned by Playden on console storage and starts. Playing
+    // in place from the drive is a separate matter: a USB filesystem records no file owners
+    // (/mnt/usb0 reads uid -1), and runtime_host.cpp refuses a game root whose owners it cannot
+    // read unless the kit declares game-root-unowned -- which is kit-wide and must not be
+    // declared lightly (see scripts/ps4-kit-view.py).
+    import_config.volumes = playden::stores::local::ConsoleImportVolumes();
     import_config.log = [log_directory](const std::string &line) {
         playden::app::AppendLogLine(log_directory, "install.log", line);
     };
