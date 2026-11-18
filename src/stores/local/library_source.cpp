@@ -26,6 +26,14 @@ bool IsFolder(const std::string& path) {
   return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
 }
 
+// The mode and owner the mount test reads, for the log: "40777/4294967295" or "-" when unreadable.
+std::string ModeText(const std::string& path) {
+  struct stat info {};
+  if (lstat(path.c_str(), &info) != 0) return "-";
+  return std::to_string(static_cast<unsigned long>(info.st_mode)) + "/" +
+         std::to_string(static_cast<unsigned long>(info.st_uid));
+}
+
 // The same rule the install volumes use: a drive's folder counts only while a file system other
 // than its parent's is mounted there.
 bool IsMountPoint(const std::string& path) {
@@ -35,7 +43,20 @@ bool IsMountPoint(const std::string& path) {
   const auto parent_path = slash == 0 ? std::string("/") : path.substr(0, slash);
   if (lstat(path.c_str(), &mount) != 0 || !S_ISDIR(mount.st_mode) || stat(parent_path.c_str(), &parent) != 0)
     return false;
-  return mount.st_dev != parent.st_dev;
+  if (mount.st_dev != parent.st_dev) return true;
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+  // PS4: st_dev does not tell the mounts apart. An attached exFAT drive reports the same device as
+  // /mnt itself, so the rule above answered "no drive" for a drive that was plainly there and the
+  // importer skipped it without a word -- measured on /mnt/usb0 with a game on it, 2026-11-18.
+  // What does differ is the mode and the owner: the console keeps an empty /mnt/usb<n> at
+  // dr-xr-xr-x owned by root for every slot, and a mounted exFAT volume reads drwxrwxrwx with no
+  // owner at all (uid -1, the filesystem records none). So: writable by its group and others, and
+  // owned by nobody. An empty slot fails both, and a real console folder fails the second.
+  return (mount.st_mode & (S_IWGRP | S_IWOTH)) == (S_IWGRP | S_IWOTH) &&
+         mount.st_uid == static_cast<uid_t>(-1);
+#else
+  return false;
+#endif
 }
 
 const char* ProgramWords(ProgramCheck check) {
@@ -544,7 +565,8 @@ bool LocalLibrarySource::CheckPresence() {
     // against its parent's, so a console that does not report them apart answers no here.
     if (!volume.require_mount_point) continue;  // the drop folder is always there; do not repeat it
     Log("import volume " + volume.volume + " mount=" + volume.mount + " present=" + (here ? "1" : "0") +
-        " by=mount-point");
+        " by=" + (volume.require_mount_point ? "mount-point" : "folder") +
+        " mode=" + ModeText(HostPath(volume.mount)));
   }
   if (present == present_) return false;
   std::string line = "import volumes present=";
