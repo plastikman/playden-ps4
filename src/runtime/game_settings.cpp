@@ -269,7 +269,7 @@ std::vector<SettingDefinition> BuildCatalogue() {
   // Compatibility › Graphics.
   // "OpenGL worker thread" ([display] opengl_thread) was the PS5 OpenGL SDK's; Zink has none, so the row is gone.
   // Saved values for it are dropped when the record loads (RecordFromValue).
-  list.push_back(Choice("graphics", "Graphics", "How Direct3D is drawn on the " PLAYDEN_CONSOLE_NAME " GPU.", "[application] graphics",
+  list.push_back(Choice("graphics", "Graphics", "How Direct3D is drawn on the " PLAYDEN_CONSOLE_NAME " GPU.", "Direct3D renderer",
                         G::kGraphics,
                         {{"auto", "Automatic", ""}, {"gdi", "GDI", "2D only."}, {"dxvk", "DXVK", "Direct3D 9-11 on Vulkan."},
                          {"opengl", "OpenGL", ""}},
@@ -1166,7 +1166,9 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
   // Pointer stick Touchpad needs a runtime with the touchpad pointer (kit input-touchpad).
   for (const char* id : {"frame_limit", "pointer_stick", "movement_stick"}) {
     auto& value = out.values[id];
-    const auto& fallback = FindSetting(id)->playden_default;
+    // Controller presets carry movement_stick, but it deliberately has no catalogue row.
+    const auto* definition = FindSetting(id);
+    const std::string fallback = definition ? definition->playden_default : "none";
     if (!value.available) {
       if (value.after_update.empty()) continue;
       if (auto reason = SettingChoiceUnavailable(out, id, value.after_update); !reason.empty()) {
