@@ -1445,3 +1445,149 @@ logs the requested audio volume. Keep the test isolated to this one setting.
   action is to expand `~/junk`. Avoid another package or full-log copy until
   that space is available. The test run is complete and Playden is back at its
   launcher.
+
+## Workspace recovery and source control — 2026-11-19 05:00-05:20 AKST
+
+This section closes the two items the previous section left open: the disk, and
+the fact that most of this work existed only in scratch directories.
+
+### Disk: resolved, about 83 GiB reclaimed
+
+Both volumes were at 100%. `~/junk` had 187 MB free and `/` had 767 MB, which
+is why the previous section warned against another package or full-log copy.
+Note the device names reorder across reboots (`/dev/sda1` and `/dev/sdb` have
+swapped roles); go by mount point, not device.
+
+| mount | before | after |
+| --- | --- | --- |
+| `/` | 767 MB free (100%) | 62 GB free (47%) |
+| `~/junk` | 187 MB free (100%) | 22 GB free (82%) |
+| `/tmp` (tmpfs) | 169 MB free | 2.0 GB (cleared by the reboot) |
+
+Three manifests record exactly what was removed, with sizes, timestamps and
+the contents of each tree, so anything can be identified or rebuilt:
+
+- `/home/zpeirce/junk/codex_scratch/disk-cleanup-2026-11-19.tsv` — 25.7 GiB of
+  superseded build trees: `splinter-cell-conviction-issue8`,
+  `playden-fresh-install-20261114`, `playden-0286`, `playden-0287-source`,
+  `playden-runtime-build-0287`, `ps4-hl2-20261113`, `candidate-0170`,
+  `playden-test-20261111-postreboot`, plus the 01.27 (2.6 GB) and 01.28
+  (1.3 GB) package trees, both superseded by the installed 01.30.
+- `/home/zpeirce/junk/codex_scratch/prospero-library-removed-2026-11-19.tsv` —
+  about 36 GiB: the eight host Wine prefixes under
+  `prospero-library/prefixes/`. Inspected first and found to contain no cache,
+  log or dump waste at all, so there was nothing to clean short of removing
+  whole titles. Those bottles exist on the PS4, so the host copies were
+  redundant. `profiles/` (13 `.profile` files), `input/`, `.cache` and `.pw`
+  were retained; `prospero-library` is now 21 MB.
+- `/home/zpeirce/junk/codex_scratch/host-installers-removed-2026-11-19.tsv` —
+  `VampireBloodlinesGOG` (6.5 GB), `HL-install` (1.0 GB) and `~/.wine`
+  (14.8 GB), the last being a default prefix with no project reference.
+
+Deliberately kept: `runtime-kit-parity-build-20261118` and
+`continuation-20261119` (this work's build stages and evidence),
+`splinter-async-origin-20261118` (another session's active tree),
+`wine-host-driver-thread-overlay-20261118` (the patch 1076 overlay, still the
+open `wine-driver-threads` question), the three 49 MB `PLDN10001-network-*.log`
+snapshots (the only local copy of the publication-refusal diagnostic), and
+`orbis-fromsource/prospero-win{,-abi4}`.
+
+Worth recording: `~/.wine/drive_c/GOG Games` held **Titan Quest - Anniversary
+Edition**, not Bloodlines as the sibling directory name suggested. Titan Quest
+has an open regression on the from-source build (null-`this` virtual call); its
+evidence is already pinned in the repo and its bottle is on the console, but a
+host-side control run would now need a reinstall from GOG.
+
+Left untouched, available if more space is ever needed:
+`abi4-upstream-port-20261104` (7.7 GB, 8 repo references, superseded by
+`orbis-fromsource/prospero-win-abi4`), `playden-upstream` (1.5 GB),
+`orbis-hk-0259` (1.5 GB), `splinter-offline-20261117` (3.0 GB).
+
+### Package size: the 1.5 GB is accounted for
+
+The installer grew by **411 MiB in 101 minutes** on 2026-11-18, which is
+Phase 5 and Phase 7 staging and not a leak:
+
+| package | bytes | built |
+| --- | --- | --- |
+| `-0354` (pre-mono) | 1,096,613,888 | 11-18 15:06 |
+| `playden-mono-vkd3d` | 1,527,447,552 | 11-18 16:47 |
+| `playden-profile-parity-0126` | 1,547,501,568 | 11-18 19:32 |
+
+The staged `kit/` directory went from about 300 KB to 241 MB over the same
+step: `kit/mono/wine-mono-11.3.0` is 227 MB, and
+`kit/runtime/lib/vkd3d-proton` is 14 MB (`i386-windows/d3d12.dll` 143 K +
+`d3d12core.dll` 7.3 M; `x86_64-windows/d3d12.dll` 147 K + `d3d12core.dll`
+6.7 M). The PKG grows more than those 241 MB because the PFS image does not
+compress and rounds up. The vkd3d DLLs ship **inert** — the runtime manifest
+records `vkd3d_proton_qualified=0` and the capability is unclaimed — so they
+cost size without changing behaviour until a D3D12 title qualifies them.
+
+### Everything is now committed and pushed
+
+Nothing of this work remains only in a scratch directory.
+
+**`plastikman/playden-ps4`, branch `sync/v0.12.0`** — pushed
+`ae245c2f..1e78af57`, nine commits:
+
+    1b2c8329 web: wait for the socket to drain instead of abandoning the response
+    42fdaab2 PS4: claim the capabilities the runtime's profile parser already reads
+    80f2e516 PS4: derive kit capabilities from evidence, and test that they stay honest
+    7f1020b3 PS4: gate kit capabilities on staged runtime evidence
+    1145cfa3 profile: allow hosted driver opt-in for qualified kits
+    4965c770 fix game settings fallback for preset-only input
+    938f3192 Clarify settings publication preflight failures
+    0ef0a2c9 test runtime publication failure diagnostics
+    1e78af57 docs: record the kit capability parity work and its console qualification
+
+This document is that last commit, carried in as
+`docs/ps4-current-handoff-2026-11-19.md` to match the repo's existing
+`ps4-current-handoff-<date>.md` convention. It had previously been a loose file
+in `junk` and in no repository at all.
+
+Note `deps/` and `scripts/network-deps/.deps` are untracked and **not**
+gitignored in this repo, so stage by name; a `git add -A` would sweep them in.
+
+**`plastikman/orbis-win`, branch `launcher-settings`** — pushed
+`86cfa40..086105b`, two commits.
+
+`c89349a` archives the prospero-win parser work. **A correction on mechanism:**
+that work could not be pushed to orbis-win as a branch. The two repositories
+have unrelated histories — orbis-win does not track `pw_game_profile.c` at all,
+it consumes prospero-win as an external tree at `$PW_ROOT`
+(`scripts/build-app-ps4.sh:17`), which is why `prospero-win/` shows as
+untracked in `orbis-fromsource/repo`. Pushing the branch would have created an
+orphan whose paths match nothing in the repo. The repo's existing convention
+for external-tree changes is `src/prospero-win-patches-ps4/` (147 patches), so
+the two commits were exported there in the `02xx` series after `0205`:
+
+- `0206-profile-accept-runtime-version.patch` (from `a8f8850`)
+- `0207-profile-environment-audio-and-steam-path.patch` (from `8604f3b`, 653
+  diff lines)
+
+Both were normalized to the archive's format (no `diff --git` or `index`
+lines, no diffstat, author `Zak Peirce <zak@orbis-win>`) and then **verified**
+rather than assumed: applied onto base `5d1cb4f` in a scratch worktree, both
+`git apply --check` clean, and the result diffed against `8604f3b` is
+byte-identical. Per the sibling series' README these are an archive for review
+and porting, **not a build input** — the runtime still builds from the pins in
+`src/wine-trees/`. The live source stays on `codex/profile-environment` in
+`/home/zpeirce/junk/codex_scratch/prospero-profile-env-20261118`, whose only
+remote is a path on Slackian; the patches are its durable copy.
+
+`086105b` commits the two handoffs that had been uncommitted in `ps4-gladius`:
+the Splinter Cell Conviction findings (+218 lines) and the PS4 native Steam
+probe record.
+
+### What this does not change
+
+The substantive blocker is unchanged and is a hardware one, not a code one.
+The settings publication preflight still refuses with `Before state is not a
+verified committed complete publication`, which gates qualification of
+`[environment]`, `[audio] volume` and `[steam] install_dir` — the three
+capabilities `0207` exists to deliver. Playden 01.30 is installed and carries
+the six specific diagnostic strings built to distinguish that generic refusal.
+Per the qualification order above, finishing the HL2 setup once and capturing
+that diagnostic is the next step that unblocks the rest. `wine-driver-threads`
+also remains unclaimed: patch 1076's markers are absent from the selected
+runtime and no hosted-driver event has been observed.
