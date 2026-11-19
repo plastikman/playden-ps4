@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts/ps4-kit-view.py'
@@ -136,10 +137,55 @@ class Ps4KitViewCapabilityTests(unittest.TestCase):
                     kept = [p for p in every_provider if p != missing]
                     self.assertNotIn(name, self.view.capabilities(self.staged(kept)))
 
+    def test_compiled_marker_backed_claims_require_their_binary_markers(self):
+        for name, markers in self.view.CAPABILITY_MARKERS.items():
+            with self.subTest(capability=name):
+                checks = markers if isinstance(markers[0], tuple) else (markers,)
+                paths = [path for path, _ in checks]
+                stage = self.staged(paths)
+                self.assertNotIn(name, self.view.capabilities(stage))
+                for path, marker in checks:
+                    (stage / path).write_bytes(b'prefix ' + marker + b' suffix')
+                self.assertIn(name, self.view.capabilities(stage))
+                if name == 'wine-driver-threads':
+                    for path, _ in checks:
+                        (stage / path).write_bytes(b'marker removed')
+                        self.assertNotIn(name, self.view.capabilities(stage))
+                        # Restore this provider before checking the next one.
+                        marker = next(value for candidate, value in checks if candidate == path)
+                        (stage / path).write_bytes(b'prefix ' + marker + b' suffix')
+        self.assertNotIn('wine-driver-threads', self.view.NEVER_CLAIM)
+
     def test_parser_backed_claims_are_listed_without_any_staged_file(self):
         unbacked = sorted(name for name, (providers, _) in self.view.CAPABILITY_EVIDENCE.items()
                           if not providers)
         self.assertEqual(unbacked, self.view.capabilities(self.staged([])))
+
+    def test_wine_mono_requires_payload_and_template_runtime_path(self):
+        provider = self.view.CAPABILITY_EVIDENCE['wine-mono'][0][0]
+        stage = self.staged([provider])
+        self.assertNotIn('wine-mono', self.view.capabilities(stage))
+        registry = stage / self.view.TEMPLATE / 'user.reg'
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        expected = (f'"RuntimePath"="Z:\\\\data\\\\playden\\\\kits\\\\orbis-win-ps4'
+                    f'\\\\mono\\\\wine-mono-{self.view.MONO_VERSION}"')
+        registry.write_text(f'[Software\\\\Wine\\\\Mono]\n{expected}\n', encoding='utf-8')
+        self.assertIn('wine-mono', self.view.capabilities(stage))
+        registry.write_text('[Software\\\\Wine\\\\Mono]\n"RuntimePath"="Z:\\\\wrong"\n',
+                            encoding='utf-8')
+        self.assertNotIn('wine-mono', self.view.capabilities(stage))
+
+    def test_vkd3d_proton_requires_all_architectures_and_hardware_qualification(self):
+        providers = self.view.VKD3D_PROTON_PROVIDERS
+        stage = self.staged(providers)
+        for provider in providers:
+            (stage / provider).write_bytes(b'PE test payload')
+        with mock.patch.object(self.view, 'VKD3D_PROTON_QUALIFIED', False):
+            self.assertNotIn('vkd3d-proton', self.view.capabilities(stage))
+        with mock.patch.object(self.view, 'VKD3D_PROTON_QUALIFIED', True):
+            self.assertIn('vkd3d-proton', self.view.capabilities(stage))
+            (stage / providers[-1]).unlink()
+            self.assertNotIn('vkd3d-proton', self.view.capabilities(stage))
 
     def test_display_120hz_is_never_claimed(self):
         # The one that would do real damage: Playden's SoftwareFrameLimit() turns OFF its software
