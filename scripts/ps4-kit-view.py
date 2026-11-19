@@ -86,6 +86,8 @@ CAPABILITY_EVIDENCE = {
     "title-any-id": ((), "one title shell serves every game"),
     "input-keyboard-stick": ((), "[input] keyboard_stick = left_stick|right_stick"),
     "input-touchpad": ((), "[input] touchpad"),
+    "touchpad-switch": (("sce_module/relocated_wine_app.prx",),
+                        "[launcher] chain = off with a touchpad hold switch and mouse = touchpad"),
     "input-rumble": ((), "[input] rumble"),
     "display-framegen": ((), "[display] framegen = 2|3|4|off"),
     "display-fps-counter": ((), "[display] show_fps, which Playden writes for every profile"),
@@ -143,6 +145,7 @@ CAPABILITY_MARKERS = {
         ("win/wine/lib/wine/x86_64-windows/ntoskrnl.exe", b"hosted driver %s"),
     ),
     "steam-library-path": ("sce_module/relocated_wine_app.prx", b"PW_WINE64 steam view install_dir="),
+    "touchpad-switch": ("sce_module/relocated_wine_app.prx", b"PW_WINE64 profile_features=launcher-touchpad-switch"),
 }
 
 # Capabilities that must stay unclaimed, and why. Keeping the reason in code is the point: each of
@@ -179,8 +182,7 @@ NEVER_CLAIM = {
         "cannot be handed the Wine-server socket the PS5 helper's SendFd() design depends on. "
         "See docs/HANDOFF-2026-11-18-PS4-NATIVE-STEAM.md.",
     "title-notify": "Needs Leo's pw_title_notify.h, which we do not have; also dead without helper-process.",
-    "launcher-mode": "No [launcher] section; our exec chain is sequential, the opposite of what it needs.",
-    "touchpad-switch": "Needs [launcher] too -- claiming it alone still makes Playden emit that section.",
+    "launcher-mode": "PS4 runtime supports [launcher] chain = off for manual input switching, not automatic exec-chain mode.",
     "launch-arguments-4096":
         "Raises the WHOLE profile cap to 16KiB, not just arguments; our buffers are still the old tier "
         "(PW_APP_ARGUMENTS_CAPACITY 513, PW_APP_PROFILE_MAX_BYTES 8192).",

@@ -203,9 +203,9 @@ std::vector<SettingDefinition> BuildCatalogue() {
   list.push_back(Choice("touchpad_hold", "Touchpad hold",
                         "Hold the touchpad for 2 seconds to swap to another preset, for menus.", "", G::kControls,
                         {{"off", "Off", "The touchpad works as the game's own button."},
-                         {"mouse", "Switch to Mouse",
-                          "Left stick moves the pointer; Cross clicks, Circle right-clicks, D-pad sends keyboard arrows, "
-                          "Triangle Esc. Hold the touchpad again to go back."}},
+                         {"mouse", "Switch to Touchpad mouse",
+                          "The touch surface moves the pointer; click the touchpad to select. Circle right-clicks, the "
+                          "D-pad sends keyboard arrows, and Triangle is Esc. Hold the touchpad for 2 seconds to go back."}},
                         "off"));
   // Controls › Button mapping.
   static const std::map<std::string, std::string> button_names = {
@@ -694,6 +694,7 @@ std::string Unavailable(const SettingDefinition& definition, const std::string& 
   if (id == "touchpad_hold") {
     if (kit.touchpad_switch_needs_update) return kAppliesAfterKitUpdate;
     if (!kit.touchpad_switch) return "Needs a newer runtime kit that switches presets with the touchpad.";
+    if (value == "mouse" && !settings.input_touchpad) return "Needs a runtime kit that moves the pointer with the touchpad.";
     if (const auto launcher = values.find("start_through_launcher");
         launcher != values.end() && launcher->second.available && launcher->second.value == "on")
       return "Start through a launcher already switches presets with the touchpad.";
@@ -782,9 +783,10 @@ const std::map<std::string, std::map<std::string, std::string>>& ControllerPrese
 
 const std::map<std::string, std::string>& TouchpadMenuButtons() {
   static const std::map<std::string, std::string> buttons = {
-      {"cross", "mouse_left"}, {"circle", "mouse_right"}, {"square", "mouse_middle"}, {"r2", "mouse_left"},
-      {"l2", "mouse_right"},   {"options", "enter"},      {"triangle", "escape"},     {"up", "up"},
-      {"down", "down"},        {"left", "left"},          {"right", "right"}};
+      {"touchpad", "mouse_left"}, {"circle", "mouse_right"}, {"square", "mouse_middle"},
+      {"r2", "mouse_left"},       {"l2", "mouse_right"},     {"options", "enter"},
+      {"triangle", "escape"},     {"up", "up"},              {"down", "down"},
+      {"left", "left"},           {"right", "right"}};
   return buttons;
 }
 
@@ -1568,14 +1570,14 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
   const auto& touchpad_hold = OptionalValue(settings, "touchpad_hold");
   const bool touchpad_section = !launcher_section && touchpad_hold.available && touchpad_hold.value == "mouse";
   if (touchpad_section) {
-    text += "\n[launcher]\nchain = off\nlabel = Mouse\n";
+    text += "\n[launcher]\nchain = off\nlabel = Touchpad mouse\n";
     if (value("controller_preset") != "none") {
       for (const auto& option : FindSetting("controller_preset")->choices)
         if (option.value == value("controller_preset")) text += "game_label = " + option.label + "\n";
     } else {
       text += "game_label = Game controls\n";
     }
-    text += "mode = keyboard\nmouse = left_stick\nmouse_speed = 900\n";
+    text += "mode = keyboard\nmouse = touchpad\n";
     for (const auto& button : ProsperoButtons()) {
       const auto binding = TouchpadMenuButtons().find(button);
       if (binding != TouchpadMenuButtons().end()) text += button + " = " + binding->second + "\n";

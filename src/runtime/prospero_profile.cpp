@@ -262,7 +262,8 @@ bool CheckProsperoProfile(std::string_view text, std::string* reason, ProsperoPr
       if ((name != "application" && name != "display" && name != "input" && name != "debug" &&
            !(features.environment_section && name == "environment") &&
            !(features.audio_section && name == "audio") && !(features.runtime_version && name == "runtime") &&
-           !(features.launcher_section && name == "launcher") && !(features.helper_section && name == "helper") &&
+           !((features.launcher_section || features.launcher_chain_off) && name == "launcher") &&
+           !(features.helper_section && name == "helper") &&
            !(features.steam_section && name == "steam")) ||
           std::find(sections.begin(), sections.end(), name) != sections.end())
         return fail("section [" + name + "] unknown or repeated");
@@ -389,7 +390,10 @@ bool CheckProsperoProfile(std::string_view text, std::string* reason, ProsperoPr
       } else if (key == "mode") {
         if (!OneOf(value, {"keyboard", "xinput"})) return bad("not keyboard or xinput");
       } else if (key == "mouse") {
-        if (!OneOf(value, {"none", "left_stick", "right_stick"})) return bad("unknown pointer stick");
+        if (features.input_touchpad && value == "touchpad") {
+        } else if (!OneOf(value, {"none", "left_stick", "right_stick"})) {
+          return bad("unknown pointer stick");
+        }
       } else if (key == "mouse_speed") {
         const long speed = IsDigits(value, 9) ? std::atol(std::string(value).c_str()) : 0;
         if (speed < 1 || speed > 20000) return bad("not 1-20000");
