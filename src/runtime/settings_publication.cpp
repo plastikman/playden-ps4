@@ -847,16 +847,31 @@ Result<SettingsPublicationOperation> CaptureSettingsPublicationOperation(const R
       if (!Complete(checked) || pw_title_publication_parse(reinterpret_cast<const uint8_t*>(receipt.bytes.data()),
                                                            receipt.bytes.size(), &parsed) != PW_OK)
         return fail("Before state is not the verified publication of this game folder: " + checked.message);
-    } else if (const auto known_mount = platform::UsbMountOf(r.install_path);
-        pw_title_publication_parse(reinterpret_cast<const uint8_t*>(receipt.bytes.data()), receipt.bytes.size(), &parsed) != PW_OK ||
-        parsed.phase != PW_TITLE_PUBLICATION_COMMITTED || !prior || !prior->present ||
-        pw_title_publication_read_descriptor((std::string(kManagedTitleRoot) + "/" + r.title_id + "/game-launch.json").c_str(), r.title_id.c_str(),
-        &platform, &descriptor, error, sizeof(error)) != PW_OK || descriptor.launch.app_id != r.runtime_number ||
-        (platform.known_game_mount = known_mount.empty() ? nullptr : known_mount.c_str(), false) ||
-        pw_title_publication_verify_locked(&descriptor, &platform, borrowed,
-        reinterpret_cast<const uint8_t*>(receipt.bytes.data()), receipt.bytes.size(), parsed.publication_sha256,
-        &contents, error, sizeof(error)) != PW_OK)
-      return fail("Before state is not a verified committed complete publication.");
+    } else {
+      const auto reject_before = [&](const std::string& reason) {
+        return fail("Before state is not a verified committed complete publication: " + reason);
+      };
+      if (pw_title_publication_parse(reinterpret_cast<const uint8_t*>(receipt.bytes.data()), receipt.bytes.size(),
+                                     &parsed) != PW_OK)
+        return reject_before("receipt is invalid");
+      if (parsed.phase != PW_TITLE_PUBLICATION_COMMITTED)
+        return reject_before("receipt is not committed");
+      if (!prior || !prior->present)
+        return reject_before("publication metadata is missing or unreadable");
+      const auto descriptor_path = std::string(kManagedTitleRoot) + "/" + r.title_id + "/game-launch.json";
+      if (pw_title_publication_read_descriptor(descriptor_path.c_str(), r.title_id.c_str(), &platform,
+                                               &descriptor, error, sizeof(error)) != PW_OK)
+        return reject_before(std::string("game descriptor: ") + (error[0] ? error : "parser rejected it"));
+      if (descriptor.launch.app_id != r.runtime_number)
+        return reject_before("descriptor app id does not match the installed runtime");
+      const auto known_mount = platform::UsbMountOf(r.install_path);
+      platform.known_game_mount = known_mount.empty() ? nullptr : known_mount.c_str();
+      error[0] = '\0';
+      if (pw_title_publication_verify_locked(&descriptor, &platform, borrowed,
+              reinterpret_cast<const uint8_t*>(receipt.bytes.data()), receipt.bytes.size(),
+              parsed.publication_sha256, &contents, error, sizeof(error)) != PW_OK)
+        return reject_before(std::string("published contents: ") + (error[0] ? error : "verification failed"));
+    }
     o.previous_revision = parsed.settings_revision; o.previous_receipt_bytes = receipt.bytes; o.previous_metadata_bytes = prior->bytes;
   }
   auto game = ManagedDirectory::Open(Map(prefix, platform::OnGameMount(working, r.install_path)), GameDirectoryPolicy(m.game_root_unowned != 0));
