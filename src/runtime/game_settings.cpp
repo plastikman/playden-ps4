@@ -1369,6 +1369,8 @@ bool BuildEffectiveSettings(const GameRecipe& recipe, const SettingsPreset* pres
     };
     if (names("WINE_LARGE_ADDRESS_AWARE") && !kit.large_address_aware)
       return refuse("WINE_LARGE_ADDRESS_AWARE", kit.large_address_aware_needs_update);
+    if (names("WINE_NTOSKRNL_HOSTED") && !kit.driver_threads)
+      return refuse("WINE_NTOSKRNL_HOSTED", false);
     if (names("PW_NSIPROXY_DISABLE") && !kit.nsiproxy_switch)
       return refuse("PW_NSIPROXY_DISABLE", kit.nsiproxy_switch_needs_update);
     for (const char* budget : {"WINE_" PLAYDEN_CONSOLE_NAME "_PARK_FILES", "WINE_" PLAYDEN_CONSOLE_NAME "_CACHED_FILES"})

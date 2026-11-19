@@ -1018,6 +1018,16 @@ int main(int argc, char** argv) {
         std::string::npos);
   CHECK(!CheckProsperoProfile(profile.text, &reason));                // a released runtime refuses it
   CHECK(CheckProsperoProfile(profile.text, &reason, {.environment_section = true}));
+  const std::map<std::string, std::string> hosted_driver_env = {{"environment", "WINE_NTOSKRNL_HOSTED=1"}};
+  auto hosted_driver_kit = environment_kit;
+  hosted_driver_kit.driver_threads = true;
+  CHECK(BuildEffectiveSettings(hl2, nullptr, hosted_driver_env, hosted_driver_kit, &settings, &error));
+  CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
+  CHECK(profile.text.find("\n[environment]\nRADV_PERFTEST = pswave32\nWINE_NTOSKRNL_HOSTED = 1\n") !=
+        std::string::npos);
+  CHECK(CheckProsperoProfile(profile.text, &reason, {.environment_section = true}));
+  CHECK(!BuildEffectiveSettings(hl2, nullptr, hosted_driver_env, environment_kit, &settings, &error));
+  CHECK(error.setting_id == "environment" && error.message == "WINE_NTOSKRNL_HOSTED needs a newer runtime kit");
   // A Zink kit that also reads [environment] (kit H r5): CPU cores and the names [environment] takes go there, the
   // diagnostics names only [debug] env takes stay env lines, and no name is written twice.
   {
@@ -1640,6 +1650,8 @@ int main(int argc, char** argv) {
   CHECK(!ValidateSettingValue(hl2, "environment", "DXVK_HUD=full", &reason));
   CHECK(!ValidateSettingValue(hl2, "environment", "DXVK_A=1;DXVK_A=2", &reason));
   CHECK(!ValidateSettingValue(hl2, "environment", "DXVK_A", &reason));
+  CHECK(ValidateSettingValue(hl2, "environment", "WINE_NTOSKRNL_HOSTED=1", &reason));
+  CHECK(!ValidateSettingValue(hl2, "environment", "WINE_NTOSKRNL_HOSTED=0", &reason));
   // A refused name says which names are allowed, and every name the hint lists is (#480).
   CHECK(!ValidateSettingValue(hl2, "environment", "PROTON_LOG=1", &reason) &&
         reason == std::string("PROTON_LOG is not an allowed variable. ") + kEnvironmentNamesHint);

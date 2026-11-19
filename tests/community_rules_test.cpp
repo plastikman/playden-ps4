@@ -356,6 +356,7 @@ void Rules(const std::string& fixtures) {
   // Only the variables that take no path; the player's own row and the profile still take all of them.
   CHECK(!IsPlaydenEnvironmentVariable("VKD3D_LOG_FILE") && !IsPlaydenEnvironmentVariable("VKD3D_SHADER_CACHE_PATH") &&
         IsPlaydenEnvironmentVariable("VKD3D_CONFIG") && IsPlaydenEnvironmentVariable("PW_MEDIA_DISABLE"));
+  CHECK(!IsPlaydenEnvironmentVariable("WINE_NTOSKRNL_HOSTED"));  // profile-only: a shared recipe can't start drivers
   CHECK(IsBottleEnvironmentEntry("VKD3D_LOG_FILE", "Z:\\x.log"));
   // A launch option naming a later program is allowed and flagged.
   const auto second = Load(fixtures + "/flagged/launch-option-second.json");
