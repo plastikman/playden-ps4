@@ -48,8 +48,27 @@ VIEW = "runtime-template/playden-kit-view.json"
 # of a runtime that does. Without it the row reads "Needs a newer runtime kit" and an imported
 # game cannot be switched to the translator: MDK, a 1997 32-bit title, crashed on native with
 # c0000005 five seconds in (2026-11-18).
+# Claim only what the runtime's profile parser actually reads (pw_game_profile.c). A capability is a
+# promise about behaviour, not about shipping a file: game-root-unowned crashed the launcher because
+# it is kit-wide, and display-120hz must stay off this list even though [display] refresh takes 120 --
+# it promises the runtime paces the cap itself via [display] frame_rate, which the parser does not
+# know, and Playden turns OFF its software frame limiter for a kit that claims it (SoftwareFrameLimit,
+# game_settings.cpp), so games would run with no cap at all.
+#
+# Audited against kit_trust.cpp's 34 known capabilities on 2026-11-18. Still unclaimable because the
+# parser has no section for them: settings-profile-environment ([environment]), settings-audio-volume
+# ([audio]), helper-process ([helper]), steam-library-path ([steam]). Partial, so left off:
+# settings-input-tuning (stick_deadzone yes, trigger_deadzone no), input-playstation (no such [input]
+# mode). Environment variables already work without settings-profile-environment: that row's gate also
+# passes on opengl-zink, and the parser reads [debug] env.
 CAPABILITIES = sorted(["input-keyboard-stick", "input-touchpad", "profile-version-2",
-                       "settings-dxvk-config", "title-any-id"])
+                       "settings-dxvk-config", "title-any-id",
+                       # [display] framegen = 2|3|4|off
+                       "display-framegen",
+                       # [display] show_fps, which Playden writes for every profile
+                       "display-fps-counter",
+                       # [input] rumble
+                       "input-rumble"])
 
 
 def capabilities(stage) -> list:
