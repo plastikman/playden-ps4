@@ -17,13 +17,20 @@ PW="$ORBIS_WIN_ROOT/prospero-win"
 SDK="$ORBIS_WIN_ROOT/sdk/orbis-sdk-v1/sdk"
 COMPAT="$ORBIS_WIN_ROOT/sdk/orbis-sdk-v1/orbis-compat"
 CC="$ORBIS_WIN_ROOT/build/ps4-wine-sdk/bin/prospero-clang"
-BUILD="$ROOT/build/ps4-runtime"
+BUILD="${PLAYDEN_PS4_BUILD_DIR:-$ROOT/build/ps4-runtime}"
 CMAKE_BUILD="$BUILD/cmake"
 STAGE="$BUILD/pkg-stage"
 PKG_OUT="$BUILD/package"
 TITLE_ID=PLDN10001
 PKG_VERSION="${PKG_VERSION:-01.24}"
 MESA_SHA256="${PLAYDEN_MESA_SHA256:-}"
+WINE_MONO_DIR="${WINE_MONO_DIR:-}"
+WINE_MONO_VERSION="${WINE_MONO_VERSION:-11.3.0}"
+VKD3D_PROTON_DIR="${VKD3D_PROTON_DIR:-}"
+VKD3D_PROTON_VERSION="${VKD3D_PROTON_VERSION:-none}"
+VKD3D_PROTON_QUALIFIED="${VKD3D_PROTON_QUALIFIED:-0}"
+KIT_ID="orbis-win-ps4"
+export WINE_MONO_VERSION VKD3D_PROTON_QUALIFIED
 PKGTOOL_SSL_LIB="${PS4_PKGTOOL_OPENSSL_LIB:-${HOME}/.cache/orbis-ports/openssl11/lib}"
 export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 if [[ -f "$PKGTOOL_SSL_LIB/libssl.so.1.1" ]]; then
@@ -42,10 +49,25 @@ manifest_diff="$(sed -n 's/^prospero_win_abi4_diff_sha256=//p' "$RELEASE_MANIFES
 empty_diff_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 [[ "$manifest_diff" == "$empty_diff_sha256" ]] ||
     die "Orbis-Win release contains local changes (prospero_win_abi4_diff_sha256=$manifest_diff)"
+manifest_root_diff="$(sed -n 's/^orbis_win_root_diff_sha256=//p' "$RELEASE_MANIFEST")"
+[[ "$manifest_root_diff" == "$empty_diff_sha256" ]] ||
+    die "Orbis-Win root release contains local changes (orbis_win_root_diff_sha256=${manifest_root_diff:-missing})"
 manifest_commit="$(sed -n 's/^prospero_win_abi4_commit=//p' "$RELEASE_MANIFEST")"
 [[ -n "$manifest_commit" ]] || die "missing exact Orbis-Win source commit from BUILD-MANIFEST.txt"
 manifest_root_commit="$(sed -n 's/^root_commit=//p' "$RELEASE_MANIFEST")"
 [[ -n "$manifest_root_commit" ]] || die "missing exact Orbis-Win root commit from BUILD-MANIFEST.txt"
+actual_root_commit="$(git -C "$ORBIS_WIN_ROOT" rev-parse HEAD)"
+[[ "$actual_root_commit" == "$manifest_root_commit" ]] ||
+    die "Orbis-Win root checkout $actual_root_commit does not match release manifest $manifest_root_commit"
+actual_root_diff="$(git -C "$ORBIS_WIN_ROOT" diff HEAD --binary | sha256sum | awk '{print $1}')"
+[[ "$actual_root_diff" == "$empty_diff_sha256" ]] ||
+    die "Orbis-Win root checkout has tracked local changes (sha256=$actual_root_diff)"
+actual_pw_commit="$(git -C "$ORBIS_WIN_ROOT/prospero-win" rev-parse HEAD)"
+[[ "$actual_pw_commit" == "$manifest_commit" ]] ||
+    die "Orbis-Win Prosper-Win checkout $actual_pw_commit does not match release manifest $manifest_commit"
+actual_pw_diff="$(git -C "$ORBIS_WIN_ROOT/prospero-win" diff HEAD --binary | sha256sum | awk '{print $1}')"
+[[ "$actual_pw_diff" == "$empty_diff_sha256" ]] ||
+    die "Orbis-Win Prosper-Win checkout has tracked local changes (sha256=$actual_pw_diff)"
 if [[ -n "$PW_SOURCE_COMMIT" && "$PW_SOURCE_COMMIT" != "$manifest_commit" ]]; then
     die "PW_SOURCE_COMMIT $PW_SOURCE_COMMIT does not match release manifest commit $manifest_commit"
 fi
@@ -54,6 +76,23 @@ PW_SOURCE_COMMIT="$manifest_commit"
 [[ -d "$ORBIS_WIN_STAGE/sce_module" ]] || die "missing runtime stage: $ORBIS_WIN_STAGE"
 [[ -x "$CC" && -f "$SDK/link.x" ]] || die "orbis-win PS4 compiler/SDK missing"
 [[ -n "$HOST_WINE_ROOT" ]] || die "release manifest has no host_wine path"
+if [[ -n "$WINE_MONO_DIR" ]]; then
+    [[ "$WINE_MONO_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || die "invalid WINE_MONO_VERSION: $WINE_MONO_VERSION"
+    for path in bin/libmono-2.0-x86.dll bin/libmono-2.0-x86_64.dll etc/mono lib/mono/4.5/mscorlib.dll; do
+        [[ -e "$WINE_MONO_DIR/$path" ]] || die "Wine Mono payload is incomplete: $WINE_MONO_DIR/$path"
+    done
+fi
+case "$VKD3D_PROTON_QUALIFIED" in
+    0|1) ;;
+    *) die "VKD3D_PROTON_QUALIFIED must be 0 or 1" ;;
+esac
+if [[ -n "$VKD3D_PROTON_DIR" ]]; then
+    [[ "$VKD3D_PROTON_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
+        die "invalid VKD3D_PROTON_VERSION: $VKD3D_PROTON_VERSION"
+    for path in x86/d3d12.dll x86/d3d12core.dll x64/d3d12.dll x64/d3d12core.dll; do
+        [[ -f "$VKD3D_PROTON_DIR/$path" ]] || die "vkd3d-proton payload is incomplete: $VKD3D_PROTON_DIR/$path"
+    done
+fi
 WINE="$HOST_WINE_ROOT/install/usr/bin/wine"
 [[ -x "$WINE" ]] || die "manifest host Wine is missing or not executable: $WINE"
 [[ -f "$ORBIS_WIN_STAGE/sce_module/libvulkan.prx" ]] || die "Mesa PRX missing from baseline stage"
@@ -95,10 +134,26 @@ for dll in $DXVK_DLLS; do
     [[ "$(pe_machine "$DXVK_262_DIR/$dll.dll")" == 0x14c ]] || die "$DXVK_262_DIR/$dll.dll is not 32-bit"
     [[ "$(pe_machine "$DXVK_262_X64_DIR/$dll.dll")" == 0x8664 ]] || die "$DXVK_262_X64_DIR/$dll.dll is not 64-bit"
 done
+if [[ -n "$VKD3D_PROTON_DIR" ]]; then
+    for dll in d3d12.dll d3d12core.dll; do
+        [[ "$(pe_machine "$VKD3D_PROTON_DIR/x86/$dll")" == 0x14c ]] ||
+            die "$VKD3D_PROTON_DIR/x86/$dll is not 32-bit"
+        [[ "$(pe_machine "$VKD3D_PROTON_DIR/x64/$dll")" == 0x8664 ]] ||
+            die "$VKD3D_PROTON_DIR/x64/$dll is not 64-bit"
+    done
+elif [[ "$VKD3D_PROTON_QUALIFIED" == 1 ]]; then
+    die "cannot qualify vkd3d-proton without VKD3D_PROTON_DIR"
+fi
 WINE_VERSION="$("$WINE" --version)"
 [[ "$WINE_VERSION" == wine-* ]] || die "manifest host Wine did not report a version: $WINE_VERSION"
 MESA_COMMIT="$(sed -n 's/^mesa_commit=//p' "$RELEASE_MANIFEST")"
 [[ -n "$MESA_COMMIT" ]] || die "release manifest has no mesa_commit"
+MESA_SOURCE_DIFF="$(sed -n 's/^mesa_source_diff_sha256=//p' "$RELEASE_MANIFEST")"
+[[ "$MESA_SOURCE_DIFF" == "$empty_diff_sha256" ]] ||
+    die "Orbis-Win Mesa source has local changes (mesa_source_diff_sha256=${MESA_SOURCE_DIFF:-missing})"
+EXPECTED_MESA_COMMIT="$(tr -d '[:space:]' < "$ORBIS_WIN_ROOT/src/mesa-trees/mesa-ps4-HEAD.txt")"
+[[ "$MESA_COMMIT" == "$EXPECTED_MESA_COMMIT" ]] ||
+    die "Orbis-Win Mesa commit $MESA_COMMIT does not match pinned commit $EXPECTED_MESA_COMMIT"
 STEAMWORKS_DIR="$ROOT/runtime/steamworks"
 for spec in \
     'steam_api.dll d778ba3007cc46b7587f23698493c6734752213e34eaec2d5e59a036da11df44' \
@@ -255,6 +310,11 @@ USER=prospero LOGNAME=prospero WINEARCH=win64 WINEPREFIX="$PREFIX" WINEDEBUG=-al
 # mutations. Keep the capability and the template registry in sync.
 USER=prospero LOGNAME=prospero WINEARCH=win64 WINEPREFIX="$PREFIX" WINEDEBUG=-all \
     "$WINE" reg add 'HKCU\Software\Wine\Drivers' /v Audio /t REG_SZ /d ps5 /f
+if [[ -n "$WINE_MONO_DIR" ]]; then
+    USER=prospero LOGNAME=prospero WINEARCH=win64 WINEPREFIX="$PREFIX" WINEDEBUG=-all \
+        "$WINE" reg add 'HKCU\Software\Wine\Mono' /v RuntimePath /t REG_SZ \
+        /d "Z:\\data\\playden\\kits\\$KIT_ID\\mono\\wine-mono-$WINE_MONO_VERSION" /f
+fi
 for dll in $DXVK_DLLS; do
     cp "$DXVK_262_DIR/$dll.dll" "$PREFIX/drive_c/windows/syswow64/$dll.dll"
     cp "$DXVK_262_X64_DIR/$dll.dll" "$PREFIX/drive_c/windows/system32/$dll.dll"
@@ -294,6 +354,22 @@ cmp -s "$ORBIS_WIN_STAGE/sce_module/relocated_wine_app.prx" \
     "$STAGE/sce_module/relocated_wine_app.prx" ||
     die "packaged Wine runtime differs from the released Orbis-Win PRX"
 mkdir -p "$STAGE/runtime-template/hl2-prefix" "$STAGE/assets" "$STAGE/runtime/steamworks"
+if [[ -n "$WINE_MONO_DIR" ]]; then
+    MONO_STAGE="$STAGE/runtime-template/kit/mono/wine-mono-$WINE_MONO_VERSION"
+    mkdir -p "$MONO_STAGE"
+    for path in bin etc lib support; do
+        [[ ! -e "$WINE_MONO_DIR/$path" ]] || cp -a "$WINE_MONO_DIR/$path" "$MONO_STAGE/"
+    done
+fi
+if [[ -n "$VKD3D_PROTON_DIR" ]]; then
+    for spec in 'x64 x86_64-windows' 'x86 i386-windows'; do
+        read -r source_arch target_arch <<<"$spec"
+        destination="$STAGE/runtime-template/kit/runtime/lib/vkd3d-proton/$target_arch"
+        mkdir -p "$destination"
+        cp "$VKD3D_PROTON_DIR/$source_arch/d3d12.dll" \
+           "$VKD3D_PROTON_DIR/$source_arch/d3d12core.dll" "$destination/"
+    done
+fi
 cp "$ORBIS_WIN_STAGE/win/wine/lib/wine/x86_64-windows/wow64native.dll" \
     "$PREFIX/drive_c/windows/system32/wow64native.dll"
 cp -a "$PREFIX/." "$STAGE/runtime-template/hl2-prefix/"
@@ -354,16 +430,25 @@ cp "$ROOT/scripts/network-deps/.deps/ps4/cacert.pem" "$STAGE/assets/cacert.pem"
 # -- which discards the prefix -- as the only path. What actually changed still reaches the console
 # through the kit view: runtime.artifact_revision carries $PW_SOURCE_COMMIT, files_sha256 covers
 # the template, and capabilities say what the runtime can do.
-KIT_ID="orbis-win-ps4"
 python3 "$ROOT/scripts/ps4-kit-view.py" "$STAGE" "$KIT_ID" \
     "$PW_SOURCE_COMMIT" "$WINE_VERSION"
 cp "$STEAMWORKS_DIR/steam_api.dll" "$STEAMWORKS_DIR/steam_api64.dll" \
     "$STEAMWORKS_DIR/steam.dll" "$STEAMWORKS_DIR/LICENSE" "$STEAMWORKS_DIR/README.md" \
     "$STAGE/runtime/steamworks/"
-printf 'title=PLDN10001\nversion=%s\norbis_win_root_commit=%s\nprospero_win_abi4_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_commit=%s\nmesa_libvulkan_sha256=%s\ndxvk=%s-x32+x64\ndxvk_d3d11_sha256=%s\nprefix_template_stamp=%s\nsteamworks_emulator=gbe_fork-ca45922c\n' \
-    "$PKG_VERSION" "$manifest_root_commit" "$PW_SOURCE_COMMIT" "$manifest_diff" "${WINE_VERSION#wine-}" \
-    "$MESA_COMMIT" "$MESA_SHA256" "$(dxvk_version "$DXVK_262_DIR")" \
-    "$(sha256sum "$DXVK_262_X64_DIR/d3d11.dll" | cut -d" " -f1)" "$TEMPLATE_STAMP" >"$STAGE/runtime-manifest.txt"
+MONO_TREE_SHA256=""
+if [[ -n "$WINE_MONO_DIR" ]]; then
+    MONO_TREE_SHA256="$(cd "$WINE_MONO_DIR" && find . -mindepth 1 -type f ! -name extract.log -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+fi
+VKD3D_PROTON_TREE_SHA256=""
+if [[ -n "$VKD3D_PROTON_DIR" ]]; then
+    VKD3D_PROTON_TREE_SHA256="$(cd "$VKD3D_PROTON_DIR" && sha256sum x86/d3d12.dll x86/d3d12core.dll x64/d3d12.dll x64/d3d12core.dll | sha256sum | cut -d' ' -f1)"
+fi
+printf 'title=PLDN10001\nversion=%s\norbis_win_root_commit=%s\norbis_win_root_diff_sha256=%s\nprospero_win_abi4_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_commit=%s\nmesa_source_diff_sha256=%s\nmesa_libvulkan_sha256=%s\ndxvk=%s-x32+x64\ndxvk_d3d11_sha256=%s\nprefix_template_stamp=%s\nwine_mono_version=%s\nwine_mono_tree_sha256=%s\nvkd3d_proton_version=%s\nvkd3d_proton_tree_sha256=%s\nvkd3d_proton_qualified=%s\nsteamworks_emulator=gbe_fork-ca45922c\n' \
+    "$PKG_VERSION" "$manifest_root_commit" "$manifest_root_diff" "$PW_SOURCE_COMMIT" "$manifest_diff" "${WINE_VERSION#wine-}" \
+    "$MESA_COMMIT" "$MESA_SOURCE_DIFF" "$MESA_SHA256" "$(dxvk_version "$DXVK_262_DIR")" \
+    "$(sha256sum "$DXVK_262_X64_DIR/d3d11.dll" | cut -d" " -f1)" "$TEMPLATE_STAMP" \
+    "$WINE_MONO_VERSION" "$MONO_TREE_SHA256" "$VKD3D_PROTON_VERSION" "$VKD3D_PROTON_TREE_SHA256" \
+    "$VKD3D_PROTON_QUALIFIED" >"$STAGE/runtime-manifest.txt"
 cmp -s "$ORBIS_WIN_STAGE/sce_module/libvulkan.prx" "$STAGE/sce_module/libvulkan.prx" || die "packaged Mesa PRX mismatch"
 cmp -s "$STAGE/sce_module/libvulkan.prx" "$STAGE/win/wine/lib/wine/x86_64-unix/libvulkan.prx" ||
     die "Wine's Vulkan loader and system Vulkan module differ"

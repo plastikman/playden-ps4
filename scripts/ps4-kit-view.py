@@ -30,6 +30,16 @@ AUDIO_DRIVER = "sce_module/wineps5.prx"
 # "graphics = opengl" games. Both architectures must be present to claim the capability.
 ZINK_PROVIDERS = ("win/mesa-zink/i386-windows/opengl32.dll", "win/mesa-zink/x86_64-windows/opengl32.dll")
 VIEW = "runtime-template/playden-kit-view.json"
+MONO_VERSION = os.environ.get("WINE_MONO_VERSION", "11.3.0")
+MONO_ROOT = "runtime-template/kit/mono"
+MONO_PROVIDER = f"{MONO_ROOT}/wine-mono-{MONO_VERSION}/lib/mono/4.5/mscorlib.dll"
+VKD3D_PROTON_QUALIFIED = os.environ.get("VKD3D_PROTON_QUALIFIED", "0") == "1"
+VKD3D_PROTON_PROVIDERS = (
+    "runtime-template/kit/runtime/lib/vkd3d-proton/x86_64-windows/d3d12.dll",
+    "runtime-template/kit/runtime/lib/vkd3d-proton/x86_64-windows/d3d12core.dll",
+    "runtime-template/kit/runtime/lib/vkd3d-proton/i386-windows/d3d12.dll",
+    "runtime-template/kit/runtime/lib/vkd3d-proton/i386-windows/d3d12core.dll",
+)
 # What Orbis-Win does that Playden's settings ask a kit about (ps4/platform_ps4/game_controls.cpp Ps4Kit),
 # and the any-title slots that stand for each game's profile.
 # ⚠ Do NOT add game-root-unowned here. It reads like "this kit can start a game from a folder it
@@ -55,9 +65,10 @@ VIEW = "runtime-template/playden-kit-view.json"
 # know, and Playden turns OFF its software frame limiter for a kit that claims it (SoftwareFrameLimit,
 # game_settings.cpp), so games would run with no cap at all.
 #
-# Audited against kit_trust.cpp's 34 known capabilities on 2026-11-18. Still unclaimable because the
-# parser has no section for them: settings-profile-environment ([environment]), settings-audio-volume
-# ([audio]), helper-process ([helper]), steam-library-path ([steam]). Partial, so left off:
+# Audited against kit_trust.cpp's 34 known capabilities on 2026-11-18. Remaining
+# refusals are recorded in NEVER_CLAIM. [steam] is now parsed by the isolated
+# Prosper-Win worktree; the capability remains gated on the compiled runtime
+# marker and staged Playden view. Partial, so left off:
 # settings-input-tuning (stick_deadzone yes, trigger_deadzone no), input-playstation (no such [input]
 # mode). Environment variables already work without settings-profile-environment: that row's gate also
 # passes on opengl-zink, and the parser reads [debug] env.
@@ -78,12 +89,60 @@ CAPABILITY_EVIDENCE = {
     "input-rumble": ((), "[input] rumble"),
     "display-framegen": ((), "[display] framegen = 2|3|4|off"),
     "display-fps-counter": ((), "[display] show_fps, which Playden writes for every profile"),
+    "settings-profile-environment": (("sce_module/relocated_wine_app.prx",),
+                                      "[environment] per-game variables accepted by the runtime parser"),
+    "wine-large-address-aware": (("sce_module/relocated_wine_app.prx",),
+                                  "[environment] WINE_LARGE_ADDRESS_AWARE = 0|1"),
+    "environment-file-budgets": (("sce_module/relocated_wine_app.prx",),
+                                  "[environment] WINE_PS5_PARK_FILES and WINE_PS5_CACHED_FILES"),
+    "settings-audio-volume": (("sce_module/relocated_wine_app.prx",),
+                              "[audio] volume = 0..100, defaulting to 100"),
     # Playden routes a "graphics = opengl" game through Mesa's Zink only when the kit says it can
     # (kKitOpenGLZink, game_settings.h). PS4 ships that provider, built by Orbis-Win's
     # build_mesa_zink.sh -- but the kit never claimed it, so an OpenGL game got a window and no
     # rendering (The Binding of Isaac, 2026-11-12) because Playden fell back to a PS5 OpenGL SDK
     # path this console does not have. Both architectures must be staged.
     "opengl-zink": (ZINK_PROVIDERS, "win/mesa-zink/*/opengl32.dll"),
+    # The 02.14 runtime stage was built from Orbis-Win a8f8850. Its ntdll carries
+    # patch 1024's implementation marker; the patch archive alone is not build
+    # evidence, so require the compiled marker below.
+    "wine-shared-sections": (("sce_module/ntdll.prx",), "patch 1024 in ntdll.prx"),
+    # Hosted-driver startup and its thread-attach exception are PE-side Wine
+    # code, not the PS4 ntdll PRX. Require both architectures of both modules.
+    "wine-driver-threads": ((
+        "win/wine/lib/wine/i386-windows/ntdll.dll",
+        "win/wine/lib/wine/x86_64-windows/ntdll.dll",
+        "win/wine/lib/wine/i386-windows/ntoskrnl.exe",
+        "win/wine/lib/wine/x86_64-windows/ntoskrnl.exe",
+    ), "compiled hosted-driver implementation and thread-attach exception"),
+    "wine-mono": ((MONO_PROVIDER,), "Wine Mono payload and template RuntimePath"),
+    "vkd3d-proton": (VKD3D_PROTON_PROVIDERS,
+                      "32-bit and 64-bit vkd3d-proton DLLs; hardware qualification required"),
+    "steam-library-path": (("sce_module/relocated_wine_app.prx",),
+                            "compiled [steam] handler writes the PS4 virtual link table"),
+}
+
+# Some runtime features have no standalone staged file: their implementation is
+# compiled into a shared PRX. Require a distinctive compiled-in marker rather
+# than claiming them because the PRX (or an archived patch) exists.
+CAPABILITY_MARKERS = {
+    "settings-profile-environment": ("sce_module/relocated_wine_app.prx",
+                                     b"PW_WINE64 profile_features=environment,audio-volume,steam-library-path"),
+    "wine-large-address-aware": ("sce_module/relocated_wine_app.prx",
+                                 b"PW_WINE64 profile_features=environment,audio-volume,steam-library-path"),
+    "environment-file-budgets": ("sce_module/relocated_wine_app.prx",
+                                  b"PW_WINE64 profile_features=environment,audio-volume,steam-library-path"),
+    "settings-audio-volume": ("sce_module/relocated_wine_app.prx",
+                              b"PW_WINE64 profile_features=environment,audio-volume,steam-library-path"),
+    "wine-shared-sections": ("sce_module/ntdll.prx",
+                             b"unaligned committed mapping %p-%p, using private copy"),
+    "wine-driver-threads": (
+        ("win/wine/lib/wine/i386-windows/ntdll.dll", b"hosted driver thread %04lx: no thread attach"),
+        ("win/wine/lib/wine/x86_64-windows/ntdll.dll", b"hosted driver thread %04lx: no thread attach"),
+        ("win/wine/lib/wine/i386-windows/ntoskrnl.exe", b"hosted driver %s"),
+        ("win/wine/lib/wine/x86_64-windows/ntoskrnl.exe", b"hosted driver %s"),
+    ),
+    "steam-library-path": ("sce_module/relocated_wine_app.prx", b"PW_WINE64 steam view install_dir="),
 }
 
 # Capabilities that must stay unclaimed, and why. Keeping the reason in code is the point: each of
@@ -104,15 +163,8 @@ NEVER_CLAIM = {
     "settings-dxvk-present":
         "Every present is a VSYNC flip; there is no immediate/mailbox path, so VSync off cannot be "
         "honoured (measured, results/20261005-dxvk-conf-probe).",
-    "wine-large-address-aware":
-        "Wine implements it (patch 1040 reads WINE_LARGE_ADDRESS_AWARE) but no profile can deliver a "
-        "WINE_* variable: [debug] env's family allowlist excludes it. Worse, claiming it makes Playden "
-        "emit an [environment] section regardless of kit.environment (game_settings.cpp:1651-1699), "
-        "which this parser refuses outright. Needs [environment] first.",
-    "nsiproxy-switch": "Same [environment] emission trap as wine-large-address-aware, and no switch exists.",
-    "environment-file-budgets":
-        "Wine implements the budgets (patch 1056) but WINE_PS5_* names are silently dropped by the "
-        "[debug] env allowlist, so claiming it only removes an honest refusal. Needs [environment].",
+    "nsiproxy-switch":
+        "The profile can carry PW_NSIPROXY_DISABLE, but the selected runtime has no switch that disables nsiproxy.",
     "bottle-profile-shared":
         "Admission requires exactly 0700 (pw_title_publication_native.c); claiming it triggers a chmod "
         "sweep to 0711 across all installs and would break every bottle, irreversibly in place.",
@@ -122,17 +174,10 @@ NEVER_CLAIM = {
     "settings-input-tuning": "Partial: the parser has stick_deadzone but not trigger_deadzone.",
     "input-playstation": "No such [input] mode value in the parser.",
     "game-root-usb-search": "/mnt is ENOENT inside the PS4 title sandbox; there is nothing to search.",
-    "settings-profile-environment":
-        "No [environment] section in the parser; Playden already routes the Environment variables "
-        "row through [debug] env because opengl-zink is claimed.",
-    "settings-audio-volume":
-        "No [audio] section in the parser. The consumer is close -- pw_audio_ps5_open_port() sets "
-        "all eight channels to 0dB unconditionally -- but the profile cannot carry a volume yet.",
     "helper-process":
         "SCM_RIGHTS fails EINVAL on PS4 and a local child has its own descriptor table, so the child "
         "cannot be handed the Wine-server socket the PS5 helper's SendFd() design depends on. "
         "See docs/HANDOFF-2026-11-18-PS4-NATIVE-STEAM.md.",
-    "steam-library-path": "No [steam] section in the parser, and no bottle-side steamapps tree.",
     "title-notify": "Needs Leo's pw_title_notify.h, which we do not have; also dead without helper-process.",
     "launcher-mode": "No [launcher] section; our exec chain is sequential, the opposite of what it needs.",
     "touchpad-switch": "Needs [launcher] too -- claiming it alone still makes Playden emit that section.",
@@ -151,8 +196,33 @@ def capabilities(stage) -> list:
     unconditionally -- the parser ships inside the runtime, not as a file we can stat here -- and
     tests/test_ps4_kit_view.py holds them against prospero-win's actual section and field lists.
     """
-    found = [name for name, (providers, _) in CAPABILITY_EVIDENCE.items()
-             if all((stage / provider).is_file() for provider in providers)]
+    found = []
+    for name, (providers, _) in CAPABILITY_EVIDENCE.items():
+        if not all((stage / provider).is_file() for provider in providers):
+            continue
+        if name == "vkd3d-proton" and not VKD3D_PROTON_QUALIFIED:
+            continue
+        marker = CAPABILITY_MARKERS.get(name)
+        if marker is not None:
+            checks = marker if isinstance(marker[0], tuple) else (marker,)
+            try:
+                if any(expected not in (stage / path).read_bytes()
+                       for path, expected in checks):
+                    continue
+            except OSError:
+                continue
+        if name == "wine-mono":
+            # A payload by itself does not make Wine use it. The template bottle must resolve the
+            # exact kit-relative path that Playden installs under /data/playden/kits/<kit id>.
+            try:
+                registry = (stage / TEMPLATE / "user.reg").read_text(encoding="utf-8")
+            except OSError:
+                continue
+            expected = (f'"RuntimePath"="Z:\\\\data\\\\playden\\\\kits\\\\orbis-win-ps4'
+                        f'\\\\mono\\\\wine-mono-{MONO_VERSION}"')
+            if expected not in registry:
+                continue
+        found.append(name)
     return sorted(found)
 
 
@@ -198,7 +268,7 @@ def main() -> int:
                                      sort_keys=True) + "\n")
 
     files = []
-    for root in (TEMPLATE, TITLE, RUNTIME, os.path.dirname(RECIPE)):
+    for root in (TEMPLATE, TITLE, RUNTIME, os.path.dirname(RECIPE), MONO_ROOT):
         for path in sorted((stage / root).rglob("*")):
             if path.is_symlink() or not path.is_file():
                 continue
