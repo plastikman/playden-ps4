@@ -694,7 +694,6 @@ std::string Unavailable(const SettingDefinition& definition, const std::string& 
   if (id == "touchpad_hold") {
     if (kit.touchpad_switch_needs_update) return kAppliesAfterKitUpdate;
     if (!kit.touchpad_switch) return "Needs a newer runtime kit that switches presets with the touchpad.";
-    if (value == "mouse" && !settings.input_touchpad) return "Needs a runtime kit that moves the pointer with the touchpad.";
     if (const auto launcher = values.find("start_through_launcher");
         launcher != values.end() && launcher->second.available && launcher->second.value == "on")
       return "Start through a launcher already switches presets with the touchpad.";
@@ -894,6 +893,8 @@ std::string SettingChoiceUnavailable(const EffectiveSettings& settings, std::str
     if (value != "touchpad" || settings.input_touchpad) return {};
     return "Needs a runtime with the touchpad pointer.";
   }
+  if (id == "touchpad_hold" && value == "mouse" && !settings.input_touchpad)
+    return "Needs a runtime kit that moves the pointer with the touchpad.";
   if (id == "movement_stick") {
     if (value == "none" || settings.input_keyboard_stick) return {};
     return "Needs a runtime where a stick can send W A S D.";
