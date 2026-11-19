@@ -61,28 +61,98 @@ VIEW = "runtime-template/playden-kit-view.json"
 # settings-input-tuning (stick_deadzone yes, trigger_deadzone no), input-playstation (no such [input]
 # mode). Environment variables already work without settings-profile-environment: that row's gate also
 # passes on opengl-zink, and the parser reads [debug] env.
-CAPABILITIES = sorted(["input-keyboard-stick", "input-touchpad", "profile-version-2",
-                       "settings-dxvk-config", "title-any-id",
-                       # [display] framegen = 2|3|4|off
-                       "display-framegen",
-                       # [display] show_fps, which Playden writes for every profile
-                       "display-fps-counter",
-                       # [input] rumble
-                       "input-rumble"])
+# Every capability this kit claims, with the evidence for it. A claim is a promise about
+# BEHAVIOUR, not about shipping a file, and the dangerous mistake is not "claiming something we do
+# not support" -- it is claiming something that makes Playden disable a working fallback or emit a
+# profile section Orbis-Win cannot read. See NEVER_CLAIM below for the ones that bite.
+#
+# providers: staged files that must all exist, or () when the provider is the runtime's profile
+# parser (prospero-win src/pw_game_profile.c) rather than a file in the package.
+CAPABILITY_EVIDENCE = {
+    # The parser reads these keys; see pw_game_profile.c section_of() and the *_field() functions.
+    "profile-version-2": ((), "[runtime] version = 2, beside the cpu line"),
+    "settings-dxvk-config": ((), "DXVK reads dxvk.conf from the game's working directory"),
+    "title-any-id": ((), "one title shell serves every game"),
+    "input-keyboard-stick": ((), "[input] keyboard_stick = left_stick|right_stick"),
+    "input-touchpad": ((), "[input] touchpad"),
+    "input-rumble": ((), "[input] rumble"),
+    "display-framegen": ((), "[display] framegen = 2|3|4|off"),
+    "display-fps-counter": ((), "[display] show_fps, which Playden writes for every profile"),
+    # Playden routes a "graphics = opengl" game through Mesa's Zink only when the kit says it can
+    # (kKitOpenGLZink, game_settings.h). PS4 ships that provider, built by Orbis-Win's
+    # build_mesa_zink.sh -- but the kit never claimed it, so an OpenGL game got a window and no
+    # rendering (The Binding of Isaac, 2026-11-12) because Playden fell back to a PS5 OpenGL SDK
+    # path this console does not have. Both architectures must be staged.
+    "opengl-zink": (ZINK_PROVIDERS, "win/mesa-zink/*/opengl32.dll"),
+}
+
+# Capabilities that must stay unclaimed, and why. Keeping the reason in code is the point: each of
+# these was either tried and reverted, or is unreachable, and a future audit should not re-derive it.
+NEVER_CLAIM = {
+    "display-120hz":
+        "Promises the RUNTIME paces the frame cap itself via [display] frame_rate, which the parser "
+        "does not know. Playden's SoftwareFrameLimit() turns OFF its software limiter for a kit that "
+        "claims this, so games would run with no cap at all. [display] refresh taking 120 is not enough.",
+    "game-root-unowned":
+        "Not per-game: it makes Playden publish EVERY game folder unowned (settings_publication.h), "
+        "re-publishing the whole library at startup. Tried in 03.38 on 2026-11-18: every regeneration "
+        "was refused and Playden crashed on its title screen. Import by copying a tree we own instead.",
+    "display-vrr":
+        "Has no KitCapabilities field at all -- read straight from the manifest, it flips param.json "
+        "attribute3 bit 0x40000 on every title and invalidates them, and that bit is a PS5 attribute. "
+        "Our WSI always submits ORBIS_VIDEO_OUT_FLIP_VSYNC at 60Hz (src/native/pw_videoout_ps4.c).",
+    "settings-dxvk-present":
+        "Every present is a VSYNC flip; there is no immediate/mailbox path, so VSync off cannot be "
+        "honoured (measured, results/20261005-dxvk-conf-probe).",
+    "wine-large-address-aware":
+        "Wine implements it (patch 1040 reads WINE_LARGE_ADDRESS_AWARE) but no profile can deliver a "
+        "WINE_* variable: [debug] env's family allowlist excludes it. Worse, claiming it makes Playden "
+        "emit an [environment] section regardless of kit.environment (game_settings.cpp:1651-1699), "
+        "which this parser refuses outright. Needs [environment] first.",
+    "nsiproxy-switch": "Same [environment] emission trap as wine-large-address-aware, and no switch exists.",
+    "environment-file-budgets":
+        "Wine implements the budgets (patch 1056) but WINE_PS5_* names are silently dropped by the "
+        "[debug] env allowlist, so claiming it only removes an honest refusal. Needs [environment].",
+    "bottle-profile-shared":
+        "Admission requires exactly 0700 (pw_title_publication_native.c); claiming it triggers a chmod "
+        "sweep to 0711 across all installs and would break every bottle, irreversibly in place.",
+    "publication-open-modes":
+        "Sets strict_modes = 0 in Playden's own pre-flight, so a title reports admissible while the "
+        "shell refuses it at launch and the diagnostic that would name the fault says 'ok'.",
+    "settings-input-tuning": "Partial: the parser has stick_deadzone but not trigger_deadzone.",
+    "input-playstation": "No such [input] mode value in the parser.",
+    "game-root-usb-search": "/mnt is ENOENT inside the PS4 title sandbox; there is nothing to search.",
+    "settings-profile-environment":
+        "No [environment] section in the parser; Playden already routes the Environment variables "
+        "row through [debug] env because opengl-zink is claimed.",
+    "settings-audio-volume":
+        "No [audio] section in the parser. The consumer is close -- pw_audio_ps5_open_port() sets "
+        "all eight channels to 0dB unconditionally -- but the profile cannot carry a volume yet.",
+    "helper-process":
+        "SCM_RIGHTS fails EINVAL on PS4 and a local child has its own descriptor table, so the child "
+        "cannot be handed the Wine-server socket the PS5 helper's SendFd() design depends on. "
+        "See docs/HANDOFF-2026-11-18-PS4-NATIVE-STEAM.md.",
+    "steam-library-path": "No [steam] section in the parser, and no bottle-side steamapps tree.",
+    "title-notify": "Needs Leo's pw_title_notify.h, which we do not have; also dead without helper-process.",
+    "launcher-mode": "No [launcher] section; our exec chain is sequential, the opposite of what it needs.",
+    "touchpad-switch": "Needs [launcher] too -- claiming it alone still makes Playden emit that section.",
+    "launch-arguments-4096":
+        "Raises the WHOLE profile cap to 16KiB, not just arguments; our buffers are still the old tier "
+        "(PW_APP_ARGUMENTS_CAPACITY 513, PW_APP_PROFILE_MAX_BYTES 8192).",
+    "settings-input-wheel": "No [input] wheel key; the wheel exists only from a real USB mouse. Needs patch 0745.",
+}
 
 
 def capabilities(stage) -> list:
-    """CAPABILITIES plus the ones whose provider is actually staged.
+    """The capabilities whose evidence is actually present in this stage.
 
-    opengl-zink: Playden routes a "graphics = opengl" game through Mesa's Zink only when the kit
-    says it can (kKitOpenGLZink, game_settings.h). PS4 ships that provider -- win/mesa-zink's
-    opengl32.dll for both architectures, built by Orbis-Win -- but the kit never claimed it, so an
-    OpenGL game got a window and no rendering (The Binding of Isaac, 2026-11-12), because Playden
-    fell back to a PS5 OpenGL SDK path this console does not have.
+    A claim with staged providers is dropped when any of them is missing, so the kit cannot promise
+    something this build does not carry. Claims whose provider is the profile parser are listed
+    unconditionally -- the parser ships inside the runtime, not as a file we can stat here -- and
+    tests/test_ps4_kit_view.py holds them against prospero-win's actual section and field lists.
     """
-    found = list(CAPABILITIES)
-    if all((stage / p).is_file() for p in ZINK_PROVIDERS):
-        found.append("opengl-zink")
+    found = [name for name, (providers, _) in CAPABILITY_EVIDENCE.items()
+             if all((stage / provider).is_file() for provider in providers)]
     return sorted(found)
 
 
