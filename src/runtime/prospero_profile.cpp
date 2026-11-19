@@ -190,9 +190,9 @@ bool IsProsperoEnvironmentEntry(std::string_view name, std::string_view value) {
     if (!((c >= 'A' && c <= 'Z') || c == '_' || (i > 0 && c >= '0' && c <= '9'))) return false;
   }
   const auto starts = [&](std::string_view prefix) { return name.size() > prefix.size() && name.substr(0, prefix.size()) == prefix; };
-  // WINE_LARGE_ADDRESS_AWARE and PW_NSIPROXY_DISABLE (0 or 1) and the open-file budgets (up to four digits) only for a
-  // title whose kit has wine-large-address-aware, nsiproxy-switch or environment-file-budgets: BuildEffectiveSettings
-  // checks that.
+  // WINE_LARGE_ADDRESS_AWARE and PW_NSIPROXY_DISABLE (0 or 1), WINE_NTOSKRNL_HOSTED (1 only), and the open-file
+  // budgets (up to four digits) only for a title whose kit has the matching capability: BuildEffectiveSettings checks.
+  if (name == "WINE_NTOSKRNL_HOSTED") return value == "1";
   const bool zero_or_one = name == "WINE_LARGE_ADDRESS_AWARE" || name == "PW_NSIPROXY_DISABLE";
   const bool file_budget = name == "WINE_" PLAYDEN_CONSOLE_NAME "_PARK_FILES" || name == "WINE_" PLAYDEN_CONSOLE_NAME "_CACHED_FILES";
   if (zero_or_one) return value == "0" || value == "1";
