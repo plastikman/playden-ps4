@@ -292,7 +292,7 @@ int main(int argc, char** argv) {
   // Touchpad hold: the menu preset a touchpad hold swaps to, without a launcher ([launcher] chain = off). Only with the
   // kit and a title on its runtime; Start through a launcher has its own switch and wins.
   {
-    const auto touchpad_kit = KitCapabilitiesFromManifest({kKitTouchpadSwitch, kKitLauncherMode}, false);
+    const auto touchpad_kit = KitCapabilitiesFromManifest({kKitTouchpadSwitch, kKitLauncherMode, kKitInputTouchpad}, false);
     CHECK(touchpad_kit.touchpad_switch && !KitCapabilitiesFromManifest({kKitLauncherMode}, false).touchpad_switch);
     const auto older_title = KitForTitleRuntime(touchpad_kit, false);
     CHECK(!older_title.touchpad_switch && older_title.touchpad_switch_needs_update);
@@ -303,15 +303,15 @@ int main(int argc, char** argv) {
     // On: the game keeps its own [input]; the menu preset is written out, with the D-pad as arrows and Triangle as Esc.
     CHECK(BuildEffectiveSettings(hl2, nullptr, {{"touchpad_hold", "mouse"}}, touchpad_kit, &settings, &error));
     CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
-    CHECK(profile.text.find("\n[launcher]\nchain = off\nlabel = Mouse\ngame_label = Game controls\nmode = keyboard\n"
-                            "mouse = left_stick\nmouse_speed = 900\ncross = mouse_left\ncircle = mouse_right\n"
-                            "square = mouse_middle\ntriangle = escape\nl2 = mouse_right\nr2 = mouse_left\nup = up\n"
-                            "down = down\nleft = left\nright = right\noptions = enter\n") != std::string::npos);
+    CHECK(profile.text.find("\n[launcher]\nchain = off\nlabel = Touchpad mouse\ngame_label = Game controls\nmode = keyboard\n"
+                            "mouse = touchpad\ncircle = mouse_right\nsquare = mouse_middle\ntriangle = escape\n"
+                            "l2 = mouse_right\nr2 = mouse_left\nup = up\ndown = down\nleft = left\nright = right\n"
+                            "options = enter\ntouchpad = mouse_left\n") != std::string::npos);
     CHECK(profile.text.find("\n[input]\nmode = xinput\nmouse = none\n") != std::string::npos);
     CHECK(BuildEffectiveSettings(hl2, nullptr, {{"touchpad_hold", "mouse"}, {"controller_preset", "gamepad"}}, touchpad_kit,
                                  &settings, &error));
     CHECK(RenderProsperoProfile(hl2, settings, target, &profile, &reason));
-    CHECK(profile.text.find("\n[launcher]\nchain = off\nlabel = Mouse\ngame_label = Gamepad\n") != std::string::npos);
+    CHECK(profile.text.find("\n[launcher]\nchain = off\nlabel = Touchpad mouse\ngame_label = Gamepad\n") != std::string::npos);
     // Start through a launcher: one section, the launcher's, and the row says why it is off.
     CHECK(BuildEffectiveSettings(hl2, nullptr, {{"touchpad_hold", "mouse"}, {"start_through_launcher", "on"}}, touchpad_kit,
                                  &settings, &error));
