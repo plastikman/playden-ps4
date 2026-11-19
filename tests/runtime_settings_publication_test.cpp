@@ -99,6 +99,29 @@ struct Test {
   }
   PackageActionResult Run() { return PublishSettingsOperation(operation, paths, deps); }
 };
+void WritePrivate(const fs::path& path, const std::string& bytes) {
+  std::ofstream file(path, std::ios::binary); file.write(bytes.data(), bytes.size()); file.close();
+  CHECK(file.good() && chmod(path.c_str(), 0600) == 0);
+}
+std::string CaptureFailure(Test& t, const std::string& receipt, const std::string& metadata,
+                           const std::string& descriptor) {
+  const auto profiles = t.root / "data/playden/games/install-220/library/profiles";
+  fs::create_directories(profiles); CHECK(chmod(profiles.c_str(), 0700) == 0);
+  const auto receipt_path = t.control / "publication-state.v1";
+  WritePrivate(receipt_path, receipt);
+  if (!metadata.empty()) WritePrivate(profiles / ".playden-publication", metadata);
+  if (!descriptor.empty()) WritePrivate(t.paths.descriptor, descriptor);
+  auto directory = playden::platform::ManagedDirectory::Open(t.control, playden::platform::DirectoryPolicy::kPrivate);
+  CHECK(directory);
+  auto lease = playden::platform::ManagedFileLock::Acquire(*directory, "publication.lock",
+      playden::platform::LockMode::kPublisher);
+  CHECK(lease);
+  const auto before = Read(receipt_path);
+  auto result = CaptureSettingsPublicationOperation(t.operation.install, t.operation.plan, t.operation.kit_id,
+      "00000000-0000-7000-8000-000000000003", 1760000000, lease->fd(), t.root);
+  CHECK(!result.ok() && Read(receipt_path) == before);
+  return result.message();
+}
 struct OwnerPackage final : PackageInstaller {
   PackageStatus status{true, true, true, true, true, true, true, false, 0};
   unsigned mutations = 0;
@@ -156,6 +179,20 @@ void SeedOwner(RuntimeInstallRepository& repository, const RuntimeInstall& r, bo
   CHECK(repository.Update(owned).ok());
 }
 int main() {
+  {
+    Test t;
+    CHECK(CaptureFailure(t, "invalid receipt", {}, {}).find("receipt is corrupt or unavailable") != std::string::npos);
+    CHECK(CaptureFailure(t, t.operation.pending_receipt_bytes, {}, {}).find("receipt is not committed") != std::string::npos);
+    CHECK(CaptureFailure(t, t.operation.committed_receipt_bytes, {}, {}).find("publication metadata is missing") != std::string::npos);
+    CHECK(CaptureFailure(t, t.operation.committed_receipt_bytes, t.operation.metadata_bytes, {}).find("game descriptor:") != std::string::npos);
+    auto wrong_app = t.operation.descriptor_bytes;
+    const auto app_id = wrong_app.find("\"app_id\":220"); CHECK(app_id != std::string::npos);
+    wrong_app.replace(app_id, std::strlen("\"app_id\":220"), "\"app_id\":221");
+    CHECK(CaptureFailure(t, t.operation.committed_receipt_bytes, t.operation.metadata_bytes, wrong_app)
+          .find("descriptor app id does not match") != std::string::npos);
+    CHECK(CaptureFailure(t, t.operation.committed_receipt_bytes, t.operation.metadata_bytes,
+                         t.operation.descriptor_bytes).find("published contents:") != std::string::npos);
+  }
   {
     Test t; auto missing = t.deps; missing.verify_files = {};
     CHECK(PublishSettingsOperation(t.operation, t.paths, missing).state == PackageActionState::kFailed && t.blocks == 0);
