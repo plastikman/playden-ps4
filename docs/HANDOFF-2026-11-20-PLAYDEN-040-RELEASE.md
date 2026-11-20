@@ -2,9 +2,9 @@
 
 ## Current state
 
-The release work is on branch `codex/ps4-v0.4.0-release`, currently at
-`ae198ba5` (one local commit ahead of the pushed branch). It is rebased on
-current `origin/main`. The branch sets `ps4/VERSION` to `0.4.0`, package
+The release work is on branch `codex/ps4-v0.4.0-release`, at
+`c0d001b633658a6cdb4ac9f3d4beba5ef4a27f0f`, pushed to `origin`. It is based
+on current `origin/main`. The branch sets `ps4/VERSION` to `0.4.0`, package
 APP_VER to `02.99`, and pins Prosper-Win to published commit
 `eaccec6d3382fa4ab61e35d8cc72908aa67ac164`.
 
@@ -36,32 +36,40 @@ already carried the fix, so no new Orbis-Win release is needed. The Playden
 parity command now passes `--upstream-root "$PW_ABI4_ROOT/source"` and fails
 early if the runner did not set `PW_ABI4_ROOT`.
 
-## Playden 02.99 build result
+## Playden 02.99 release result
+
+The hosted workflow `44763828090` completed successfully on
+`c0d001b633658a6cdb4ac9f3d4beba5ef4a27f0f`. It built and published the
+public, non-prerelease GitHub release [`ps4-v0.4.0`](https://github.com/plastikman/playden-ps4/releases/tag/ps4-v0.4.0)
+with Orbis-Win v0.0.8 (02.98). The release includes the installer and build
+manifest. The manifest records package SHA-256
+`50033a5d0a6661f652b7326e5ee6787bc989ab2c30bee4a0cc60357651279fa1` and
+Orbis-Win package SHA-256
+`6932b8532766a33afca2a386697a62b8a6c95cc2c46802fc38f185c8edb8d3bf`.
 
 A local rebuild from this branch passed PkgTool validation and parity with
 **0 hard failures**. The parity report still warns that matching
 `ntdll.shared.elf` and `wineserver.shared.elf` are unavailable, so those
-export/signal-mask checks are skipped. The package uses the locked v0.0.8
+export/signal-mask checks are skipped. The hosted build used the locked v0.0.8
 Orbis-Win package.
 
 Artifacts are under
 `/home/zpeirce/ps4-package-scratch/playden040-gatefix/`:
 
 - Installer: `IV0000-PLDN10001_00-PLDN100010000000.pkg`
-- SHA-256: `840b0c2db7fbc2f1f6ff710c50aaf188d4916c40a151a7889ca1a0fdd986d40f`
-- Playden source commit: `ae198ba5b923f242544b7dcb5a400b0f6efb30f4`
+- Local rebuild SHA-256: `840b0c2db7fbc2f1f6ff710c50aaf188d4916c40a151a7889ca1a0fdd986d40f`
+- Hosted release SHA-256: `50033a5d0a6661f652b7326e5ee6787bc989ab2c30bee4a0cc60357651279fa1`
+- Playden source commit: `c0d001b633658a6cdb4ac9f3d4beba5ef4a27f0f`
 - PkgTool validation: all `[OK]`
 - Parity: `hard gates passed: 0 FAIL`
 
-This package has not been installed or published. The hosted workflow did not
-upload an artifact because its earlier run failed.
+The installer filename is `IV0000-PLDN10001_00-PLDN100010000000.pkg`.
 
-## Next step
+## Follow-up
 
-Transfer this corrected branch/build through the usual review path, then
-install and hardware-test this exact Playden package before publishing
-`ps4-v0.4.0`. No Orbis-Win package version or lock update is needed for this
-source-path correction.
+The release is published. Hardware installation and game testing remain to be
+done; the user has not yet reported testing this release. No Orbis-Win package
+version or lock update was needed for the source-path correction.
 
 The Orbis-Win source cache under
 `/home/zpeirce/codex_scratch/abi4-upstream-port-20261104/source` remains dirty
