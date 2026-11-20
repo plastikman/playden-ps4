@@ -106,7 +106,8 @@ pkg="$PLAYDEN_BUILD/package/IV0000-PLDN10001_00-PLDN100010000000.pkg"
 cp "$pkg" "$OUT/"
 cp "$PLAYDEN_BUILD/pkg-stage/runtime-manifest.txt" "$OUT/runtime-manifest.txt"
 echo "== PkgTool validation"
-"$SDK_ROOT/sdk/bin/linux/PkgTool.Core" pkg_validate "$OUT/$(basename "$pkg")" |
+DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+    "$SDK_ROOT/sdk/bin/linux/PkgTool.Core" pkg_validate "$OUT/$(basename "$pkg")" |
     tee "$OUT/pkg_validate.txt"
 if grep -qvE '^(\[OK\]|$)' "$OUT/pkg_validate.txt"; then
     die "PkgTool validation reported a non-OK line"

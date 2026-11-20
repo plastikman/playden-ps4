@@ -167,7 +167,7 @@ jobs:
           - **Runtime-kit capability parity:** includes the profile and recipe updates for environment variables, audio volume, Steam library paths, controller input, Zink, and the runtime-kit view. Prosper-Win is pinned to published commit eaccec6d.
           - **Touchpad launcher input:** the PS4 touchpad provides pointer movement and click input for launcher configuration screens.
           - **Safer game-test reporting and local imports:** reporting requires an explicit endpoint in `/data/PLDN10001/features.txt`; local game import remains behind its feature flag.
-          - **Experimental Steam Online play:** Steam sign-in handoff, friends, lobby invites and online game settings. Online play remains off unless \`online-steam\` is listed in \`features.txt\`. Local-network sessions have been tested; internet peer-to-peer play is still experimental and has not been validated on-console. See the [online play notes](https://github.com/plastikman/playden-ps4/blob/ps4-v0.3.0/docs/online-play.md).
+          - **Experimental Steam Online play:** Steam sign-in handoff, friends, lobby invites and online game settings. Online play remains off unless \`online-steam\` is listed in \`features.txt\`. Local-network sessions have been tested; internet peer-to-peer play is still experimental and has not been validated on-console. See the [online play notes](https://github.com/plastikman/playden-ps4/blob/ps4-v0.3.1/docs/online-play.md).
 
           ### Known issues
 
