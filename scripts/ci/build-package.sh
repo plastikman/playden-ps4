@@ -51,14 +51,16 @@ checkout_commit=$(git -C "$ORBIS_WIN_ROOT" rev-parse HEAD)
 # The compact v0.0.6 tested-stage manifest binds the downloaded package by
 # package_sha256 and records runtime_source_commit/stage digests. Enrich the
 # extracted copy with the runner inputs and exact extracted-file hashes that
-# build-ps4-runtime.sh expects from a full source rebuild manifest.
+# build-ps4-runtime.sh expects from a full source rebuild manifest. The host
+# Wine path is specific to the current runner; never trust the workstation path
+# recorded in a published Orbis-Win manifest.
 manifest="$WORK/orbis-win/BUILD-MANIFEST.txt"
-if ! grep -q '^host_wine=' "$manifest"; then
-    : "${PLAYDEN_HOST_WINE_ROOT:?set PLAYDEN_HOST_WINE_ROOT to the runner cached Wine prefix}"
-    [[ -x "$PLAYDEN_HOST_WINE_ROOT/install/usr/bin/wine" ]] ||
-        die "runner host Wine is missing: $PLAYDEN_HOST_WINE_ROOT/install/usr/bin/wine"
-    printf 'host_wine=%s\n' "$PLAYDEN_HOST_WINE_ROOT" >> "$manifest"
-fi
+: "${PLAYDEN_HOST_WINE_ROOT:?set PLAYDEN_HOST_WINE_ROOT to the runner cached Wine prefix}"
+[[ -x "$PLAYDEN_HOST_WINE_ROOT/install/usr/bin/wine" ]] ||
+    die "runner host Wine is missing: $PLAYDEN_HOST_WINE_ROOT/install/usr/bin/wine"
+sed '/^host_wine=/d' "$manifest" > "$manifest.host-wine"
+printf 'host_wine=%s\n' "$PLAYDEN_HOST_WINE_ROOT" >> "$manifest.host-wine"
+mv "$manifest.host-wine" "$manifest"
 provenance_mode=$(sed -n 's/^provenance_mode=//p' "$manifest")
 if [[ "$provenance_mode" != release-package-only ]] && ! grep -q '^prospero_win_abi4_commit=' "$manifest"; then
     runtime_commit=$(sed -n 's/^runtime_source_commit=//p' "$manifest")
