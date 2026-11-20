@@ -65,13 +65,31 @@ jobs:
           # libx11-6/libxext6: the host Wine that makes the prefix template loads its X11 driver.
           sudo apt-get install -y \
             build-essential clang-19 lld-19 llvm-19 cmake ninja-build git python3 curl perl \
-            xz-utils bzip2 gh libx11-6 libxext6
+            xz-utils bzip2 zstd 7zip gh libx11-6 libxext6
           for tool in clang clang++ lld ld.lld llvm-ar llvm-ranlib llvm-nm \
                       llvm-objcopy llvm-readelf llvm-strip; do
             sudo ln -sfn "/usr/bin/${tool}-19" "/usr/local/bin/$tool"
           done
           clang --version | grep -q 'version 19\.1\.7' || {
             echo "clang must be 19.1.7 to match the validated workstation build" >&2; exit 1; }
+
+      - name: Download and verify runtime-kit payloads
+        env:
+          PAYLOAD_DIR: ${{ runner.temp }}/runtime-kit-payloads
+        run: |
+          set -euo pipefail
+          mkdir -p "$PAYLOAD_DIR/wine-mono-11.3.0"
+          curl --fail --location --proto '=https' --tlsv1.2 -sS \
+            -o "$PAYLOAD_DIR/wine-mono-11.3.0-x86.msi" \
+            https://dl.winehq.org/wine/wine-mono/11.3.0/wine-mono-11.3.0-x86.msi
+          echo 'df2dfc1665c2511882e7cabd56eafd0c0a3d94e5a7e86f969277f6c189d418d3  '"$PAYLOAD_DIR/wine-mono-11.3.0-x86.msi" | sha256sum --check
+          7z x -y "$PAYLOAD_DIR/wine-mono-11.3.0-x86.msi" \
+            "-o$PAYLOAD_DIR/wine-mono-11.3.0" > "$PAYLOAD_DIR/wine-mono-extract.log"
+          curl --fail --location --proto '=https' --tlsv1.2 -sS \
+            -o "$PAYLOAD_DIR/vkd3d-proton-3.1.tar.zst" \
+            https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v3.1/vkd3d-proton-3.1.tar.zst
+          echo 'b85ea8219b71093a3924913dd7aae6172333dc0c069983ed510816d67f02120b  '"$PAYLOAD_DIR/vkd3d-proton-3.1.tar.zst" | sha256sum --check
+          tar --zstd -xf "$PAYLOAD_DIR/vkd3d-proton-3.1.tar.zst" -C "$PAYLOAD_DIR"
 
       - name: Resolve the version and the Orbis-Win package
         id: orbis
@@ -131,10 +149,10 @@ jobs:
           PS4_PKGTOOL_OPENSSL_LIB: /orbis-cache/deps/openssl11/lib
           PLAYDEN_MESA_COMMIT: 0ec293c29f9735ee462eff0d9a9316481d741afa
           PLAYDEN_HOST_WINE_ROOT: /home/zpeirce/codex_scratch/abi4-upstream-port-20261104/source/.deps/wine-host
-          WINE_MONO_DIR: /home/zpeirce/codex_scratch/wine-mono-extract-11.3.0
+          WINE_MONO_DIR: ${{ runner.temp }}/runtime-kit-payloads/wine-mono-11.3.0
           WINE_MONO_VERSION: "11.3.0"
           WINE_MONO_TREE_SHA256: 7aee0067e7aa6a43743e0b0da647d7ab6c892c7dbd288ed76f9763fc92efbaa1
-          VKD3D_PROTON_DIR: /home/zpeirce/codex_scratch/vkd3d-proton-3.1/vkd3d-proton-3.1
+          VKD3D_PROTON_DIR: ${{ runner.temp }}/runtime-kit-payloads/vkd3d-proton-3.1
           VKD3D_PROTON_VERSION: "3.1"
           VKD3D_PROTON_TREE_SHA256: e27aac172c62f3599ebc56f333d70ffd250b555aa0beaeb77ad81901206448c3
           VKD3D_PROTON_QUALIFIED: "0"

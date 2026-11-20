@@ -15,10 +15,14 @@ This release build pins the earlier verified payloads:
   `e27aac172c62f3599ebc56f333d70ffd250b555aa0beaeb77ad81901206448c3`
 - vkd3d-proton remains unqualified for D3D12 gameplay (`vkd3d_proton_qualified=0`).
 
-The workflow now provides both pinned inputs, validates their hashes, checks
-for the staged Mono and 32/64-bit vkd3d-proton files, and copies their versions
-and hashes into the public build manifest. The release notes distinguish
-payload presence from hardware qualification.
+The workflow downloads and verifies the upstream Wine Mono MSI and official
+vkd3d-proton archive by archive SHA-256, then checks the extracted tree hashes.
+It checks for the staged Mono and 32/64-bit vkd3d-proton files, and copies
+their versions and hashes into the public build manifest. The release notes
+distinguish payload presence from hardware qualification.
+
+- Wine Mono MSI SHA-256: `df2dfc1665c2511882e7cabd56eafd0c0a3d94e5a7e86f969277f6c189d418d3`
+- vkd3d-proton archive SHA-256: `b85ea8219b71093a3924913dd7aae6172333dc0c069983ed510816d67f02120b`
 
 ## Build status
 
