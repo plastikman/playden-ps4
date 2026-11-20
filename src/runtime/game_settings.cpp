@@ -1739,7 +1739,11 @@ bool RenderProsperoProfile(const GameRecipe& recipe, const EffectiveSettings& se
   features.display_framegen = display_framegen;
   features.display_fps_counter = fps_counter;
   features.input_playstation = value("controller") == "playstation";
-  features.input_touchpad = value("pointer_stick") == "touchpad";
+  // The kit capability, not this game's pointer stick: the touchpad_hold section below writes
+  // "mouse = touchpad" into [launcher] whatever the game's own stick is, so deriving the flag
+  // from pointer_stick made Playden reject the line it had just written -- "generated profile
+  // is invalid: mouse: unknown pointer stick" -- for every game not already on the touchpad.
+  features.input_touchpad = settings.input_touchpad || value("pointer_stick") == "touchpad";
   features.input_keyboard_stick = keyboard_stick;
   features.runtime_version = settings.profile_version == 2;
   // BuildEffectiveSettings let arguments past 512 bytes through only for a runtime that takes them; such a runtime

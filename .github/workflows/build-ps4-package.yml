@@ -15,11 +15,11 @@ on:
           APP_VER as NN.NN (e.g. 02.07). Required: a number never used before, always
           increasing, so the console shows which build is installed.
         required: true
-        default: "02.90"
+        default: "02.99"
       orbis_win_tag:
         description: >-
-          Orbis-Win release to build on. Playden 0.3.1 targets the audio-fixed v0.0.7 runtime.
-        default: "v0.0.7"
+          Orbis-Win release to build on. Playden 0.4.0 uses the tested v0.0.8 runtime package.
+        default: "v0.0.8"
       publish_release:
         description: >-
           Also publish a GitHub release tagged v<ps4/VERSION> (title: the tag) with the package
@@ -84,17 +84,29 @@ jobs:
           [[ "$INPUT_VERSION" =~ ^[0-9]{2}\.[0-9]{2}$ ]] || {
             echo "package version '$INPUT_VERSION' must be NN.NN, e.g. 02.07" >&2; exit 1; }
           echo "PKG_VERSION=$INPUT_VERSION" >> "$GITHUB_ENV"
-          if [[ -n "$ORBIS_WIN_TAG" ]]; then
+          if [[ "$ORBIS_WIN_TAG" == "v0.0.8" ]]; then
+            lock="playden/scripts/ci/orbis-win-v0.0.8.lock"
+            dir="$RUNNER_TEMP/orbis-win-package"
+            mkdir -p "$dir"
+            package=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["package"])' "$lock")
+            gh release download "$ORBIS_WIN_TAG" -R plastikman/orbis-win -D "$dir" -p "$package"
+            root_commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["root_commit"])' "$lock")
+            echo "ORBIS_WIN_PKG_DIR=$dir" >> "$GITHUB_ENV"
+            echo "ORBIS_WIN_PACKAGE_LOCK=$GITHUB_WORKSPACE/$lock" >> "$GITHUB_ENV"
+            echo "ORBIS_WIN_RUNTIME_REVISION=$ORBIS_WIN_TAG" >> "$GITHUB_ENV"
+            echo "ORBIS_WIN_PACKAGE_TAG=$ORBIS_WIN_TAG" >> "$GITHUB_ENV"
+          elif [[ -n "$ORBIS_WIN_TAG" ]]; then
             dir="$RUNNER_TEMP/orbis-win-manifest"
             gh release download "$ORBIS_WIN_TAG" -R plastikman/orbis-win -D "$dir" -p 'BUILD-MANIFEST*.txt'
             manifest=$(ls "$dir"/BUILD-MANIFEST*.txt)
+            root_commit=$(sed -n 's/^root_commit=//p' "$manifest")
             echo "ORBIS_WIN_TAG=$ORBIS_WIN_TAG" >> "$GITHUB_ENV"
           else
             manifest=$(ls "$ORBIS_WIN_CACHED_PKG"/BUILD-MANIFEST*.txt)
+            root_commit=$(sed -n 's/^root_commit=//p' "$manifest")
             echo "ORBIS_WIN_PKG_DIR=$ORBIS_WIN_CACHED_PKG" >> "$GITHUB_ENV"
           fi
-          root_commit=$(sed -n 's/^root_commit=//p' "$manifest")
-          [[ "$root_commit" =~ ^[0-9a-f]{40}$ ]] || { echo "no root_commit in $manifest" >&2; exit 1; }
+          [[ "$root_commit" =~ ^[0-9a-f]{40}$ ]] || { echo "no root_commit for Orbis-Win $ORBIS_WIN_TAG" >&2; exit 1; }
           echo "root_commit=$root_commit" >> "$GITHUB_OUTPUT"
           echo "Orbis-Win package from ${ORBIS_WIN_TAG:-$ORBIS_WIN_CACHED_PKG}, built from $root_commit"
 
@@ -147,12 +159,19 @@ jobs:
           cp "$OUT/BUILD-MANIFEST.txt" "$OUT/BUILD-MANIFEST-$APP_VER.txt"
           package_sha=$(sed -n 's/^package_sha256=//p' "$OUT/BUILD-MANIFEST.txt")
           cat > "$OUT/RELEASE-NOTES.md" <<EOF
-          ## What's new in Playden for PS4 v0.3.1
+          ## What's new in Playden for PS4 v0.4.0
 
           - **Game test reports require an explicit endpoint.** Reporting is off unless \`/data/PLDN10001/features.txt\` contains \`game-test-reports=https://your-report-api\`. Reports are sent only to that endpoint; there is no default destination.
           - **Import games is available behind a feature flag.** Add \`import-games\` to \`/data/PLDN10001/features.txt\` to show the local import workflow.
-          - **Updated Orbis-Win runtime:** uses v0.0.7, including the audio endpoint reload fix that prevents saved device names from accumulating repeated labels.
+          - **Updated Orbis-Win runtime:** uses the tested v0.0.8 package (runtime build 02.98), including the PS4 Vulkan shared-resource fix, 32-bit executable-page fix, and updated profile handling.
+          - **Runtime-kit capability parity:** includes the profile and recipe updates for environment variables, audio volume, Steam library paths, controller input, Zink, and the runtime-kit view. Prosper-Win is pinned to published commit eaccec6d.
+          - **Touchpad launcher input:** the PS4 touchpad provides pointer movement and click input for launcher configuration screens.
+          - **Safer game-test reporting and local imports:** reporting requires an explicit endpoint in `/data/PLDN10001/features.txt`; local game import remains behind its feature flag.
           - **Experimental Steam Online play:** Steam sign-in handoff, friends, lobby invites and online game settings. Online play remains off unless \`online-steam\` is listed in \`features.txt\`. Local-network sessions have been tested; internet peer-to-peer play is still experimental and has not been validated on-console. See the [online play notes](https://github.com/plastikman/playden-ps4/blob/ps4-v0.3.0/docs/online-play.md).
+
+          ### Known issues
+
+          Some titles still fail or stall under the PS4 runtime. In the Orbis-Win 02.98 console suite, Hollow Knight and Risk of Rain 2 render but stall during startup; Left 4 Dead 2 and Splinter Cell: Conviction remain on the loading spinner; The Binding of Isaac exits before its first rendered frame; and MDK has visual corruption. See the [Orbis-Win v0.0.8 notes](https://github.com/plastikman/orbis-win/releases/tag/v0.0.8) for the full test record.
 
           This package is **$APP_VER**, built with Orbis-Win **${ORBIS_WIN_TAG}**.
 
@@ -164,9 +183,6 @@ jobs:
           EOF
           gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes-file "$OUT/RELEASE-NOTES.md" \
             "${pkg[0]}" "$OUT/BUILD-MANIFEST-$APP_VER.txt"
-          if [[ "$tag" == "ps4-v0.3.1" ]] && gh release view ps4-v0.3.0 -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release delete ps4-v0.3.0 -R "$GITHUB_REPOSITORY" --cleanup-tag --yes
-          fi
 
       - uses: actions/upload-artifact@v4
         with:

@@ -59,13 +59,14 @@ if ! grep -q '^host_wine=' "$manifest"; then
         die "runner host Wine is missing: $PLAYDEN_HOST_WINE_ROOT/install/usr/bin/wine"
     printf 'host_wine=%s\n' "$PLAYDEN_HOST_WINE_ROOT" >> "$manifest"
 fi
-if ! grep -q '^prospero_win_abi4_commit=' "$manifest"; then
+provenance_mode=$(sed -n 's/^provenance_mode=//p' "$manifest")
+if [[ "$provenance_mode" != release-package-only ]] && ! grep -q '^prospero_win_abi4_commit=' "$manifest"; then
     runtime_commit=$(sed -n 's/^runtime_source_commit=//p' "$manifest")
     [[ "$runtime_commit" =~ ^[0-9a-f]{40}$ ]] ||
         die "tested-stage manifest has no exact runtime_source_commit"
     printf 'prospero_win_abi4_commit=%s\n' "$runtime_commit" >> "$manifest"
 fi
-if ! grep -q '^prospero_win_abi4_diff_sha256=' "$manifest"; then
+if [[ "$provenance_mode" != release-package-only ]] && ! grep -q '^prospero_win_abi4_diff_sha256=' "$manifest"; then
     stage=$(sed -n 's/^stage=//p' "$manifest")
     release_version=$(sed -n 's/^release_version=//p' "$manifest")
     base_hash=$(sed -n 's/^base_package_sha256=//p' "$manifest")
@@ -99,10 +100,22 @@ echo "== PLDN10001 $PKG_VERSION"
 ORBIS_WIN_RELEASE="$WORK/orbis-win" DXVK_262_DIR="$WORK/dxvk-2.6.2/x32" \
     "$ROOT/scripts/build-ps4-runtime.sh"
 
-pkg="$ROOT/build/ps4-runtime/package/IV0000-PLDN10001_00-PLDN100010000000.pkg"
+PLAYDEN_BUILD="${PLAYDEN_PS4_BUILD_DIR:-$ROOT/build/ps4-runtime}"
+pkg="$PLAYDEN_BUILD/package/IV0000-PLDN10001_00-PLDN100010000000.pkg"
 [[ -s "$pkg" ]] || die "no package at $pkg"
 cp "$pkg" "$OUT/"
-cp "$ROOT/build/ps4-runtime/pkg-stage/runtime-manifest.txt" "$OUT/runtime-manifest.txt"
+cp "$PLAYDEN_BUILD/pkg-stage/runtime-manifest.txt" "$OUT/runtime-manifest.txt"
+echo "== PkgTool validation"
+"$SDK_ROOT/sdk/bin/linux/PkgTool.Core" pkg_validate "$OUT/$(basename "$pkg")" |
+    tee "$OUT/pkg_validate.txt"
+if grep -qvE '^(\[OK\]|$)' "$OUT/pkg_validate.txt"; then
+    die "PkgTool validation reported a non-OK line"
+fi
+echo "== Orbis-Win payload parity"
+python3 "$ORBIS_WIN_ROOT/scripts/check-ps4-package-parity.py" \
+    "$WORK/orbis-win/app/pkg-stage" "$PLAYDEN_BUILD/pkg-stage" \
+    --elf-dir "$PLAYDEN_BUILD/prx" --upstream-root "$ORBIS_WIN_ROOT/prospero-win" |
+    tee "$OUT/package-parity.txt"
 {
     echo "title_id=PLDN10001"
     echo "version=$PKG_VERSION"
@@ -111,7 +124,10 @@ cp "$ROOT/build/ps4-runtime/pkg-stage/runtime-manifest.txt" "$OUT/runtime-manife
     echo "playden_commit=$(git -C "$ROOT" rev-parse HEAD)"
     echo "playden_status=$(git -C "$ROOT" status --porcelain --untracked-files=no | sha256sum | cut -c1-64)"
     echo "orbis_win_root_commit=$root_commit"
-    sed -n -e 's/^orbis_win_source=/&/p' -e 's/^package_sha256=/orbis_win_&/p' -e 's/^title_id=/orbis_win_&/p' \
+    sed -n -e 's/^orbis_win_source=/&/p' -e 's/^release_tag=/orbis_win_&/p' \
+        -e 's/^provenance_mode=/orbis_win_&/p' -e 's/^app_version=/orbis_win_&/p' \
+        -e 's/^runtime_build_marker=/orbis_win_&/p' -e 's/^package_sha256=/orbis_win_&/p' \
+        -e 's/^title_id=/orbis_win_&/p' \
         "$WORK/orbis-win/BUILD-MANIFEST.txt"
     echo "dxvk_sha256=$dxvk_sha256"
     git -C "$ROOT" submodule status third_party/prospero-win third_party/ps5-homebrew-ui | sed 's/^/submodule /'

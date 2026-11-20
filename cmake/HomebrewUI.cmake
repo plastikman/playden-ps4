@@ -828,6 +828,9 @@ if(BUILD_TESTING)
     add_test(NAME collect_logs COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_collect_logs.py")
     add_test(NAME kit_module_diff COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_kit_module_diff.py")
     add_test(NAME build_kit_cross COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_build_kit_cross.py")
+    add_test(NAME ps4_kit_view_capabilities COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_ps4_kit_view.py")
+    set_tests_properties(ps4_kit_view_capabilities PROPERTIES
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
     add_test(NAME ui_comparison_fixture
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/verify_ui_comparison.py"
             "${CMAKE_SOURCE_DIR}/fixtures/ui-comparison")

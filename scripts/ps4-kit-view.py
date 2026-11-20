@@ -182,7 +182,18 @@ NEVER_CLAIM = {
         "cannot be handed the Wine-server socket the PS5 helper's SendFd() design depends on. "
         "See docs/HANDOFF-2026-11-18-PS4-NATIVE-STEAM.md.",
     "title-notify": "Needs Leo's pw_title_notify.h, which we do not have; also dead without helper-process.",
-    "launcher-mode": "PS4 runtime supports [launcher] chain = off for manual input switching, not automatic exec-chain mode.",
+    "launcher-mode":
+        "PS4 runtime supports [launcher] chain = off for manual input switching, not automatic "
+        "exec-chain mode (sceSystemServiceLoadExec is sequential, the opposite of what chaining "
+        "needs). Claiming it does not just disable one row, it REFUSES EVERY PROFILE THAT USES "
+        "IT: with start_through_launcher available and on, game_settings.cpp writes a [launcher] "
+        "section WITHOUT a chain = off line, and pw_game_profile.c answers PW_ERR_UNSUPPORTED to "
+        "any [launcher] section that is not chain = off, which fails the whole parse -- the way "
+        "an unparsed [audio] section lost Mafia's volume on 01.26, but for every game given a "
+        "launcher preset. Only the touchpad_hold branch emits chain = off, and it is written to "
+        "be mutually exclusive with the launcher branch ('!launcher_section &&'), which is why "
+        "touchpad-switch is safe to claim on its own while this stays refused until the runtime "
+        "can really chain.",
     "launch-arguments-4096":
         "Raises the WHOLE profile cap to 16KiB, not just arguments; our buffers are still the old tier "
         "(PW_APP_ARGUMENTS_CAPACITY 513, PW_APP_PROFILE_MAX_BYTES 8192).",

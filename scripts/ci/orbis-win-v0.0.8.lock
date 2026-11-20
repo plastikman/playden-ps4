@@ -1,0 +1,11 @@
+{
+  "release": "v0.0.8",
+  "repository": "plastikman/orbis-win",
+  "root_commit": "e2173907c2d4fa9be10f299474ad30b48ac88c90",
+  "package": "IV0000-GLDS10043_00-GLDS100430000000.pkg",
+  "package_sha256": "6932b8532766a33afca2a386697a62b8a6c95cc2c46802fc38f185c8edb8d3bf",
+  "title_id": "GLDS10043",
+  "app_version": "02.98",
+  "runtime_build_marker": "GLDS10043-02.98-guest-sampler-128",
+  "provenance_mode": "release-package-only"
+}

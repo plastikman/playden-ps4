@@ -1591,3 +1591,175 @@ Per the qualification order above, finishing the HL2 setup once and capturing
 that diagnostic is the next step that unblocks the rest. `wine-driver-threads`
 also remains unclaimed: patch 1076's markers are absent from the selected
 runtime and no hosted-driver event has been observed.
+
+## Post-reboot game smoke test and merge audit — 2026-11-19
+
+- After the workstation reboot, the PS4 Remote Play control path was still
+  available through the local `ps5mcp` CLI; a live screenshot captured the
+  console while Duke Nukem Forever Complete was copying. The log receiver was
+  re-armed on TCP 9300 at
+  `/home/zpeirce/junk/codex_scratch/build-ps4-logs/ps5log-20261119-053946.log`.
+- The user reported launching Half-Life 2, Five Nights at Freddy's, and
+  Oblivion before the fresh receiver was armed. Those launches are user-reported
+  in this checkpoint; this receiver did not capture them.
+- Hades (Steam app 1145360) was captured. It started with marker
+  `GLDS10043-02.17-profile-parity`, native WoW64, and the profile feature marker
+  `environment,audio-volume,steam-library-path`. The Steam-path trace resolved
+  `install_dir=Hades` to `/data/PLDN10001/games/1145360` with status 0. Wine
+  loaded `Hades.exe`; the display path reached `frames_put=6` and `vk_shown=69`,
+  and audio `audible` callbacks increased. The log receiver disconnected at
+  05:41:18 without a `guest-exit` record, so clean exit is not established.
+  The full raw log is retained; it includes high-volume `wake_up` diagnostics.
+- Duke Nukem Forever Complete was also captured as local title
+  `local-3ed9a91a-41fd-4ee8-96ce-c80ef495533f`, still on marker
+  `GLDS10043-02.17-profile-parity`. Wine tried
+  `System\DukeForever.exe`, then failed dependency loading: `steam_api.dll`
+  required missing `codex.dll`, `Engine.dll` was missing, and the executable
+  loader returned `c0000135`. `frames_put=0`; the guest returned to Playden
+  with `reason=guest-exit status=0`. This is evidence of an incomplete or
+  mismatched imported game layout, not a runtime or Mono qualification.
+- These launches are useful smoke evidence for the existing package, but its
+  02.17 marker predates the merged Orbis-Win PR #21/#22 code. The runtime build
+  manifest confirms it came from Orbis-Win root commit `db657ef`, while the
+  merged `origin/main` is `79b1ddc`.
+- Current upstream status is precise: Orbis-Win PRs #21 and #22 are merged.
+  Playden PR #4 is merged, but its nine kit-parity follow-up commits remain on
+  `sync/v0.12.0` and are not in Playden `main`. This branch is pushed and nine
+  commits ahead of `origin/main`; there is no open Playden PR. Do not describe
+  the follow-ups as merged.
+- Current next source step: reconcile the merged `79b1ddc` Orbis-Win changes
+  with the profile-enabled Prosper-Win `8604f3b` runtime used by Playden 01.30.
+  Resolve the ABI-v3 `wow64native.dll` build provenance failure rather than
+  copying an unexplained binary into a stage. Preserve all known-good runtime
+  fixes, then build the integrated kit and run the mandatory Playden package
+  parity gate before console installation. The installed 01.30/02.17
+  combination is a smoke-test baseline, not proof of the merged runtime changes.
+- Follow-up artifact audit found an existing merged-source Orbis-Win candidate:
+  `/home/zpeirce/codex_scratch/build-merged-prs-20261118/package-0266/app/IV0000-GLDS10043_00-GLDS100430000000.pkg`, app version 02.66, SHA-256
+  `3db746698c0654c256852110888ac51a8e15e8dc954b14f7259f663eac0408b4`. Its
+  manifest records root commit `79b1ddc` and its readback hash matches. Package
+  validation passes all 28 checks and the baseline parity gate has zero hard
+  failures, with two WARNs because the supplied PRX ELFs do not match the
+  stage. This is a repackage of tested 02.65 plus the rebuilt `ws2_32.prx`.
+  Direct SHA-256 comparison confirms `relocated_wine_app.prx`, `win32u.prx`,
+  and `wineserver.prx` are byte-identical to 02.65. Therefore root commit
+  `79b1ddc` in the manifest does not prove the merged `pw_wine_dmem_glue`
+  sampler change is in the package; the source-diff update was not carried into
+  that app PRX. The archived Wine patches are also not build inputs by
+  themselves; their selected Wine pins must be audited separately. The
+  attempted full source build failed at package staging because the required
+  ABI-v3 `wow64native.dll` was missing. This 02.66 artifact has not been proven
+  installed by the current Hades log, which still reports 02.17, and it does
+  not use Prosper-Win profile commit `8604f3b`; it is not yet the integrated
+  profile-enabled Playden runtime candidate.
+
+## Integrated Playden 01.31 candidate uploaded — 2026-11-19
+
+- The user authorized uploading the candidate for their test. Playden 01.31 is
+  at `/data/pkg/IV0000-PLDN10001_00-PLDN100010000000.pkg` on the PS4
+  (`10.168.2.52`). GoldHEN FTP returned `226` after all 1,493,762,048 bytes;
+  `ftp-size.py` independently reported the same remote size. It has not been
+  installed.
+- Local package:
+  `/home/zpeirce/junk/codex_scratch/runtime-kit-integrated-20261119/playden-0131/IV0000-PLDN10001_00-PLDN100010000000.pkg`
+  SHA-256 `f48709cef86756c537fa4b248e6cf98c6eb71b1548b965bf13c8a4121565d332`.
+  PkgTool validation passed all 28 checks. Provenance: Playden
+  `37951d759d9f366fe12177390b8f0127a7727fd8`, Orbis-Win root
+  `79b1ddc89bf85fd373ea30470d805f087403e7a9`, Prosper-Win
+  `ceddba9de112df765d91c6a4285cc93724d79a4e`, and Mesa
+  `0ec293c29f9735ee462eff0d9a9316481d741afa`.
+- The kit view claims 16 capabilities: display FPS/frame generation,
+  environment file budgets, keyboard stick/rumble/touchpad input, Zink,
+  profile version 2, audio volume, DXVK config, profile environment, Steam
+  library path, any-title support, large-address-aware, Wine Mono, and shared
+  sections. `wine-driver-threads` is not claimed. vkd3d-proton 3.1 is staged
+  but unqualified and unclaimed.
+- The required parity gate against the 03.54 baseline exited 0 with zero hard
+  failures and no missing baseline payloads. It warns that matching
+  `ntdll.shared.elf` and `wineserver.shared.elf` are unavailable, so some
+  export/signal-mask checks were skipped. It also reports absent ntdll
+  disk-space/guest-sampler strings, the win32u scan-code diagnostic, and
+  wineserver async-detail diagnostics. Source archive patches do not prove
+  these changes are present in the packaged modules. The external-memory
+  Win32 provider is present. Full report:
+  `/home/zpeirce/junk/codex_scratch/runtime-kit-integrated-20261119/playden-0131/parity.txt`.
+- No 01.31 console test has happened yet. Earlier user-reported HL2, FNAF,
+  Oblivion, and captured Hades runs were on the 02.17/01.30-era runtime. The
+  user's test and a decision on the parity standard come before further
+  capability claims or builds; package parity is not hardware qualification.
+- The CI wrapper change that selects `PLAYDEN_PS4_BUILD_DIR` is uncommitted in
+  the Playden worktree. It ensured the copied package was the actual 01.31
+  output rather than stale default-build output. Leave untracked dependency
+  symlinks unstaged.
+
+
+## Playden 01.31 Vulkan regression fixed in uploaded 01.32 — 2026-11-19
+
+The 01.31 test package returned to desktop before the spinning dots. The updated
+parity checker identified its `libvulkan.prx` as linked against the wrong, pinned
+`orbis-compat` archive. This is the failure the old checker missed. Do not retest
+01.31. The source failure is consistent with RADV failing to load/render at
+startup; it is no longer an open guess.
+
+Built only the RADV module for 01.32 from the pinned Mesa source
+`0ec293c29f9735ee462eff0d9a9316481d741afa`. The link used the exact SDK bundle
+archive (114,252 bytes, SHA-256
+`a094d04c68650f4338fce5e76a81440267d58ed7b66de0ceaa703b77252a48cd`). A
+scratch copy of the bundle headers received the required PS4 signal ABI delta
+so the compiler safety guard passed; the original bundle and pinned source
+trees were not changed. The resulting `libvulkan.prx` carries
+`ORBIS_THREAD_STACK`, no `orbis_jit`, and its hash is
+`5e021c3a0329aed17063332bafd692d78bfd3de0782605dfde5ff8e0510fc5d4`.
+
+01.32 preserves the 01.31 payload and changes only the Vulkan PRX in both staged
+locations plus the SFO/manifest version and Vulkan hash. Mandatory parity against
+the 03.54 known-good stage exited 0 with 0 FAIL and 0 absent baseline files.
+Existing warnings remain: ntdll/wineserver ELF inputs are missing or do not
+match the stage, and several PS4 diagnostic strings are absent. PkgTool
+validation passed all 28 checks.
+
+The exact installer is
+`IV0000-PLDN10001_00-PLDN100010000000.pkg`, 1,493,762,048 bytes, SHA-256
+`9e348c24a2606766d9e8943660b30ea90ed5fdf8a37f1e015f5231bb694b2d8f`. It is
+uploaded to `/data/pkg/IV0000-PLDN10001_00-PLDN100010000000.pkg`; FTP returned
+226 and the remote size matches. The user must install and validate it on-console;
+this upload is not a hardware pass.
+
+Artifacts and reports are under
+`/home/zpeirce/junk/codex_scratch/runtime-kit-integrated-20261119/radv-0132/`:
+`playden-0132/pkg-stage/`, `playden-0132/parity.txt`,
+`playden-0132/pkg_validate.txt`, and `pwroot/.deps/wine-ps5/prx/`.
+
+## 01.33: Playden runtime profile version support
+
+01.32's Playden kit view advertises `profile-version-2`, so Playden writes
+`[runtime] version = 2` to title profiles. The 01.32 runtime source at `ceddba9`
+did not recognize this field and refused `playden-steam-220.profile` before
+game launch. 01.33 uses Prosper-Win ABI4 commit
+`8604f3b6c38cc8eb273bc8f2079a870e5482ba98`, including patch 0206's support for
+runtime profile versions 1 and 2. Compared with `ceddba9`, the source delta is
+only `src/pw_game_profile.c`; marker: `GLDS10043-02.68-profile-v2`.
+
+Focused neighboring-patch review: 0202–0204 and 0207 are present; 0201's
+relocation behavior is present despite a partial archive-audit match; 0205's
+fixed marker has been superseded by the parameterized runtime marker; and
+patch 0003's module-environment behavior is implemented through
+`start->ps4_setenv`. The broad archive audit spans historical diagnostics and
+multiple source trees, so its absent/partial numbers are not a count of missing
+runtime features. This review focused on Prosper profile/runtime patches, not
+every Wine source tree.
+
+The candidate preserves 01.32's corrected `libvulkan.prx` (SHA-256
+`5e021c3a0329aed17063332bafd692d78bfd3de0782605dfde5ff8e0510fc5d4`). Mandatory
+parity against the 03.54 known-good stage exited 0 with 0 hard failures and 0
+absent baseline files; PkgTool validation passed all 28 checks. Existing
+ntdll/wineserver symbol-input and diagnostic-string warnings remain.
+
+Installer: `IV0000-PLDN10001_00-PLDN100010000000.pkg`, 1,493,827,584 bytes,
+SHA-256 `75d0e9ed4ac66e9d1b33b2d81c563944ff59090689f4c77427c837357e545180`.
+Uploaded to `/data/pkg/IV0000-PLDN10001_00-PLDN100010000000.pkg`; FTP returned
+226 and remote size verified at 1,493,827,584 bytes. Console validation is
+pending: install 01.33, refresh the Playden runtime kit, check that the profile
+is accepted and HL2 appears in the library, then launch.
+
+Build, stage, and reports: `/home/zpeirce/junk/codex_scratch/runtime-kit-integrated-20261119/radv-0132/playden-0133/`.

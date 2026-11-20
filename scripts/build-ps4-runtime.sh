@@ -43,17 +43,13 @@ die() { echo "build-ps4-runtime: $*" >&2; exit 1; }
 PW_SOURCE_COMMIT="${PW_SOURCE_COMMIT:-}"
 RELEASE_MANIFEST="$ORBIS_WIN_RELEASE/BUILD-MANIFEST.txt"
 [[ -f "$RELEASE_MANIFEST" ]] || die "missing release manifest: $RELEASE_MANIFEST"
+PROVENANCE_MODE="$(sed -n 's/^provenance_mode=//p' "$RELEASE_MANIFEST")"
 HOST_WINE_ROOT="$(sed -n 's/^host_wine=//p' "$RELEASE_MANIFEST")"
 [[ "$HOST_WINE_ROOT" == /* ]] || die "release manifest has no absolute host_wine path"
 manifest_diff="$(sed -n 's/^prospero_win_abi4_diff_sha256=//p' "$RELEASE_MANIFEST")"
 empty_diff_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-[[ "$manifest_diff" == "$empty_diff_sha256" ]] ||
-    die "Orbis-Win release contains local changes (prospero_win_abi4_diff_sha256=$manifest_diff)"
 manifest_root_diff="$(sed -n 's/^orbis_win_root_diff_sha256=//p' "$RELEASE_MANIFEST")"
-[[ "$manifest_root_diff" == "$empty_diff_sha256" ]] ||
-    die "Orbis-Win root release contains local changes (orbis_win_root_diff_sha256=${manifest_root_diff:-missing})"
 manifest_commit="$(sed -n 's/^prospero_win_abi4_commit=//p' "$RELEASE_MANIFEST")"
-[[ -n "$manifest_commit" ]] || die "missing exact Orbis-Win source commit from BUILD-MANIFEST.txt"
 manifest_root_commit="$(sed -n 's/^root_commit=//p' "$RELEASE_MANIFEST")"
 [[ -n "$manifest_root_commit" ]] || die "missing exact Orbis-Win root commit from BUILD-MANIFEST.txt"
 actual_root_commit="$(git -C "$ORBIS_WIN_ROOT" rev-parse HEAD)"
@@ -62,16 +58,35 @@ actual_root_commit="$(git -C "$ORBIS_WIN_ROOT" rev-parse HEAD)"
 actual_root_diff="$(git -C "$ORBIS_WIN_ROOT" diff HEAD --binary | sha256sum | awk '{print $1}')"
 [[ "$actual_root_diff" == "$empty_diff_sha256" ]] ||
     die "Orbis-Win root checkout has tracked local changes (sha256=$actual_root_diff)"
-actual_pw_commit="$(git -C "$ORBIS_WIN_ROOT/prospero-win" rev-parse HEAD)"
-[[ "$actual_pw_commit" == "$manifest_commit" ]] ||
-    die "Orbis-Win Prosper-Win checkout $actual_pw_commit does not match release manifest $manifest_commit"
-actual_pw_diff="$(git -C "$ORBIS_WIN_ROOT/prospero-win" diff HEAD --binary | sha256sum | awk '{print $1}')"
-[[ "$actual_pw_diff" == "$empty_diff_sha256" ]] ||
-    die "Orbis-Win Prosper-Win checkout has tracked local changes (sha256=$actual_pw_diff)"
-if [[ -n "$PW_SOURCE_COMMIT" && "$PW_SOURCE_COMMIT" != "$manifest_commit" ]]; then
-    die "PW_SOURCE_COMMIT $PW_SOURCE_COMMIT does not match release manifest commit $manifest_commit"
+if [[ "$PROVENANCE_MODE" == release-package-only ]]; then
+    [[ -n "$(sed -n 's/^release_tag=//p' "$RELEASE_MANIFEST")" ]] || die "package-only manifest lacks release_tag"
+    expected_orbis_pkg="$(sed -n 's/^package_sha256=//p' "$RELEASE_MANIFEST")"
+    [[ "$expected_orbis_pkg" =~ ^[0-9a-f]{64}$ ]] || die "package-only manifest lacks a valid package_sha256"
+    orbis_pkgs=("$ORBIS_WIN_RELEASE"/download/*.pkg)
+    [[ ${#orbis_pkgs[@]} -eq 1 ]] || die "expected exactly one locked Orbis-Win package in $ORBIS_WIN_RELEASE/download"
+    actual_orbis_pkg="$(sha256sum "${orbis_pkgs[0]}" | awk '{print $1}')"
+    [[ "$actual_orbis_pkg" == "$expected_orbis_pkg" ]] ||
+        die "Orbis-Win package SHA-256 $actual_orbis_pkg differs from locked $expected_orbis_pkg"
+    [[ -n "$manifest_diff" ]] || manifest_diff=not-published
+    [[ -n "$manifest_root_diff" ]] || manifest_root_diff=not-published
+    PW_SOURCE_COMMIT="${PW_SOURCE_COMMIT:-$(sed -n 's/^release_tag=//p' "$RELEASE_MANIFEST")}"
+else
+    [[ "$manifest_diff" == "$empty_diff_sha256" ]] ||
+        die "Orbis-Win release contains local changes (prospero_win_abi4_diff_sha256=$manifest_diff)"
+    [[ "$manifest_root_diff" == "$empty_diff_sha256" ]] ||
+        die "Orbis-Win root release contains local changes (orbis_win_root_diff_sha256=${manifest_root_diff:-missing})"
+    [[ -n "$manifest_commit" ]] || die "missing exact Orbis-Win source commit from BUILD-MANIFEST.txt"
+    actual_pw_commit="$(git -C "$ORBIS_WIN_ROOT/prospero-win" rev-parse HEAD)"
+    [[ "$actual_pw_commit" == "$manifest_commit" ]] ||
+        die "Orbis-Win Prosper-Win checkout $actual_pw_commit does not match release manifest $manifest_commit"
+    actual_pw_diff="$(git -C "$ORBIS_WIN_ROOT/prospero-win" diff HEAD --binary | sha256sum | awk '{print $1}')"
+    [[ "$actual_pw_diff" == "$empty_diff_sha256" ]] ||
+        die "Orbis-Win Prosper-Win checkout has tracked local changes (sha256=$actual_pw_diff)"
+    if [[ -n "$PW_SOURCE_COMMIT" && "$PW_SOURCE_COMMIT" != "$manifest_commit" ]]; then
+        die "PW_SOURCE_COMMIT $PW_SOURCE_COMMIT does not match release manifest commit $manifest_commit"
+    fi
+    PW_SOURCE_COMMIT="$manifest_commit"
 fi
-PW_SOURCE_COMMIT="$manifest_commit"
 
 [[ -d "$ORBIS_WIN_STAGE/sce_module" ]] || die "missing runtime stage: $ORBIS_WIN_STAGE"
 [[ -x "$CC" && -f "$SDK/link.x" ]] || die "orbis-win PS4 compiler/SDK missing"
@@ -147,13 +162,18 @@ fi
 WINE_VERSION="$("$WINE" --version)"
 [[ "$WINE_VERSION" == wine-* ]] || die "manifest host Wine did not report a version: $WINE_VERSION"
 MESA_COMMIT="$(sed -n 's/^mesa_commit=//p' "$RELEASE_MANIFEST")"
-[[ -n "$MESA_COMMIT" ]] || die "release manifest has no mesa_commit"
 MESA_SOURCE_DIFF="$(sed -n 's/^mesa_source_diff_sha256=//p' "$RELEASE_MANIFEST")"
-[[ "$MESA_SOURCE_DIFF" == "$empty_diff_sha256" ]] ||
-    die "Orbis-Win Mesa source has local changes (mesa_source_diff_sha256=${MESA_SOURCE_DIFF:-missing})"
-EXPECTED_MESA_COMMIT="$(tr -d '[:space:]' < "$ORBIS_WIN_ROOT/src/mesa-trees/mesa-ps4-HEAD.txt")"
-[[ "$MESA_COMMIT" == "$EXPECTED_MESA_COMMIT" ]] ||
-    die "Orbis-Win Mesa commit $MESA_COMMIT does not match pinned commit $EXPECTED_MESA_COMMIT"
+if [[ "$PROVENANCE_MODE" == release-package-only ]]; then
+    MESA_COMMIT=not-published
+    MESA_SOURCE_DIFF=not-published
+else
+    [[ -n "$MESA_COMMIT" ]] || die "release manifest has no mesa_commit"
+    [[ "$MESA_SOURCE_DIFF" == "$empty_diff_sha256" ]] ||
+        die "Orbis-Win Mesa source has local changes (mesa_source_diff_sha256=${MESA_SOURCE_DIFF:-missing})"
+    EXPECTED_MESA_COMMIT="$(tr -d '[:space:]' < "$ORBIS_WIN_ROOT/src/mesa-trees/mesa-ps4-HEAD.txt")"
+    [[ "$MESA_COMMIT" == "$EXPECTED_MESA_COMMIT" ]] ||
+        die "Orbis-Win Mesa commit $MESA_COMMIT does not match pinned commit $EXPECTED_MESA_COMMIT"
+fi
 STEAMWORKS_DIR="$ROOT/runtime/steamworks"
 for spec in \
     'steam_api.dll d778ba3007cc46b7587f23698493c6734752213e34eaec2d5e59a036da11df44' \
@@ -443,8 +463,9 @@ VKD3D_PROTON_TREE_SHA256=""
 if [[ -n "$VKD3D_PROTON_DIR" ]]; then
     VKD3D_PROTON_TREE_SHA256="$(cd "$VKD3D_PROTON_DIR" && sha256sum x86/d3d12.dll x86/d3d12core.dll x64/d3d12.dll x64/d3d12core.dll | sha256sum | cut -d' ' -f1)"
 fi
-printf 'title=PLDN10001\nversion=%s\norbis_win_root_commit=%s\norbis_win_root_diff_sha256=%s\nprospero_win_abi4_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_commit=%s\nmesa_source_diff_sha256=%s\nmesa_libvulkan_sha256=%s\ndxvk=%s-x32+x64\ndxvk_d3d11_sha256=%s\nprefix_template_stamp=%s\nwine_mono_version=%s\nwine_mono_tree_sha256=%s\nvkd3d_proton_version=%s\nvkd3d_proton_tree_sha256=%s\nvkd3d_proton_qualified=%s\nsteamworks_emulator=gbe_fork-ca45922c\n' \
-    "$PKG_VERSION" "$manifest_root_commit" "$manifest_root_diff" "$PW_SOURCE_COMMIT" "$manifest_diff" "${WINE_VERSION#wine-}" \
+printf 'title=PLDN10001\nversion=%s\nprovenance_mode=%s\norbis_win_release_tag=%s\norbis_win_package_sha256=%s\norbis_win_root_commit=%s\norbis_win_root_diff_sha256=%s\nprospero_win_abi4_source_commit=%s\nprospero_win_abi4_diff_sha256=%s\nwine=%s\nmesa_source_commit=%s\nmesa_source_diff_sha256=%s\nmesa_libvulkan_sha256=%s\ndxvk=%s-x32+x64\ndxvk_d3d11_sha256=%s\nprefix_template_stamp=%s\nwine_mono_version=%s\nwine_mono_tree_sha256=%s\nvkd3d_proton_version=%s\nvkd3d_proton_tree_sha256=%s\nvkd3d_proton_qualified=%s\nsteamworks_emulator=gbe_fork-ca45922c\n' \
+    "$PKG_VERSION" "${PROVENANCE_MODE:-source-manifest}" "$(sed -n 's/^release_tag=//p' "$RELEASE_MANIFEST")" \
+    "$(sed -n 's/^package_sha256=//p' "$RELEASE_MANIFEST")" "$manifest_root_commit" "$manifest_root_diff" "$PW_SOURCE_COMMIT" "$manifest_diff" "${WINE_VERSION#wine-}" \
     "$MESA_COMMIT" "$MESA_SOURCE_DIFF" "$MESA_SHA256" "$(dxvk_version "$DXVK_262_DIR")" \
     "$(sha256sum "$DXVK_262_X64_DIR/d3d11.dll" | cut -d" " -f1)" "$TEMPLATE_STAMP" \
     "$WINE_MONO_VERSION" "$MONO_TREE_SHA256" "$VKD3D_PROTON_VERSION" "$VKD3D_PROTON_TREE_SHA256" \
