@@ -86,7 +86,9 @@ if [[ "$(sed -n 's/^provenance_mode=//p' "$manifest")" == release-package-only ]
         die "runtime marker $marker is absent from the locked package"
     for path in sce_module/libvulkan.prx sce_module/relocated_wine_app.prx; do
         [[ -s "$OUT/extract/uroot/$path" ]] || die "locked package lacks $path"
-        printf 'sha256 %s %s\n' "$(sha256sum "$OUT/extract/uroot/$path" | awk '{print $1}')" "$path" >> "$manifest"
+        if ! awk -v path="$path" '$1 == "sha256" && $3 == path { found = 1 } END { exit !found }' "$manifest"; then
+            printf 'sha256 %s %s\n' "$(sha256sum "$OUT/extract/uroot/$path" | awk '{print $1}')" "$path" >> "$manifest"
+        fi
     done
 fi
 
