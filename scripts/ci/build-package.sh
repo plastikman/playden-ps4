@@ -114,9 +114,10 @@ if grep -qvE '^(\[OK\]|$)' "$OUT/pkg_validate.txt"; then
     die "PkgTool validation reported a non-OK line"
 fi
 echo "== Orbis-Win payload parity"
+[[ -n "${PW_ABI4_ROOT:-}" ]] || die "Orbis-Win runner did not set PW_ABI4_ROOT for the pinned Wine source"
 python3 "$ORBIS_WIN_ROOT/scripts/check-ps4-package-parity.py" \
     "$WORK/orbis-win/app/pkg-stage" "$PLAYDEN_BUILD/pkg-stage" \
-    --elf-dir "$PLAYDEN_BUILD/prx" --upstream-root "$ORBIS_WIN_ROOT/prospero-win" |
+    --elf-dir "$PLAYDEN_BUILD/prx" --upstream-root "$PW_ABI4_ROOT/source" |
     tee "$OUT/package-parity.txt"
 {
     echo "title_id=PLDN10001"
