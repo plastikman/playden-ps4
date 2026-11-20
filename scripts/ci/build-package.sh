@@ -106,6 +106,7 @@ pkg="$PLAYDEN_BUILD/package/IV0000-PLDN10001_00-PLDN100010000000.pkg"
 cp "$pkg" "$OUT/"
 cp "$PLAYDEN_BUILD/pkg-stage/runtime-manifest.txt" "$OUT/runtime-manifest.txt"
 echo "== PkgTool validation"
+LD_LIBRARY_PATH="${PS4_PKGTOOL_OPENSSL_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
     "$SDK_ROOT/sdk/bin/linux/PkgTool.Core" pkg_validate "$OUT/$(basename "$pkg")" |
     tee "$OUT/pkg_validate.txt"
