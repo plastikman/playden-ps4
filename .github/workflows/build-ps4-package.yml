@@ -15,10 +15,10 @@ on:
           APP_VER as NN.NN (e.g. 02.07). Required: a number never used before, always
           increasing, so the console shows which build is installed.
         required: true
-        default: "02.99"
+        default: "03.00"
       orbis_win_tag:
         description: >-
-          Orbis-Win release to build on. Playden 0.4.0 uses the tested v0.0.8 runtime package.
+          Orbis-Win release to build on. Playden 0.4.1 uses the tested v0.0.8 runtime package.
         default: "v0.0.8"
       publish_release:
         description: >-
@@ -129,7 +129,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}   # prepare-orbis-win.sh downloads the Orbis-Win release
           ORBIS_WIN_ROOT: ${{ github.workspace }}/orbis-win
           PS4_PKGTOOL_OPENSSL_LIB: /orbis-cache/deps/openssl11/lib
+          PLAYDEN_MESA_COMMIT: 0ec293c29f9735ee462eff0d9a9316481d741afa
           PLAYDEN_HOST_WINE_ROOT: /home/zpeirce/codex_scratch/abi4-upstream-port-20261104/source/.deps/wine-host
+          WINE_MONO_DIR: /home/zpeirce/codex_scratch/wine-mono-extract-11.3.0
+          WINE_MONO_VERSION: "11.3.0"
+          WINE_MONO_TREE_SHA256: 7aee0067e7aa6a43743e0b0da647d7ab6c892c7dbd288ed76f9763fc92efbaa1
+          VKD3D_PROTON_DIR: /home/zpeirce/codex_scratch/vkd3d-proton-3.1/vkd3d-proton-3.1
+          VKD3D_PROTON_VERSION: "3.1"
+          VKD3D_PROTON_TREE_SHA256: e27aac172c62f3599ebc56f333d70ffd250b555aa0beaeb77ad81901206448c3
+          VKD3D_PROTON_QUALIFIED: "0"
           OUT: ${{ runner.temp }}/playden-artifacts
           JOBS: "4"
         run: |
@@ -159,12 +167,13 @@ jobs:
           cp "$OUT/BUILD-MANIFEST.txt" "$OUT/BUILD-MANIFEST-$APP_VER.txt"
           package_sha=$(sed -n 's/^package_sha256=//p' "$OUT/BUILD-MANIFEST.txt")
           cat > "$OUT/RELEASE-NOTES.md" <<EOF
-          ## What's new in Playden for PS4 v0.4.0
+          ## What's new in Playden for PS4 v0.4.1
 
           - **Game test reports require an explicit endpoint.** Reporting is off unless \`/data/PLDN10001/features.txt\` contains \`game-test-reports=https://your-report-api\`. Reports are sent only to that endpoint; there is no default destination.
           - **Import games is available behind a feature flag.** Add \`import-games\` to \`/data/PLDN10001/features.txt\` to show the local import workflow.
           - **Updated Orbis-Win runtime:** uses the tested v0.0.8 package (runtime build 02.98), including the PS4 Vulkan shared-resource fix, 32-bit executable-page fix, and updated profile handling.
           - **Runtime-kit capability parity:** includes the profile and recipe updates for environment variables, audio volume, Steam library paths, controller input, Zink, and the runtime-kit view. Prosper-Win is pinned to published commit eaccec6d.
+          - **Complete runtime-kit payloads:** restores Wine Mono 11.3.0 and vkd3d-proton 3.1 in the kit. Wine Mono is not yet hardware-qualified with a .NET Framework game, and vkd3d-proton remains unqualified for D3D12 gameplay.
           - **Touchpad launcher input:** the PS4 touchpad provides pointer movement and click input for launcher configuration screens.
           - **Safer game-test reporting and local imports:** reporting requires an explicit endpoint in `/data/PLDN10001/features.txt`; local game import remains behind its feature flag.
           - **Experimental Steam Online play:** Steam sign-in handoff, friends, lobby invites and online game settings. Online play remains off unless \`online-steam\` is listed in \`features.txt\`. Local-network sessions have been tested; internet peer-to-peer play is still experimental and has not been validated on-console. See the [online play notes](https://github.com/plastikman/playden-ps4/blob/ps4-v0.3.1/docs/online-play.md).

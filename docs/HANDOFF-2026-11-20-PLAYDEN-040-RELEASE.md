@@ -67,9 +67,17 @@ The installer filename is `IV0000-PLDN10001_00-PLDN100010000000.pkg`.
 
 ## Follow-up
 
-The release is published. Hardware installation and game testing remain to be
-done; the user has not yet reported testing this release. No Orbis-Win package
-version or lock update was needed for the source-path correction.
+The release is published, but a later size audit found that the hosted package
+omitted the optional Wine Mono and vkd3d-proton kit payloads. The workflow did
+not pass `WINE_MONO_DIR` or `VKD3D_PROTON_DIR`, and the builder allowed both to
+be empty. See
+[`HANDOFF-2026-11-20-PLAYDEN-041-RELEASE.md`](HANDOFF-2026-11-20-PLAYDEN-041-RELEASE.md)
+for the corrected 0.4.1 build. Do not use 0.4.0 as proof of complete runtime-kit
+payload parity.
+
+The v0.4.0 hardware installation and game testing remain unreported. No
+Orbis-Win package version or lock update was needed for the source-path
+correction.
 
 The Orbis-Win source cache under
 `/home/zpeirce/codex_scratch/abi4-upstream-port-20261104/source` remains dirty

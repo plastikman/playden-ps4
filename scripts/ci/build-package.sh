@@ -97,6 +97,20 @@ for path in sce_module/libvulkan.prx sce_module/relocated_wine_app.prx; do
 done
 
 echo "== PLDN10001 $PKG_VERSION"
+: "${WINE_MONO_DIR:?CI release builds must provide the pinned Wine Mono payload}"
+: "${WINE_MONO_VERSION:?CI release builds must pin the Wine Mono version}"
+: "${WINE_MONO_TREE_SHA256:?CI release builds must pin the Wine Mono payload hash}"
+: "${VKD3D_PROTON_DIR:?CI release builds must provide the pinned vkd3d-proton payload}"
+: "${VKD3D_PROTON_VERSION:?CI release builds must pin the vkd3d-proton version}"
+: "${VKD3D_PROTON_TREE_SHA256:?CI release builds must pin the vkd3d-proton payload hash}"
+: "${VKD3D_PROTON_QUALIFIED:?CI release builds must state D3D12 qualification status}"
+[[ "$WINE_MONO_VERSION" == 11.3.0 ]] || die "unexpected Wine Mono version: $WINE_MONO_VERSION"
+[[ "$VKD3D_PROTON_VERSION" == 3.1 ]] || die "unexpected vkd3d-proton version: $VKD3D_PROTON_VERSION"
+[[ "$VKD3D_PROTON_QUALIFIED" == 0 ]] || die "vkd3d-proton is not hardware-qualified for this release"
+mono_actual=$(cd "$WINE_MONO_DIR" && find . -mindepth 1 -type f ! -name extract.log -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+[[ "$mono_actual" == "$WINE_MONO_TREE_SHA256" ]] || die "Wine Mono payload hash $mono_actual does not match pinned $WINE_MONO_TREE_SHA256"
+vkd3d_actual=$(cd "$VKD3D_PROTON_DIR" && sha256sum x86/d3d12.dll x86/d3d12core.dll x64/d3d12.dll x64/d3d12core.dll | sha256sum | awk '{print $1}')
+[[ "$vkd3d_actual" == "$VKD3D_PROTON_TREE_SHA256" ]] || die "vkd3d-proton payload hash $vkd3d_actual does not match pinned $VKD3D_PROTON_TREE_SHA256"
 ORBIS_WIN_RELEASE="$WORK/orbis-win" DXVK_262_DIR="$WORK/dxvk-2.6.2/x32" \
     "$ROOT/scripts/build-ps4-runtime.sh"
 
@@ -105,6 +119,20 @@ pkg="$PLAYDEN_BUILD/package/IV0000-PLDN10001_00-PLDN100010000000.pkg"
 [[ -s "$pkg" ]] || die "no package at $pkg"
 cp "$pkg" "$OUT/"
 cp "$PLAYDEN_BUILD/pkg-stage/runtime-manifest.txt" "$OUT/runtime-manifest.txt"
+kit_stage="$PLAYDEN_BUILD/pkg-stage/runtime-template/kit"
+for path in \
+    "mono/wine-mono-$WINE_MONO_VERSION/lib/mono/4.5/mscorlib.dll" \
+    runtime/lib/vkd3d-proton/i386-windows/d3d12.dll \
+    runtime/lib/vkd3d-proton/i386-windows/d3d12core.dll \
+    runtime/lib/vkd3d-proton/x86_64-windows/d3d12.dll \
+    runtime/lib/vkd3d-proton/x86_64-windows/d3d12core.dll; do
+    [[ -s "$kit_stage/$path" ]] || die "runtime-kit payload is missing: $path"
+done
+grep -Fx "wine_mono_version=$WINE_MONO_VERSION" "$OUT/runtime-manifest.txt" >/dev/null || die "runtime manifest has wrong Wine Mono version"
+grep -Fx "wine_mono_tree_sha256=$WINE_MONO_TREE_SHA256" "$OUT/runtime-manifest.txt" >/dev/null || die "runtime manifest has wrong Wine Mono hash"
+grep -Fx "vkd3d_proton_version=$VKD3D_PROTON_VERSION" "$OUT/runtime-manifest.txt" >/dev/null || die "runtime manifest has wrong vkd3d-proton version"
+grep -Fx "vkd3d_proton_tree_sha256=$VKD3D_PROTON_TREE_SHA256" "$OUT/runtime-manifest.txt" >/dev/null || die "runtime manifest has wrong vkd3d-proton hash"
+grep -Fx "vkd3d_proton_qualified=0" "$OUT/runtime-manifest.txt" >/dev/null || die "runtime manifest must keep D3D12 unqualified"
 echo "== PkgTool validation"
 LD_LIBRARY_PATH="${PS4_PKGTOOL_OPENSSL_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
@@ -133,6 +161,9 @@ python3 "$ORBIS_WIN_ROOT/scripts/check-ps4-package-parity.py" \
         -e 's/^title_id=/orbis_win_&/p' \
         "$WORK/orbis-win/BUILD-MANIFEST.txt"
     echo "dxvk_sha256=$dxvk_sha256"
+    for key in wine_mono_version wine_mono_tree_sha256 vkd3d_proton_version vkd3d_proton_tree_sha256 vkd3d_proton_qualified; do
+        sed -n "s/^$key=/&/p" "$PLAYDEN_BUILD/pkg-stage/runtime-manifest.txt"
+    done
     git -C "$ROOT" submodule status third_party/prospero-win third_party/ps5-homebrew-ui | sed 's/^/submodule /'
 } > "$OUT/BUILD-MANIFEST.txt"
 cat "$OUT/BUILD-MANIFEST.txt"
