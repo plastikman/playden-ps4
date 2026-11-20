@@ -15,11 +15,11 @@ on:
           APP_VER as NN.NN (e.g. 02.07). Required: a number never used before, always
           increasing, so the console shows which build is installed.
         required: true
-        default: "03.00"
+        default: "03.02"
       orbis_win_tag:
         description: >-
-          Orbis-Win release to build on. Playden 0.4.1 uses the tested v0.0.8 runtime package.
-        default: "v0.0.8"
+          Orbis-Win release to build on. Playden 0.4.2 uses the profile-compatible v0.0.9 runtime package.
+        default: "v0.0.9"
       publish_release:
         description: >-
           Also publish a GitHub release tagged v<ps4/VERSION> (title: the tag) with the package
@@ -185,11 +185,11 @@ jobs:
           cp "$OUT/BUILD-MANIFEST.txt" "$OUT/BUILD-MANIFEST-$APP_VER.txt"
           package_sha=$(sed -n 's/^package_sha256=//p' "$OUT/BUILD-MANIFEST.txt")
           cat > "$OUT/RELEASE-NOTES.md" <<EOF
-          ## What's new in Playden for PS4 v0.4.1
+          ## What's new in Playden for PS4 v0.4.2
 
           - **Game test reports require an explicit endpoint.** Reporting is off unless \`/data/PLDN10001/features.txt\` contains \`game-test-reports=https://your-report-api\`. Reports are sent only to that endpoint; there is no default destination.
           - **Import games is available behind a feature flag.** Add \`import-games\` to \`/data/PLDN10001/features.txt\` to show the local import workflow.
-          - **Updated Orbis-Win runtime:** uses the tested v0.0.8 package (runtime build 02.98), including the PS4 Vulkan shared-resource fix, 32-bit executable-page fix, and updated profile handling.
+          - **Fixed game profile loading:** uses Orbis-Win v0.0.9 (runtime build 02.99), which accepts the profile version and settings Playden writes. This fixes games being refused as unsupported before Wine starts. Half-Life 2 was verified through its main menu.
           - **Runtime-kit capability parity:** includes the profile and recipe updates for environment variables, audio volume, Steam library paths, controller input, Zink, and the runtime-kit view. Prosper-Win is pinned to published commit eaccec6d.
           - **Complete runtime-kit payloads:** restores Wine Mono 11.3.0 and vkd3d-proton 3.1 in the kit. Wine Mono is not yet hardware-qualified with a .NET Framework game, and vkd3d-proton remains unqualified for D3D12 gameplay.
           - **Touchpad launcher input:** the PS4 touchpad provides pointer movement and click input for launcher configuration screens.
@@ -198,7 +198,7 @@ jobs:
 
           ### Known issues
 
-          Some titles still fail or stall under the PS4 runtime. In the Orbis-Win 02.98 console suite, Hollow Knight and Risk of Rain 2 render but stall during startup; Left 4 Dead 2 and Splinter Cell: Conviction remain on the loading spinner; The Binding of Isaac exits before its first rendered frame; and MDK has visual corruption. See the [Orbis-Win v0.0.8 notes](https://github.com/plastikman/orbis-win/releases/tag/v0.0.8) for the full test record.
+          Some titles still fail or stall under the PS4 runtime. The profile-loading fix only addresses games rejected before Wine starts; it does not resolve title-specific startup, graphics, or compatibility failures. See the [Orbis-Win v0.0.9 notes](https://github.com/plastikman/orbis-win/releases/tag/v0.0.9) for the runtime test record.
 
           This package is **$APP_VER**, built with Orbis-Win **${ORBIS_WIN_TAG}**.
 
