@@ -9,8 +9,9 @@
 
 namespace playden::app {
 
-// features.txt in Playden's data folder (/data/playden/features.txt on the console, which FTP and the file manager
-// can write): one feature name per line; blank lines and lines starting with # are skipped. Read once at startup.
+// features.txt in Playden's data folder (/data/playden/features.txt on PS5,
+// /data/PLDN10001/features.txt on PS4, which FTP and the file manager can write):
+// one feature name per line; blank lines and lines starting with # are skipped. Read once at startup.
 // A line can only turn a feature on: a feature on by default for the build stays on.
 inline constexpr const char* kExperimentalFeaturesFileName = "features.txt";
 // The longest file read; the rest is ignored.
@@ -31,6 +32,9 @@ struct ExperimentalFeatures {
   // default endpoint, so a stable build without the line sends nothing.
   bool game_test_reports = false;
   std::string game_test_reports_api;
+  // PS4: line external-storage opts into GoldHEN-backed reads of USB volumes;
+  // imports are copied into Playden's internal library.
+  bool external_storage = false;
 };
 
 // What a build has on before features.txt. Online and GOG are on in every build; all_on (nightlies and local dev

@@ -127,6 +127,8 @@ export PW_PRX_STUBS="-L$PRX_STUBS -Wl,--as-needed $(find "$PRX_STUBS" -maxdepth 
 echo "== link Playden UI into a relocatable PRX"
 "$CC" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
     -c "$ROOT/ps4/runtime_entry.c" -o "$BUILD/obj/runtime_entry.o"
+"$CC" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
+    -c "$ROOT/ps4/goldhen_storage.c" -o "$BUILD/obj/goldhen_storage.o"
 # The UI PRX imports SceLibc malloc/free. Its own exported heap policy is
 # required for multi-megabyte Steam manifests; the eboot CRT's local symbols
 # are not exported into this separately loaded module.
@@ -155,6 +157,7 @@ HEAP_WRAPS="$HEAP_WRAPS -Wl,--wrap=stat -Wl,--wrap=lstat -Wl,--wrap=fstatat"
     "$CMAKE_BUILD/CMakeFiles/playden_ps4_app_objects.dir/main.c.obj" \
     "$CMAKE_BUILD/CMakeFiles/playden_ps4_app_objects.dir/wine_runtime.c.obj" \
     "$BUILD/obj/runtime_entry.o" \
+    "$BUILD/obj/goldhen_storage.o" \
     "$BUILD/obj/orbis_bigheap.o" \
     "$BUILD/obj/playden_heap.o" \
     "$BUILD/obj/dir_wrap.o" \

@@ -41,6 +41,7 @@ ExperimentalFeatures ParseExperimentalFeatures(std::string_view text, Experiment
     if (line == "community-recipes") continue;
     if (line == "online-steam") features.online_steam = true;
     else if (line == "gog-store") features.gog_store = true;
+    else if (line == "external-storage") features.external_storage = true;
     else if (line.rfind("game-test-reports=https://", 0) == 0 &&
              line.find_first_of(" \t\r\n?#") == std::string_view::npos) {
       std::string endpoint(line.substr(sizeof("game-test-reports=") - 1));

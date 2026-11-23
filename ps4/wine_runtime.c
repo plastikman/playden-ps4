@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define _POSIX_C_SOURCE 200809L
 #include "wine_runtime.h"
+#include "goldhen_storage.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -528,7 +529,9 @@ int playden_ps4_wine_launch_hl2(void)
     statusf("Requesting Wine runtime launch...");
     note_last_played(220);
     log_line("PLDN10001 runtime: restarting into Half-Life 2");
+    const int storage_was_enabled = playden_ps4_goldhen_storage_prepare_load_exec();
     const int status = sceSystemServiceLoadExec("/app0/eboot.bin", (const char **)arguments);
+    playden_ps4_goldhen_storage_resume_after_failed_load_exec(storage_was_enabled);
     char message[128];
     snprintf(message, sizeof(message), "PLDN10001 runtime: LoadExec returned rc=%d", status);
     log_line(message);
@@ -560,7 +563,9 @@ int playden_ps4_wine_launch_game(uint32_t app_id)
     char line[128];
     snprintf(line, sizeof(line), "PLDN10001 runtime: launching Steam app %u", app_id);
     log_line(line);
+    const int storage_was_enabled = playden_ps4_goldhen_storage_prepare_load_exec();
     const int result = sceSystemServiceLoadExec("/app0/eboot.bin", (const char **)arguments);
+    playden_ps4_goldhen_storage_resume_after_failed_load_exec(storage_was_enabled);
     snprintf(line, sizeof(line), "PLDN10001 runtime: Steam app %u LoadExec returned rc=%d",
              app_id, result);
     log_line(line);
@@ -679,7 +684,9 @@ int playden_ps4_wine_launch_descriptor(const char *title_id, const char *session
     const char *arguments[] = {"pldn-runtime=wine", descriptor, session, NULL};
     snprintf(line, sizeof(line), "PLDN10001 runtime: handoff title=%s session=%s", title_id, session_id);
     log_line(line);
+    const int storage_was_enabled = playden_ps4_goldhen_storage_prepare_load_exec();
     const int result = sceSystemServiceLoadExec("/app0/eboot.bin", arguments);
+    playden_ps4_goldhen_storage_resume_after_failed_load_exec(storage_was_enabled);
     snprintf(line, sizeof(line), "PLDN10001 runtime: descriptor LoadExec returned rc=%d", result);
     log_line(line);
     statusf("Runtime handoff failed (rc=%d).", result);

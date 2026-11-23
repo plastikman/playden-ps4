@@ -456,6 +456,8 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         (data / playden::app::kExperimentalFeaturesFileName).string(),
         playden::app::DefaultExperimentalFeatures(playden::update::CurrentVersion().nightly() || PLAYDEN_DEV_BUILD),
         nullptr);
+    if (s.features.external_storage)
+        log_line("external-storage requested; GoldHEN must grant USB access for imports");
     simulation.SetGameTestReportsEnabled(!s.features.game_test_reports_api.empty());
     playden::runtime::SetOnlineSteamEnabled(s.features.online_steam);
 

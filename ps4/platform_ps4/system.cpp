@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "platform_ps4/system.hpp"
+#include "../goldhen_storage.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -66,7 +67,9 @@ void quit()
 {
     log("[HUI] quit requested");
     std::fflush(nullptr);
+    const int storage_was_enabled = playden_ps4_goldhen_storage_prepare_load_exec();
     const int refused = sceSystemServiceLoadExec("exit", nullptr);
+    playden_ps4_goldhen_storage_resume_after_failed_load_exec(storage_was_enabled);
     log("[HUI] quit refused rc=0x%x", static_cast<unsigned>(refused));
     park();
 }

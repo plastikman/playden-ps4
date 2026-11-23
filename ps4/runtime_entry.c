@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "goldhen_storage.h"
+
 enum { EXPORT_COUNT = 1 };
 #define PRX_MAGIC UINT64_C(0x3143534544585250)
 
@@ -44,6 +46,9 @@ __attribute__((visibility("default"), noreturn))
 void playden_ps4_start(int argc, char **argv)
 {
     run_static_initializers();
+    /* The import scanner starts on a worker during app initialization, so make
+     * the opt-in USB namespace available before entering Playden's main. */
+    (void)playden_ps4_goldhen_storage_enable_if_requested();
     (void)playden_ps4_main(argc, argv);
     for (;;) sceKernelUsleep(1000000);
 }
