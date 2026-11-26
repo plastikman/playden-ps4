@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 
 #include <algorithm>
 #include <chrono>
@@ -26,6 +27,14 @@ bool IsFolder(const std::string& path) {
   return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
 }
 
+std::string MountIdentity(const std::string& path) {
+  struct stat info {};
+  if (lstat(path.c_str(), &info) != 0) return "mode=- errno=" + std::to_string(errno);
+  return "mode=" + std::to_string(static_cast<unsigned long>(info.st_mode)) +
+         " uid=" + std::to_string(static_cast<unsigned long>(info.st_uid)) +
+         " dev=" + std::to_string(static_cast<unsigned long long>(info.st_dev));
+}
+
 // The same rule the install volumes use: a drive's folder counts only while a file system other
 // than its parent's is mounted there.
 bool IsMountPoint(const std::string& path) {
@@ -35,7 +44,18 @@ bool IsMountPoint(const std::string& path) {
   const auto parent_path = slash == 0 ? std::string("/") : path.substr(0, slash);
   if (lstat(path.c_str(), &mount) != 0 || !S_ISDIR(mount.st_mode) || stat(parent_path.c_str(), &parent) != 0)
     return false;
-  return mount.st_dev != parent.st_dev;
+  if (mount.st_dev != parent.st_dev) return true;
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+  // The PS4 reports the same st_dev for an attached exFAT volume and /mnt.
+  // GoldHEN-backed external-storage access makes /mnt visible to this title;
+  // mounted volumes then report world-writable mode and uid -1, unlike the
+  // root-owned, read-only empty /mnt/usbN slots. Keep the generic device rule
+  // first for other platforms and use this measured PS4 fallback only.
+  return (mount.st_mode & (S_IWGRP | S_IWOTH)) == (S_IWGRP | S_IWOTH) &&
+         mount.st_uid == static_cast<uid_t>(-1);
+#else
+  return false;
+#endif
 }
 
 const char* ProgramWords(ProgramCheck check) {
@@ -64,10 +84,17 @@ const char* ImportWords(ImportError error) {
 
 }  // namespace
 
-std::vector<ImportVolume> ConsoleImportVolumes() {
+std::vector<ImportVolume> ConsoleImportVolumes(bool include_external_storage) {
   std::vector<ImportVolume> volumes;
-  for (const auto& root : ImportRoots())
+  for (const auto& root : ImportRoots()) {
+    if (std::string(root.volume) != ImportStore::kDropFolderVolume && !include_external_storage) continue;
+#if defined(PLAYDEN_PLATFORM_PS4) && PLAYDEN_PLATFORM_PS4
+    // PS4 currently supports only GoldHEN-exposed USB storage here. Do not
+    // offer the PS5 M.2 or extended-storage mount points from the shared list.
+    if (std::string(root.volume) == "m2" || std::string(root.volume) == "extended") continue;
+#endif
     volumes.push_back({root.volume, root.mount, root.folder, std::string(root.volume) != ImportStore::kDropFolderVolume});
+  }
   return volumes;
 }
 
@@ -540,11 +567,12 @@ bool LocalLibrarySource::CheckPresence() {
     // Say what was decided about each configured volume and on what grounds. A volume that is not
     // present is skipped by Scan() without a scan, an errno or a line, so a drive that is plugged
     // in and holds games looks exactly like one that is empty -- which cost three rounds of
-    // guessing on a USB drive on the PS4, 2026-11-18. IsMountPoint compares the mount's st_dev
-    // against its parent's, so a console that does not report them apart answers no here.
+    // guessing on a USB drive on the PS4, 2026-11-18. The PS4's st_dev is not
+    // sufficient to distinguish exFAT from /mnt, so the PS4 fallback also logs
+    // the mode and owner used to identify a mounted volume.
     if (!volume.require_mount_point) continue;  // the drop folder is always there; do not repeat it
     Log("import volume " + volume.volume + " mount=" + volume.mount + " present=" + (here ? "1" : "0") +
-        " by=mount-point");
+        " by=mount-point " + MountIdentity(HostPath(volume.mount)));
   }
   if (present == present_) return false;
   std::string line = "import volumes present=";

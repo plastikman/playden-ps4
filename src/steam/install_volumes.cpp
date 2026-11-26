@@ -22,7 +22,6 @@ extern "C" int sceKernelDlsym(int, const char*, void**);
 namespace playden::steam {
 namespace {
 
-#if !PLAYDEN_PLATFORM_PS4
 std::string ExternalRoot(const std::string& path) {
   for (const auto* root : {"/mnt/ext0", "/mnt/ext1", "/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3", "/mnt/usb4",
                            "/mnt/usb5", "/mnt/usb6", "/mnt/usb7"}) {
@@ -32,7 +31,6 @@ std::string ExternalRoot(const std::string& path) {
   }
   return {};
 }
-#endif
 
 // Collapse redundant separators/dots, but reject parent traversal so an external path
 // cannot escape its required root (including through a symlink before the '..').
@@ -67,7 +65,17 @@ bool IsMountPoint(const std::string& path) {
   if (slash == std::string::npos || lstat(path.c_str(), &mount) != 0 || !S_ISDIR(mount.st_mode) ||
       stat(parent_path.c_str(), &parent) != 0)
     return false;
-  return mount.st_dev != parent.st_dev;
+  if (mount.st_dev != parent.st_dev) return true;
+#if PLAYDEN_PLATFORM_PS4
+  // On this PS4, mounted exFAT volumes can share st_dev with /mnt. GoldHEN
+  // exposes the mounted volume as uid -1 and mode 0777, while an empty slot
+  // remains root-owned and read-only (measured on hardware, 2026-11-23).
+  return path.rfind("/mnt/usb", 0) == 0 &&
+         (mount.st_mode & (S_IWGRP | S_IWOTH)) == (S_IWGRP | S_IWOTH) &&
+         mount.st_uid == static_cast<uid_t>(-1);
+#else
+  return false;
+#endif
 }
 
 // mkdir -p for an absolute path; existing components are fine.
@@ -229,12 +237,29 @@ std::vector<VolumeCandidate> ConsoleVolumeCandidates(const std::string& title_ro
   };
 }
 
+std::vector<VolumeCandidate> Ps4UsbVolumeCandidates() {
+  return {
+      {"usb0", "USB drive", "/mnt/usb0", "/mnt/usb0/playden/games", true},
+      {"usb1", "USB drive 2", "/mnt/usb1", "/mnt/usb1/playden/games", true},
+      {"usb2", "USB drive 3", "/mnt/usb2", "/mnt/usb2/playden/games", true},
+      {"usb3", "USB drive 4", "/mnt/usb3", "/mnt/usb3/playden/games", true},
+      {"usb4", "USB drive 5", "/mnt/usb4", "/mnt/usb4/playden/games", true},
+      {"usb5", "USB drive 6", "/mnt/usb5", "/mnt/usb5/playden/games", true},
+      {"usb6", "USB drive 7", "/mnt/usb6", "/mnt/usb6/playden/games", true},
+      {"usb7", "USB drive 8", "/mnt/usb7", "/mnt/usb7/playden/games", true},
+  };
+}
+
 std::optional<VolumeSpace> QueryVolumeSpace(const std::string& path, std::uint64_t console_reserve) {
 #if PLAYDEN_PLATFORM_PS4
   const auto query = ResolvedFstatfs();
   if (!query) return std::nullopt;
   std::string directory = QueryPath(path);
   if (directory.empty()) return std::nullopt;
+  const auto external_root = ExternalRoot(directory);
+  // Never walk up into /mnt and accidentally report the system volume for an
+  // empty USB slot or a path that is no longer mounted.
+  if (!external_root.empty() && !IsMountPoint(external_root)) return std::nullopt;
   int fd = -1;
   while ((fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY)) < 0) {
     if (errno != ENOENT) return std::nullopt;
@@ -257,8 +282,10 @@ std::optional<VolumeSpace> QueryVolumeSpace(const std::string& path, std::uint64
       (bavail > 0 && static_cast<std::uint64_t>(bavail) > blocks))
     return std::nullopt;
   const auto space = detail::VolumeSpaceFromBlocks(static_cast<std::int64_t>(bsize), blocks, bavail);
-  // One volume here, and it is the console's: keep the system's share back as the PS5 path does.
-  return space ? std::optional<VolumeSpace>(detail::WithoutConsoleReserve(*space, console_reserve)) : space;
+  // Reserve console space only for the internal data volume. An external USB
+  // volume has its own capacity and must report all of its available blocks.
+  if (space && external_root.empty()) return detail::WithoutConsoleReserve(*space, console_reserve);
+  return space;
 #else
   std::string directory = QueryPath(path);
   if (directory.empty()) return std::nullopt;

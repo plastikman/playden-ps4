@@ -35,7 +35,7 @@ struct ImportVolume {
   bool require_mount_point = false;
 };
 // ImportRoots() as volumes: the drop folder, then the external drives.
-std::vector<ImportVolume> ConsoleImportVolumes();
+std::vector<ImportVolume> ConsoleImportVolumes(bool include_external_storage = true);
 
 // A folder in an import folder that could be added.
 struct ImportCandidate {

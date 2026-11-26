@@ -40,6 +40,11 @@ std::vector<InstallVolume> DiscoverInstallVolumes(const std::vector<VolumeCandid
 std::vector<VolumeCandidate> ConsoleVolumeCandidates(const std::string& title_root = "/app0",
                                                      const std::string& games_root = {});
 
+// PS4 USB volumes already mounted by Orbis. Call only when the user opted in
+// to GoldHEN-backed external storage; these are FAT/exFAT mounts, not drivers
+// Playden mounts itself.
+std::vector<VolumeCandidate> Ps4UsbVolumeCandidates();
+
 struct VolumeSpace {
   std::uint64_t total_bytes = 0;
   std::uint64_t free_bytes = 0;

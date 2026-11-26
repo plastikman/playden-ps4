@@ -457,7 +457,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
         playden::app::DefaultExperimentalFeatures(playden::update::CurrentVersion().nightly() || PLAYDEN_DEV_BUILD),
         nullptr);
     if (s.features.external_storage)
-        log_line("external-storage requested; GoldHEN must grant USB access for imports");
+        log_line("external-storage requested; GoldHEN must grant USB access for imports and installs");
     simulation.SetGameTestReportsEnabled(!s.features.game_test_reports_api.empty());
     playden::runtime::SetOnlineSteamEnabled(s.features.online_steam);
 
@@ -635,6 +635,10 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     adopt_launcher_installs(data / "games");
     std::vector<playden::steam::VolumeCandidate> candidates = {
         {playden::steam::InstallService::kPrimaryVolumeId, "PS4 storage", data.string(), (data / "games").string()}};
+    if (s.features.external_storage) {
+        auto usb_candidates = playden::steam::Ps4UsbVolumeCandidates();
+        candidates.insert(candidates.end(), usb_candidates.begin(), usb_candidates.end());
+    }
     s.import_storage = TitleStorage(data);
     s.imports = std::make_unique<playden::stores::local::ImportStore>(*s.import_storage);
     playden::stores::local::LocalCopyOptions copy_options;
@@ -696,10 +700,11 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     s.stores->Add(std::make_unique<playden::stores::SteamLibrarySource>(*s.library_service));
     s.stores->Add(std::make_unique<playden::stores::SteamDetailsSource>(*s.app_details));
     playden::stores::local::LocalLibraryConfig import_config;
-    // The drop folder AND the external drives. ConsoleImportVolumes() returns both from
-    // ImportRoots() (scanner.cpp): /data/playden-import, then <mount>/playden/import for
-    // /mnt/ext0, /mnt/ext1 and /mnt/usb0..7, each marked require_mount_point so an empty
-    // /mnt/usb* -- which the console keeps whether or not a drive is attached -- is skipped.
+    // The drop folder, plus external drives only when the feature flag enabled their GoldHEN
+    // access. ConsoleImportVolumes() builds these from ImportRoots() (scanner.cpp). On PS4 it
+    // keeps only USB roots (/mnt/usb0..7/playden/import), each marked require_mount_point so an
+    // empty /mnt/usb* -- which the console keeps whether or not a drive is attached -- is skipped.
+    // The shared PS5 list also has M.2 and extended-storage roots; those are not PS4 candidates.
     // Only the drop folder was listed before, so a USB drive was invisible to the importer and
     // every game had to be copied onto internal storage over FTP first.
     //
@@ -709,7 +714,7 @@ bool LiveServices::Start(playden::homebrew::Simulation &simulation)
     // (/mnt/usb0 reads uid -1), and runtime_host.cpp refuses a game root whose owners it cannot
     // read unless the kit declares game-root-unowned -- which is kit-wide and must not be
     // declared lightly (see scripts/ps4-kit-view.py).
-    import_config.volumes = playden::stores::local::ConsoleImportVolumes();
+    import_config.volumes = playden::stores::local::ConsoleImportVolumes(s.features.external_storage);
     import_config.log = [log_directory](const std::string &line) {
         playden::app::AppendLogLine(log_directory, "install.log", line);
     };
